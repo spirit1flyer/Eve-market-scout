@@ -129,6 +129,157 @@ def job_install_cost(eiv: float, fac: FacilityParams) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Build time (Phase 4) — pure, character-dependent
+# ---------------------------------------------------------------------------
+#
+# Manufacturing time is the ONLY place character data legitimately enters the
+# numbers (PLAN §1): it changes how long a job takes — and therefore the
+# time-based batch cap — but never the ISK cost. All multipliers are applied to
+# the blueprint's base per-run time and stack multiplicatively.
+
+# Per-level skill reductions to manufacturing time (verified EVE mechanics).
+INDUSTRY_TIME_PER_LEVEL = 0.04      # Industry skill: 4%/level
+ADV_INDUSTRY_TIME_PER_LEVEL = 0.03  # Advanced Industry skill: 3%/level
+
+
+@dataclass
+class BuildTimeParams:
+    """Time-only inputs for a manufacturing job (from the 'Built by' character +
+    blueprint TE + facility/implant bonuses). None of these affect ISK cost."""
+    te: float = 0.0                     # blueprint time efficiency, 0–20 (% off)
+    industry_level: int = 0            # Industry skill 0–5 (4%/lvl)
+    adv_industry_level: int = 0        # Advanced Industry skill 0–5 (3%/lvl)
+    facility_time_bonus_pct: float = 0.0  # structure/rig time reduction (%)
+    implant_time_pct: float = 0.0      # write-in mfg-time implant reduction (%)
+
+
+def manufacturing_time(base_time_per_run: float, runs: int,
+                       params: BuildTimeParams) -> dict:
+    """Adjusted manufacturing time for `runs` runs of a blueprint.
+
+    per_run = base × (1 − TE/100)
+                  × (1 − 0.04·Industry) × (1 − 0.03·AdvIndustry)
+                  × (1 − facility_time_bonus) × (1 − implant_time)
+    total   = per_run × runs
+
+    Returns {per_run_seconds, total_seconds}. A non-positive base time (unknown
+    — old SDE) yields zeros so callers can treat "no time data" uniformly.
+    """
+    if base_time_per_run <= 0:
+        return {"per_run_seconds": 0.0, "total_seconds": 0.0}
+    runs = max(1, int(runs))
+    mult = (
+        (1.0 - params.te / 100.0)
+        * (1.0 - INDUSTRY_TIME_PER_LEVEL * max(0, min(5, params.industry_level)))
+        * (1.0 - ADV_INDUSTRY_TIME_PER_LEVEL * max(0, min(5, params.adv_industry_level)))
+        * (1.0 - params.facility_time_bonus_pct / 100.0)
+        * (1.0 - params.implant_time_pct / 100.0)
+    )
+    mult = max(0.0, mult)
+    per_run = base_time_per_run * mult
+    return {"per_run_seconds": per_run, "total_seconds": per_run * runs}
+
+
+# Time-based batch cap default: a job's total time should fit in 30 days
+# (PLAN §4). Selectable in the UI; a single run already over the cap → max 1.
+DEFAULT_MAX_JOB_SECONDS = 30 * 24 * 3600
+
+
+def max_runs_for_time(per_run_seconds: float,
+                      max_total_seconds: float = DEFAULT_MAX_JOB_SECONDS) -> int:
+    """Largest run count whose total time fits within `max_total_seconds`.
+
+    A single run already longer than the cap returns 1 (you can still queue it;
+    the cap just stops the GUI suggesting an impossible batch). Unknown per-run
+    time (≤0) returns 1 — no basis to suggest more.
+    """
+    if per_run_seconds <= 0 or max_total_seconds <= 0:
+        return 1
+    if per_run_seconds > max_total_seconds:
+        return 1
+    return max(1, int(max_total_seconds // per_run_seconds))
+
+
+# ---------------------------------------------------------------------------
+# Research time + cost (Phase 4.3) — ME/TE research popup
+# ---------------------------------------------------------------------------
+#
+# Cumulative research time (seconds) to reach each level for a RANK-1 blueprint.
+# Source: EVE University "Research" wiki. The SDE activity time (activity 4 = ME,
+# 3 = TE) equals the level-1 value (105) × blueprint rank, so for a given
+# blueprint:  time_to_level(L) = sde_base_time × RESEARCH_TIME_RANK1[L] / 105.
+# ⚠ CCP-tuned table — verify one blueprint's ME10 time against in-game before
+# fully trusting (PLAN §4 "LIVE-verify ME10 cost/time vs in-game").
+RESEARCH_TIME_RANK1 = {
+    0: 0, 1: 105, 2: 250, 3: 595, 4: 1414, 5: 3360,
+    6: 8000, 7: 19000, 8: 45255, 9: 107700, 10: 256000,
+}
+RESEARCH_TIME_BASE = 105  # the level-1 value the SDE base time corresponds to
+
+# Per-level research-time reductions (verified EVE mechanics).
+METALLURGY_TIME_PER_LEVEL = 0.05       # Metallurgy → ME research time
+RESEARCH_SKILL_TIME_PER_LEVEL = 0.05   # Research skill → TE research time
+# Advanced Industry (3%/lvl, ADV_INDUSTRY_TIME_PER_LEVEL) applies to BOTH.
+
+
+@dataclass
+class ResearchParams:
+    """Skill/implant/facility inputs for ME or TE research (time-only)."""
+    metallurgy_level: int = 0       # ME research, 5%/lvl
+    research_level: int = 0         # TE research, 5%/lvl
+    adv_industry_level: int = 0     # both, 3%/lvl
+    facility_time_bonus_pct: float = 0.0
+    implant_me_pct: float = 0.0     # ME-research-time implant %
+    implant_te_pct: float = 0.0     # TE-research-time implant %
+
+
+def _research_time_raw(base_time: float, from_level: int, to_level: int) -> float:
+    """Unadjusted research time (seconds) for from_level → to_level."""
+    if base_time <= 0:
+        return 0.0
+    f = max(0, min(10, int(from_level)))
+    t = max(0, min(10, int(to_level)))
+    if t <= f:
+        return 0.0
+    return base_time * (RESEARCH_TIME_RANK1[t] - RESEARCH_TIME_RANK1[f]) / RESEARCH_TIME_BASE
+
+
+def research_time(base_time: float, from_level: int, to_level: int, *,
+                  kind: str, params: ResearchParams) -> float:
+    """Skill/implant/facility-adjusted research time (seconds), from_level→to_level.
+
+    kind: "me" (Metallurgy) or "te" (Research). Advanced Industry + the facility
+    time bonus apply to both; the implant uses the matching ME/TE field.
+    """
+    raw = _research_time_raw(base_time, from_level, to_level)
+    if raw <= 0:
+        return 0.0
+    adv_mult = 1.0 - ADV_INDUSTRY_TIME_PER_LEVEL * max(0, min(5, params.adv_industry_level))
+    fac_mult = 1.0 - params.facility_time_bonus_pct / 100.0
+    if kind == "me":
+        skill_mult = 1.0 - METALLURGY_TIME_PER_LEVEL * max(0, min(5, params.metallurgy_level))
+        imp_mult = 1.0 - params.implant_me_pct / 100.0
+    else:  # te
+        skill_mult = 1.0 - RESEARCH_SKILL_TIME_PER_LEVEL * max(0, min(5, params.research_level))
+        imp_mult = 1.0 - params.implant_te_pct / 100.0
+    return max(0.0, raw * skill_mult * adv_mult * fac_mult * imp_mult)
+
+
+def research_install_cost(eiv: float, research_cost_index: float,
+                          fac: FacilityParams) -> float:
+    """Research job install cost (per job, NOT per level).
+
+    Same shape as `job_install_cost` but with the research-activity system cost
+    index; alpha-clone tax excluded (research is an Omega activity). EIV is the
+    blueprint's estimated item value (Σ base material × adjusted price).
+    ⚠ Research cost modelling is approximate — verify against in-game.
+    """
+    bonus = 1.0 - fac.cost_bonus_pct / 100.0
+    surcharges = (fac.facility_tax_pct + fac.scc_surcharge_pct) / 100.0
+    return eiv * research_cost_index * bonus + eiv * surcharges
+
+
+# ---------------------------------------------------------------------------
 # Calculator
 # ---------------------------------------------------------------------------
 

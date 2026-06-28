@@ -101,6 +101,19 @@ class IndustrySkills:
         """Level of one named skill (0 if unknown/not trained)."""
         return self.get_levels(character_id).get(skill_name.lower(), 0)
 
+    def peek_levels(self, character_id: int) -> Optional[Dict[str, int]]:
+        """Named skill levels from cache ONLY — never triggers a network fetch.
+
+        Returns None if nothing is cached (or it expired) so a UI-thread caller
+        can decide to render a placeholder + warm the cache in the background
+        instead of blocking on ESI. Mirrors `get_levels`' naming.
+        """
+        cache = self._cache.get(character_id)
+        if not cache or cache.is_expired:
+            return None
+        return {name: cache.raw_skills.get(sid, 0)
+                for name, sid in INDUSTRY_SKILL_IDS.items()}
+
     def get_cache_status(self, character_id: int) -> tuple:
         """(can_refresh, seconds_remaining)."""
         cache = self._cache.get(character_id)

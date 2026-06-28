@@ -40,7 +40,7 @@ class OwnedBlueprintsPanel:
     def __init__(self, parent, bp_db, sde_industry, names, roster,
                  build_context: Callable, set_status: Optional[Callable] = None,
                  bpc_pricing=None, contracts_db=None, on_hubs_changed=None,
-                 on_ignore_changed=None):
+                 on_ignore_changed=None, build_time_for=None, on_research=None):
         self.parent = parent
         self.bp_db = bp_db
         self.sde = sde_industry          # SDEIndustryDB (recipes / bp->product)
@@ -54,6 +54,10 @@ class OwnedBlueprintsPanel:
         # Cross-refresh Top Profit too when the shared ignore set changes here;
         # falls back to re-filtering only this panel if no callback was supplied.
         self.on_ignore_changed = on_ignore_changed or self._fill_tree
+        # Phase 4: manager-provided build-time calc (uses the 'Built by' char's
+        # skills) + research-popup launcher. Owned items pass their REAL ME/TE.
+        self.build_time_for = build_time_for
+        self.on_research = on_research
         self.ignore = IgnoreList.singleton()
         self._registering = False
 
@@ -488,6 +492,7 @@ class OwnedBlueprintsPanel:
         self._build_margins(res)
         self._build_chain(res)
         self._build_totals(res)
+        self._build_time_section(res, row)
 
     def _build_bpc(self, row, res):
         """Blueprint-cost section: BPO amortizes to ~0; BPC shows the resolved
@@ -688,6 +693,42 @@ class OwnedBlueprintsPanel:
             self.set_status(f"Industry: copied {text}")
         except tk.TclError:
             pass
+
+    def _build_time_section(self, res, row):
+        """Phase 4 build time + research launcher for an owned blueprint, using
+        its REAL TE (and ME for research). Delegates the time math to the manager
+        (so it uses the 'Built by' character's skills)."""
+        if not self.build_time_for and not self.on_research:
+            return
+        from gui_industry import fmt_duration
+        frame = ttk.LabelFrame(self.detail, text="Build time (Phase 4)", padding=4)
+        frame.pack(fill=tk.X, pady=(6, 0))
+
+        info = (self.build_time_for(row["product_tid"], res.get("batch", 1),
+                                    te=row["te"]) if self.build_time_for else None)
+        if info and info.get("state") == "ok":
+            self._kv(frame, "Per run:", fmt_duration(info["per_run"]))
+            note = f"Max runs in 30 days: {info['cap']:,}"
+            if info.get("char"):
+                note += f"   (skills from {info['char']})"
+            elif info.get("skills_state") == "warming":
+                note += "   (loading skills…)"
+            else:
+                note += "   (no 'Built by' char — skills = 0)"
+            ttk.Label(frame, text=note, foreground=CLR_MUTED).pack(anchor="w", padx=8)
+        elif info and info.get("state") == "no_sde":
+            ttk.Label(frame, text="Re-download the SDE (Top Profit → Update SDE) "
+                                  "to enable build-time estimates.",
+                      foreground=CLR_BAD).pack(anchor="w", padx=8)
+        else:
+            ttk.Label(frame, text="No base build time for this item.",
+                      foreground=CLR_MUTED).pack(anchor="w", padx=8)
+
+        if self.on_research:
+            ttk.Button(frame, text="Research…",
+                       command=lambda: self.on_research(
+                           row["product_tid"], res["eiv"], row["me"], row["te"])
+                       ).pack(anchor="w", padx=8, pady=(4, 0))
 
     def _build_totals(self, r):
         frame = ttk.LabelFrame(self.detail, text="Totals (whole batch)", padding=4)
