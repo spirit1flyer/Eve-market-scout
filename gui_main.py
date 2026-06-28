@@ -34,6 +34,7 @@ except Exception as _opt_err:
     print(f"[OptionalTab] optional tab present but failed to load, greying out: {_opt_err}")
     DrugTabManager = None
 from gui_stockmarket import StockMarketTab
+from gui_industry import IndustryTabManager
 from gui_main_controls import MainControlsMixin
 from gui_main_scan import MainScanMixin
 
@@ -220,6 +221,15 @@ class MarketScoutGUI(MainControlsMixin, MainScanMixin):
             self.drug_manager = None
             placeholder = ttk.Frame(self.notebook)
             self.notebook.add(placeholder, text="Boosters", state="disabled")
+
+        # Industry tab (committed/public): T1 manufacturing buy-vs-build.
+        # Self-contained — own market-data layer over the shared ESI client.
+        self.industry_manager = IndustryTabManager(
+            self.notebook,
+            get_client=self.get_client,
+            set_status=self._set_status,
+            root=self.root,
+        )
 
         # Connect deals manager to stock market for context menu
         self.deals_manager.stock_market_tab = self.stock_market_tab

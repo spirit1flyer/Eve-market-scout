@@ -40,6 +40,12 @@ FUZZWORK_MARKET_GROUPS_URL = f"{FUZZWORK_BASE}/invMarketGroups.csv"
 # units of the source type). Powers the Reprocess-or-Sell module. Covers
 # non-mineral outputs too (Morphite, components), so materialTypeID is generic.
 FUZZWORK_TYPE_MATERIALS_URL = f"{FUZZWORK_BASE}/invTypeMaterials.csv"
+# Meta groups: typeID -> metaGroupID (1 Tech I, 2 Tech II, 3 Storyline,
+# 4 Faction, 5 Officer, 6 Deadspace, 14 Tech III, 15 Abyssal, ...). The legacy
+# invMetaTypes join table; typeIDs absent from it are treated as Tech I. Powers
+# the Industry tab's tech-level filter (T1/T2/Faction/T3). Tech level is
+# independent of BPO availability — Triglavian hulls are Tech I but BPC-only.
+FUZZWORK_META_TYPES_URL = f"{FUZZWORK_BASE}/invMetaTypes.csv"
 
 # How old before we suggest updating (days)
 SDE_STALE_DAYS = 30
@@ -82,6 +88,7 @@ class TypeInfo:
     published: bool
     portion_size: int
     group_id: Optional[int] = None  # Item group (e.g., "Frigate", "Shield Hardener")
+    meta_group_id: Optional[int] = None  # 1 Tech I, 2 Tech II, 4 Faction, 14 Tech III, … (None = Tech I)
 
 
 @dataclass
@@ -112,6 +119,9 @@ class SDEManager:
         # The full set is small (~3-4k rows) so we keep parents + names hot.
         self._mg_parents: Optional[Dict[int, Optional[int]]] = None
         self._mg_names: Dict[int, str] = {}
+        # Whether the types table carries the meta_group_id column (added with
+        # the Industry tech-level filter). Old installs lack it → re-download.
+        self._has_meta_col: Optional[bool] = None
     
     def _get_conn(self) -> sqlite3.Connection:
         """Get database connection. Creates new connection each call for thread safety."""
@@ -259,11 +269,12 @@ class SDEManager:
         if type_id in self._info_cache:
             return self._info_cache[type_id]
         
+        meta_col = ", meta_group_id" if self.has_meta_group_data() else ""
         try:
             conn = self._get_conn()
             cursor = conn.execute(
-                """SELECT type_id, name, volume, market_group_id, 
-                          published, portion_size, group_id
+                f"""SELECT type_id, name, volume, market_group_id,
+                          published, portion_size, group_id{meta_col}
                    FROM types WHERE type_id = ?""",
                 (type_id,)
             )
@@ -277,7 +288,8 @@ class SDEManager:
                     market_group_id=row["market_group_id"],
                     published=bool(row["published"]),
                     portion_size=row["portion_size"] or 1,
-                    group_id=row["group_id"]
+                    group_id=row["group_id"],
+                    meta_group_id=(row["meta_group_id"] if meta_col else None),
                 )
                 self._info_cache[type_id] = info
                 return info
@@ -376,6 +388,23 @@ class SDEManager:
         except Exception:
             return False
 
+    def has_meta_group_data(self) -> bool:
+        """Whether the `types` table has the `meta_group_id` column.
+
+        Added with the Industry tab's tech-level filter; installs that predate
+        it must re-download the SDE. Cached after first check.
+        """
+        if self._has_meta_col is not None:
+            return self._has_meta_col
+        try:
+            conn = self._get_conn()
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(types)")]
+            conn.close()
+            self._has_meta_col = "meta_group_id" in cols
+        except Exception:
+            self._has_meta_col = False
+        return self._has_meta_col
+
     def get_type_materials(self, type_id: int) -> list[tuple[int, int]]:
         """Reprocessing output for one type: [(material_type_id, quantity), ...].
 
@@ -407,6 +436,7 @@ class SDEManager:
                 uncached.append(tid)
         if not uncached:
             return result
+        meta_col = ", meta_group_id" if self.has_meta_group_data() else ""
         try:
             conn = self._get_conn()
             BATCH_SIZE = 500
@@ -415,7 +445,7 @@ class SDEManager:
                 placeholders = ",".join("?" * len(batch))
                 cursor = conn.execute(
                     f"""SELECT type_id, name, volume, market_group_id,
-                               published, portion_size, group_id
+                               published, portion_size, group_id{meta_col}
                         FROM types WHERE type_id IN ({placeholders})""",
                     batch,
                 )
@@ -428,6 +458,7 @@ class SDEManager:
                         published=bool(row["published"]),
                         portion_size=row["portion_size"] or 1,
                         group_id=row["group_id"],
+                        meta_group_id=(row["meta_group_id"] if meta_col else None),
                     )
                     result[row["type_id"]] = info
                     self._info_cache[row["type_id"]] = info
@@ -599,6 +630,10 @@ class SDEManager:
                 type_materials_bytes = await _download(
                     session, FUZZWORK_TYPE_MATERIALS_URL, "invTypeMaterials"
                 )
+                update("Downloading meta groups...", 50)
+                meta_types_bytes = await _download(
+                    session, FUZZWORK_META_TYPES_URL, "invMetaTypes"
+                )
 
             update("Decompressing...", 50)
 
@@ -612,6 +647,16 @@ class SDEManager:
             csv_data = _to_text(types_bytes)
             market_groups_csv = _to_text(market_groups_bytes)
             type_materials_csv = _to_text(type_materials_bytes)
+            meta_types_csv = _to_text(meta_types_bytes)
+
+            # typeID -> metaGroupID (Tech I/II/Faction/Tech III/…). Built before
+            # the types insert so each row carries its meta group inline.
+            meta_by_type: Dict[int, int] = {}
+            for row in csv.DictReader(io.StringIO(meta_types_csv)):
+                try:
+                    meta_by_type[int(row["typeID"])] = int(row["metaGroupID"])
+                except (ValueError, KeyError, TypeError):
+                    continue
             
             update("Building database...", 55)
             
@@ -625,7 +670,8 @@ class SDEManager:
                     market_group_id INTEGER,
                     published INTEGER,
                     portion_size INTEGER,
-                    group_id INTEGER
+                    group_id INTEGER,
+                    meta_group_id INTEGER
                 )
             """)
             conn.execute("CREATE INDEX idx_market_group ON types(market_group_id)")
@@ -674,10 +720,11 @@ class SDEManager:
                 published = _parse_optional_int(row.get("published")) or 0
                 portion_size = _parse_optional_int(row.get("portionSize")) or 1
                 group_id = _parse_optional_int(row.get("groupID"))
+                meta_group = meta_by_type.get(type_id)  # None = Tech I
 
                 records.append((
                     type_id, name, volume, market_group,
-                    published, portion_size, group_id
+                    published, portion_size, group_id, meta_group
                 ))
                 count += 1
 
@@ -686,21 +733,21 @@ class SDEManager:
                     conn.executemany(
                         """INSERT INTO types
                            (type_id, name, volume, market_group_id,
-                            published, portion_size, group_id)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            published, portion_size, group_id, meta_group_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         records
                     )
                     records = []
                     pct = int(60 + (count / 50000) * 30)  # Estimate ~47k types
                     update(f"Imported {count:,} types...", min(pct, 90))
-            
+
             # Insert remaining
             if records:
                 conn.executemany(
                     """INSERT INTO types
                        (type_id, name, volume, market_group_id,
-                        published, portion_size, group_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        published, portion_size, group_id, meta_group_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     records
                 )
 
@@ -764,6 +811,7 @@ class SDEManager:
             self._info_cache.clear()
             self._mg_parents = None
             self._mg_names = {}
+            self._has_meta_col = None  # re-detect the meta_group_id column
             self._conn = None
 
             update(
