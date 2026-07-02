@@ -61,6 +61,15 @@ tests/
 # Local-only modules (private, never committed)
 drug_*
 
+# Images (docs art / screenshots are local-only — never on GitHub;
+# "drug page.jpg" once slipped through because its space dodged drug_*)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+
 # Backup files
 *.bak
 *.backup
