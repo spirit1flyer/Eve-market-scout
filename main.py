@@ -150,15 +150,15 @@ _setup_exception_handler()
 # IMPORTS (after logging setup so we capture any import errors)
 # =============================================================================
 
-import custom_stations  # noqa: F401 — populates TRADE_HUBS before GUI init
-from api import ESIClient
-from scanner import MarketScanner
-from scanner_common import ScanResult
-from gui_main import MarketScoutGUI
-from calculate import TradingSkills, DEFAULT_SKILLS
-from config import DEFAULT_HUB, JITA_REGION_ID
-from market_history import get_market_history_db
-from gui_migration import run_migration_if_needed, run_daily_update_background
+from core import custom_stations  # noqa: F401 — populates TRADE_HUBS before GUI init
+from core.api import ESIClient
+from scanning.scanner import MarketScanner
+from scanning.scanner_common import ScanResult
+from gui.gui_main import MarketScoutGUI
+from core.calculate import TradingSkills, DEFAULT_SKILLS
+from core.config import DEFAULT_HUB, JITA_REGION_ID
+from history.market_history import get_market_history_db
+from gui.gui_migration import run_migration_if_needed, run_daily_update_background
 
 # Local debug flag
 DEBUG = False
@@ -177,7 +177,7 @@ def _check_sde_on_startup(root: tk.Tk):
         root: The single Tk root window (withdrawn)
     """
     try:
-        from sde_manager import get_sde_manager
+        from sde.sde_manager import get_sde_manager
     except ImportError:
         # sde_manager.py not present yet, skip silently
         return
@@ -241,8 +241,8 @@ def _download_sde_with_progress(root: tk.Tk):
     import queue
     import time
 
-    from sde_manager import get_sde_manager
-    from gui_window_utils import fit_window
+    from sde.sde_manager import get_sde_manager
+    from gui.gui_window_utils import fit_window
 
     msg_queue = queue.Queue()
 
@@ -426,8 +426,8 @@ async def run_scan(
     """
     global _client
     import aiohttp
-    from config import REQUEST_TIMEOUT, get_hub_config
-    from ssl_context import make_connector
+    from core.config import REQUEST_TIMEOUT, get_hub_config
+    from core.ssl_context import make_connector
 
     # Use default hub if none provided
     if hub is None:
@@ -547,11 +547,11 @@ def main():
         root.after(200, _signal_wakeup)
     
     # Ensure data directory exists BEFORE any threads can race on it
-    from sound_manager import get_data_dir
+    from core.sound_manager import get_data_dir
     get_data_dir()
     
     # Check for pending database swap BEFORE opening any connections
-    from background_import import check_and_perform_startup_swap
+    from history.background_import import check_and_perform_startup_swap
     if check_and_perform_startup_swap():
         print("[Startup] Full history database activated")
     
@@ -566,19 +566,19 @@ def main():
     
     # Initialize material risk cache storage (persists material filter
     # results across launches so the filter doesn't re-run every startup)
-    import material_risk_storage
+    from analytics import material_risk_storage
     material_risk_storage.init_table()
     material_risk_storage.purge_before()  # Drops rows older than retention window
     _preloaded_risk = material_risk_storage.load_all_today()
     if _preloaded_risk:
-        from stockmarket_filters import _material_risk_cache
+        from analytics.stockmarket_filters import _material_risk_cache
         _material_risk_cache.update(_preloaded_risk)
         print(f"[Startup] Preloaded {len(_preloaded_risk)} material risk "
               f"entries from today")
 
     # Initialize leading indicators storage (Phase 1: table + purge only,
     # GUI integration comes in Phase 2)
-    import leading_indicators_storage
+    from analytics import leading_indicators_storage
     leading_indicators_storage.init_table()
     leading_indicators_storage.purge_before()
     
@@ -596,7 +596,7 @@ def main():
     gui = MarketScoutGUI(root, scan_callback=run_scan, get_client=get_client)
 
     # Start thread-safe task queue polling AFTER GUI init, before mainloop
-    from tk_queue import start_polling
+    from core.tk_queue import start_polling
     start_polling(root)
 
     # Start daily update AFTER GUI init to avoid thread interference

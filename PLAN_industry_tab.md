@@ -21,10 +21,10 @@ Then docs + live-verify the Register button → Phase 3 complete. See memory
 `project-industry-tab` for the precise resume point.
 
 Status: **PHASE 3 (3.1–3.3) IMPLEMENTED (2026-06-27).** Owned BPO/BPC master
-list: `industry_blueprints.py` (`IndustryBlueprintsDB` SQLite store keyed by
+list: `industry/industry_blueprints.py` (`IndustryBlueprintsDB` SQLite store keyed by
 character_id + `BlueprintPuller` for `GET /characters/{id}/blueprints/`, X-Pages
 paginated, per-page slow-pace pause), `sde_industry.get_product_for_blueprint`
-(reverse lookup), `gui_industry_owned.py` (`OwnedBlueprintsPanel` sub-tab —
+(reverse lookup), `gui/industry/gui_industry_owned.py` (`OwnedBlueprintsPanel` sub-tab —
 owned blueprints at their REAL ME/TE/runs, costed via
 `IndustryTabManager.build_calc_context`, reuses the Phase 1 build breakdown), and
 the Characters card's "Pull blueprints" button wired (worker thread, refreshes
@@ -36,10 +36,10 @@ price÷runs; runs-based batch cap), then 3.5 (R8: `location_id ≥ 1e12` →
 register as industry hub).**
 
 Status: **PHASE 2 IMPLEMENTED (2026-06-27).** Stages 2.1–2.5 landed:
-`industry_characters.py` (`IndustryRoster`, ≤10-char ESI auth, write-in
-implants), `industry_skills.py` (per-char skill pull), `industry_standings.py`
-(per-char standings, display-only), `gui_industry_characters.py`
-(`CharactersPanel` cards), and `gui_industry.py` now wraps an industry-level
+`industry/industry_characters.py` (`IndustryRoster`, ≤10-char ESI auth, write-in
+implants), `industry/industry_skills.py` (per-char skill pull), `industry/industry_standings.py`
+(per-char standings, display-only), `gui/industry/gui_industry_characters.py`
+(`CharactersPanel` cards), and `gui/industry/gui_industry.py` now wraps an industry-level
 sub-notebook (Top Profit — T1 + Characters). Headless-constructed OK (both
 sub-tabs render, roster/cards build). **USER-VERIFIED LIVE 2026-06-27** — login,
 Skills + Standings dialogs work; post-test fixes landed: dialogs re-fit after
@@ -50,9 +50,9 @@ until P4) DONE. **NEXT: Phase 3 (Owned BPO/BPC master list), start at stage 3.1.
 Phases 3–7 TODO.
 
 Status: **PHASE 1 IMPLEMENTED (2026-06-22).** Stages 0.3 + 1.1–1.6 landed:
-`industry_engine.py` (+ `test_industry_engine.py`, 17/17 pass),
-`industry_market_data.py`, `gui_industry.py`, `sde_industry.get_recipe`,
-registered in `gui_main.py`. Headless-verified (prices/indices/history/category
+`industry/industry_engine.py` (+ `tests/test_industry_engine.py`, 17/17 pass),
+`industry/industry_market_data.py`, `gui/industry/gui_industry.py`, `sde_industry.get_recipe`,
+registered in `gui/gui_main.py`. Headless-verified (prices/indices/history/category
 mapping populate; full ~4,800-item pass ~7s refresh + 0.1s recompute). NOT yet
 verified in the live Tk app (no display on dev box); APP_VERSION not yet bumped.
 SCC surcharge / facility tax remain ⚠ CCP-tuned — defaults SCC 4% / tax 0.25%,
@@ -71,12 +71,12 @@ R5 sanity check removed with it; "Built by" dropdown explicitly inert until P4;
 implants default 0 / advanced.
 
 Rev 6 corrects Rev 5's over-simplification:
-- **Skills ARE pulled via ESI per character** (`industry_skills.py` kept).
-- **Standings ARE pulled via ESI per character** (`industry_standings.py`
+- **Skills ARE pulled via ESI per character** (`industry/industry_skills.py` kept).
+- **Standings ARE pulled via ESI per character** (`industry/industry_standings.py`
   kept) — not needed for T1 math, kept anyway for future ("rather have it").
 - **Only IMPLANTS are write-in** (a % per character) — avoids adding the
   `esi-clones.read_implants.v1` scope; nothing else gives implants cheaply.
-- Per-character ESI roster (`industry_characters.py`) restored, ≤10 characters,
+- Per-character ESI roster (`industry/industry_characters.py`) restored, ≤10 characters,
   separate from seller/buyer trading auth.
 - Still dropped: BPO price pulling (amortizes to ~0; optional write-in).
 - Implants fold into the roster character record; no separate profiles file.
@@ -128,7 +128,7 @@ Input and output axes are orthogonal; the top-bar toggle controls **input**.
 ## 2. Auth model — per-character ESI roster; implants write-in
 
 - **One app to CCP** (one client_id) — multiple logins never look like two apps.
-- **Industry roster** (`industry_characters.py`): up to 10 characters, separate
+- **Industry roster** (`industry/industry_characters.py`): up to 10 characters, separate
   from the seller/buyer trading auth (which stays untouched). Reuses esi_auth
   PKCE helpers + `CharacterAuth` by import; own JSON + own scope set:
   - `esi-skills.read_skills.v1` (skills → build/research time)
@@ -148,33 +148,33 @@ Input and output axes are orthogonal; the top-bar toggle controls **input**.
 ## 3. Architecture
 
 **New files (committed, public):**
-- `gui_industry.py` — `IndustryTabManager`: tab shell + all sub-tabs + Characters
+- `gui/industry/gui_industry.py` — `IndustryTabManager`: tab shell + all sub-tabs + Characters
   tab (cards) + universal sort/search helpers.
-- `industry_engine.py` — pure calc: ME-adjust, EIV, job cost, build time, batch
+- `industry/industry_engine.py` — pure calc: ME-adjust, EIV, job cost, build time, batch
   cap, margins. No GUI/network.
-- `industry_market_data.py` — own `/industry/systems/` + `/markets/prices/`
+- `industry/industry_market_data.py` — own `/industry/systems/` + `/markets/prices/`
   fetch over shared `api.ESIClient` (manufacturing, research ME/TE, copying,
   invention, reverse_engineering, reaction). 6h TTL. Also holds the CCP-tuned
   job-cost constants (SCC surcharge, NPC facility tax, alpha tax) as named
   values with a "last verified <date> / <source>" comment and overridable
   settings — a stale constant silently corrupts every job cost, so keep it
   visible and user-correctable.
-- `industry_characters.py` — `IndustryRoster`: ≤10 char auth + roster
+- `industry/industry_characters.py` — `IndustryRoster`: ≤10 char auth + roster
   persistence (`industry_characters.json`), incl. write-in implant % per char.
-- `industry_skills.py` — per-character ESI skill cache (keyed by character_id;
-  lifts parse math from `esi_skills.py`). Reads Industry 3380, Advanced Industry
+- `industry/industry_skills.py` — per-character ESI skill cache (keyed by character_id;
+  lifts parse math from `esi/esi_skills.py`). Reads Industry 3380, Advanced Industry
   3388, Research 3403, Metallurgy 3409.
-- `industry_standings.py` — per-character ESI standings (kept for future; lifts
-  Connections/Diplomacy modifier math from `esi_skills.py:ESIStandings`).
-- `industry_blueprints.py` — `IndustryBlueprintsDB.singleton()` SQLite owned
-  BPO/BPC store keyed by character_id (mirrors `contracts_db.py`).
+- `industry/industry_standings.py` — per-character ESI standings (kept for future; lifts
+  Connections/Diplomacy modifier math from `esi/esi_skills.py:ESIStandings`).
+- `industry/industry_blueprints.py` — `IndustryBlueprintsDB.singleton()` SQLite owned
+  BPO/BPC store keyed by character_id (mirrors `contracts/contracts_db.py`).
 
 **Reused unchanged:** `order_cache.peek_cached_orders`; `MarketHistoryDB`;
 `structure_history`; `sde_industry.db`; `sde_manager`;
-`contracts_db.find_bpc_offers`; `graphing.py`; `gui_station_lookup`,
+`contracts_db.find_bpc_offers`; `analytics/graphing.py`; `gui_station_lookup`,
 `gui_jump_cache`; `gui_window_utils.fit_window`; esi_auth PKCE helpers (import).
 
-**Untouched:** `esi_auth.py`, `esi_skills.py` (seller/buyer trading). No SDE
+**Untouched:** `esi/esi_auth.py`, `esi/esi_skills.py` (seller/buyer trading). No SDE
 schema change (basePrice dropped with BPO pricing).
 
 ---
@@ -225,12 +225,12 @@ sales tax; toggle changes input side only. Output cases: ≥30d → 7d+30d; ≥7
 Detail panel: ME (default 10, write-in) × Batch; material rows (ME-adj qty ×
 input px); Materials / Job cost / Total build; patient / immediate / 30d margins.
 ME: `max(1, ceil(base × (100−ME)/100))` per material per run; EIV uses base qty ×
-adjusted price. Double-click → `graphing.py`; right-click → copy name / type_id /
+adjusted price. Double-click → `analytics/graphing.py`; right-click → copy name / type_id /
 open info.
 
 ### Phase 2 — Characters tab (ESI roster + write-in implants)
-`industry_characters.py` (≤10 auth roster), `industry_skills.py`,
-`industry_standings.py`. Characters sub-tab with minimal cards (portrait, name,
+`industry/industry_characters.py` (≤10 auth roster), `industry/industry_skills.py`,
+`industry/industry_standings.py`. Characters sub-tab with minimal cards (portrait, name,
 Skills dialog w/ pulled skills + write-in implant %, Standings dialog,
 blueprint login/pull). Slow-pace safety on all ESI pulls. Own scope set (§2).
 
@@ -307,8 +307,8 @@ Deps: Phase 5, **SDE expand for activityID 11 (reactions)**. Extra sub-tab live.
 Principle: build **bottom-up** within each phase — pure calc first, then data
 wiring, then UI — so every stage compiles, runs, and is independently verifiable
 before the next. Pure-calc stages get a `test_*.py` (pattern:
-`test_inventory_replay.py`). "Ship?" = a sensible point to commit / bump version
-(`config.py:10`; ask before bumping per CLAUDE.md).
+`tests/test_inventory_replay.py`). "Ship?" = a sensible point to commit / bump version
+(`core/config.py:10`; ask before bumping per CLAUDE.md).
 
 ### Stage 0 — Pre-flight (no app code)
 - 0.1 Verify the live job-cost constants (SCC surcharge, NPC facility tax, alpha
@@ -316,43 +316,43 @@ before the next. Pure-calc stages get a `test_*.py` (pattern:
   lookup was dropped, so the old R5 order-return check goes with it.)
 - 0.2 Confirm `sde_industry.db` has the T1 product+material rows the engine needs
   (already verified: 4,847 products / 27,062 materials, activity 1).
-- 0.3 Stub the tab: register a greyed "Industry" placeholder in `gui_main.py`
+- 0.3 Stub the tab: register a greyed "Industry" placeholder in `gui/gui_main.py`
   (mirrors the Boosters try-import pattern) so the shell exists. **Ship.**
 
 ### Phase 1 — T1 Manufacturing Core
-- 1.1 `industry_engine.py` pure calc: ME-adjust (`max(1, ceil(base×(100−ME)/100))`),
+- 1.1 `industry/industry_engine.py` pure calc: ME-adjust (`max(1, ceil(base×(100−ME)/100))`),
   EIV (Σ base_qty × adjusted_price), job cost (`EIV×(SCI×bonus+tax+SCC+alpha)`),
   margins (patient/immediate/30d). All inputs injected (prices, indices, recipe).
   **Design the material-cost path as a recursive node (cost = buy price OR
   sub-build), even though T1 is flat (terminal buys only)** — this is the
   extension point T2/reactions plug into at P5+, so there's no engine rewrite
-  later (avoids the D1 refactor trap). → `test_industry_engine.py` with synthetic
+  later (avoids the D1 refactor trap). → `tests/test_industry_engine.py` with synthetic
   data incl. a one-level nested case to lock the recursion contract. **Verify:
   tests pass.**
-- 1.2 `industry_market_data.py`: own `/industry/systems/` + `/markets/prices/`
+- 1.2 `industry/industry_market_data.py`: own `/industry/systems/` + `/markets/prices/`
   fetch over shared `api.ESIClient`, 6h TTL, AppData cache, all activities.
   **Verify: run headless, adjusted_prices + cost_indices populate.**
 - 1.3 Headless compute path: T1 list from `sde_industry.db`, material prices from
   `order_cache.peek_cached_orders`, 7d/30d from `market_history`/`structure_history`,
   feed 1.1. **Verify: script prints build cost + margins for ~5 known items;
   spot-check against in-game/known values.**
-- 1.4 `gui_industry.py` tab shell + Top Profit T1 list: columns, **universal
+- 1.4 `gui/industry/gui_industry.py` tab shell + Top Profit T1 list: columns, **universal
   sort + mini search**, category chips, min-profit filter, hub + **facility** +
   input-toggle controls. Wire to 1.3. **Verify: list renders, sorts, filters,
   toggles recompute. Ship.**
 - 1.5 Detail panel: material breakdown, ME write-in, batch field, three margins,
-  double-click → `graphing.py`, right-click copy/open. **Verify: select item,
+  double-click → `analytics/graphing.py`, right-click copy/open. **Verify: select item,
   numbers reconcile with the list.**
 - 1.6 Facility selector incl. write-in structure-bonus fields (material/time/cost
   %); fold into job cost. **Verify: changing bonus moves job cost. Ship + bump.**
 
 ### Phase 2 — Characters tab
-- 2.1 `industry_characters.py` roster: ≤10 `CharacterAuth` records (reuse esi_auth
+- 2.1 `industry/industry_characters.py` roster: ≤10 `CharacterAuth` records (reuse esi_auth
   PKCE helpers), own JSON + scope set, write-in implant % field. **Verify: log in
   a char, token persists across restart, seller/buyer auth unaffected.**
-- 2.2 `industry_skills.py` per-char skill pull (Industry/Adv Ind/Research/Metallurgy),
+- 2.2 `industry/industry_skills.py` per-char skill pull (Industry/Adv Ind/Research/Metallurgy),
   cache keyed by character_id. **Verify: pulled levels match in-game.**
-- 2.3 `industry_standings.py` per-char standings (kept for future). **Verify:
+- 2.3 `industry/industry_standings.py` per-char standings (kept for future). **Verify:
   pulls without error.**
 - 2.4 Characters sub-tab: minimal cards (portrait via `images.evetech.net`,
   cached; name), Skills dialog (pulled + write-in implants + re-pull), Standings
@@ -363,7 +363,7 @@ before the next. Pure-calc stages get a `test_*.py` (pattern:
   Phase 2 ship checkpoint must NOT treat the no-op as a bug.
 
 ### Phase 3 — Owned BPO/BPC master list
-- 3.1 `industry_blueprints.py` SQLite store + schema (keyed by character_id).
+- 3.1 `industry/industry_blueprints.py` SQLite store + schema (keyed by character_id).
 - 3.2 Blueprint pull `GET /characters/{id}/blueprints/`, slow-pace safety, dedup,
   one-time + manual re-pull. **Verify: owned BPs land in DB with ME/TE/runs.**
 - 3.3 Owned master list UI (universal sort+search); each row → reuse the Phase 1
@@ -376,7 +376,7 @@ before the next. Pure-calc stages get a `test_*.py` (pattern:
   as a hub.**
 
 ### Phase 4 — Research popup + time-based batch cap
-- 4.1 Build-time calc in `industry_engine.py`: base time × TE × Industry/Adv
+- 4.1 Build-time calc in `industry/industry_engine.py`: base time × TE × Industry/Adv
   Industry (Built-by char) × write-in implant %. → extend `test_industry_engine`.
 - 4.2 Time-based batch cap wired into list/detail (≤30 days; single run >30d →
   max 1; selectable max). **Verify: cap tracks skills + run count.**
@@ -385,7 +385,7 @@ before the next. Pure-calc stages get a `test_*.py` (pattern:
   cost/time reconcile with in-game. Ship + bump.**
 
 ### Phases 5–7 — T2 / T3 / Reactions (each, same 3-stage shape)
-- x.1 Expand `sde_industry.py` importer + schema for the activity (8 invention /
+- x.1 Expand `sde/sde_industry.py` importer + schema for the activity (8 invention /
   7 reverse-eng / 11 reactions); re-download SDE. **Verify: recipes present.**
 - x.2 Recursive chain costing in `industry_engine` for the new tier (components →
   terminal market buys; invention/RE/reaction job cost). → engine tests.
