@@ -317,22 +317,8 @@ class NPCSalesTracker:
 def _build_tax_index(wallet: "ESIWallet") -> Dict[int, float]:
     """Return {transaction_id: sales_tax_amount}.
 
-    ESI dropped context_id on transaction_tax entries (2026-05). We bridge via
-    market_transaction (which still carries context_id == transaction_id) and
-    pick up the transaction_tax at entry_id + 1, matching the logic used in
-    scanner_inventory_sync._sales_tax_for.
+    Thin wrapper: the market_transaction → transaction_tax (entry_id + 1)
+    bridge now lives in ESIWallet.build_sales_tax_index so the Stock Market
+    P&L sync shares the exact same implementation.
     """
-    mt_eid_by_tx: Dict[int, int] = {}
-    tax_by_entry_id: Dict[int, float] = {}
-    for je in wallet.journal:
-        if je.ref_type == "market_transaction" and je.context_id is not None:
-            mt_eid_by_tx[je.context_id] = je.entry_id
-        elif je.ref_type == "transaction_tax":
-            tax_by_entry_id[je.entry_id] = abs(je.amount)
-
-    result: Dict[int, float] = {}
-    for tx_id, mt_eid in mt_eid_by_tx.items():
-        tax = tax_by_entry_id.get(mt_eid + 1)
-        if tax is not None:
-            result[tx_id] = tax
-    return result
+    return wallet.build_sales_tax_index()

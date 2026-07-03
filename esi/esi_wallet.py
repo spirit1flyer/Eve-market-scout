@@ -420,11 +420,44 @@ class ESIWallet:
               f"amount={abs(best.amount)} ({len(candidates)} candidate(s))")
         return abs(best.amount)
 
-    def get_sales_tax_for_transaction(self, journal_ref_id: int) -> float:
-        """Find the sales tax for a transaction via its journal reference."""
-        # Sales tax entries have context_id pointing to the transaction
+    def build_sales_tax_index(self) -> Dict[int, float]:
+        """Return {transaction_id: sales_tax_amount} for all sales in the journal.
+
+        ESI dropped context_id on transaction_tax entries (2026-05), so tax
+        can't be matched to a transaction directly. Bridge: the
+        market_transaction entry still carries context_id == transaction_id,
+        and its transaction_tax entry is written immediately after it
+        (entry_id + 1). Single shared implementation — the NPC Orders sales
+        panel and the Stock Market P&L sync both key off this.
+        """
+        mt_eid_by_tx: Dict[int, int] = {}
+        tax_by_entry_id: Dict[int, float] = {}
         for entry in self.journal:
-            if entry.ref_type == "transaction_tax" and entry.entry_id == journal_ref_id:
+            if entry.ref_type == "market_transaction" and entry.context_id is not None:
+                mt_eid_by_tx[entry.context_id] = entry.entry_id
+            elif entry.ref_type == "transaction_tax":
+                tax_by_entry_id[entry.entry_id] = abs(entry.amount)
+
+        result: Dict[int, float] = {}
+        for tx_id, mt_eid in mt_eid_by_tx.items():
+            tax = tax_by_entry_id.get(mt_eid + 1)
+            if tax is not None:
+                result[tx_id] = tax
+        return result
+
+    def get_sales_tax_for_transaction(self, journal_ref_id: int) -> float:
+        """Find the sales tax for a sale via its journal reference.
+
+        `journal_ref_id` (from the wallet transaction) is the entry_id of the
+        sale's market_transaction journal entry; the matching transaction_tax
+        entry lands at entry_id + 1 (see build_sales_tax_index). The old
+        `entry_id == journal_ref_id` match compared the tax entry's own id to
+        the market_transaction's id and could never hit — every caller got 0.
+        Returns 0 when the tax entry isn't in the fetched journal (caller
+        retries next sync / estimates past the journal age limit).
+        """
+        for entry in self.journal:
+            if entry.ref_type == "transaction_tax" and entry.entry_id == journal_ref_id + 1:
                 return abs(entry.amount)
         return 0
 
