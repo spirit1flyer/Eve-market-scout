@@ -207,6 +207,21 @@ class HubFilterPhaseMixin:
         )
 
         def run_filter():
+            """Background thread entry: any unhandled exception must still
+            chain to the LI phase, or the hub stays locked behind the
+            filter overlay until restart."""
+            try:
+                run_filter_inner()
+            except Exception:
+                import traceback
+                print(f"[StockMarket-{self.hub_key}] Material filter FAILED "
+                      f"— skipping to leading indicators:")
+                traceback.print_exc()
+                # Deliberately NOT tracker.mark_complete: let the filter
+                # retry on the next scan instead of skipping until tomorrow.
+                submit(lambda: self._run_leading_indicators_phase())
+
+        def run_filter_inner():
             """Background thread: prebuild, analyze, mark complete."""
             from analytics.stockmarket_filters import (
                 check_material_risk,
@@ -266,6 +281,7 @@ class HubFilterPhaseMixin:
             industry_db = get_sde_industry_db()
             recent_floors: Dict[int, float] = {}
             baseline_floors: Dict[int, float] = {}
+            market_db = get_market_history_db()
 
             if industry_db.is_available() and stable_profiles:
                 unique_materials: set = set()
@@ -278,7 +294,6 @@ class HubFilterPhaseMixin:
                             unique_materials.add(m.type_id)
 
                 if unique_materials:
-                    market_db = get_market_history_db()
                     submit(
                         lambda c=len(unique_materials):
                         self._update_filter_overlay(
