@@ -75,16 +75,30 @@ class PnLEntry:
 
     @property
     def realized_pnl(self) -> float:
-        """Realized profit/loss (sold value - cost basis of sold - fees on sold)."""
+        """Realized P&L: value of sold goods minus their cost basis and fees.
+
+        THE one P&L definition — the per-item column, the sort key, and the
+        summary's net_pnl all use this. Cost of goods sold = average buy
+        cost × sold quantity, so ISK sitting in unsold inventory is NOT
+        counted as loss (the old cash-flow definition did exactly that and
+        kept the panel deep red while stocked up). Sell-side fees (sell
+        broker, relist, tax) count in full; buy-side broker fees count in
+        proportion to the fraction of bought units actually sold.
+        """
         if self.total_sold_qty == 0:
             return 0.0
-        # Approximate cost basis using average
         if self.total_bought_qty > 0:
-            avg_cost = self.total_bought_value / self.total_bought_qty
-            cost_of_sold = avg_cost * self.total_sold_qty
+            # Fraction of the bought stock that has been sold, capped at 1
+            # (orphan sales — e.g. pre-tracking stock — can push qty over).
+            sold_fraction = min(1.0, self.total_sold_qty / self.total_bought_qty)
+            cost_of_sold = self.total_bought_value * sold_fraction
+            buy_fee_share = self.buy_broker_fees * sold_fraction
         else:
             cost_of_sold = 0.0
-        return self.total_sold_value - cost_of_sold - self.sales_tax_paid
+            buy_fee_share = 0.0
+        return (self.total_sold_value - cost_of_sold - buy_fee_share
+                - self.sell_broker_fees - self.modification_fees
+                - self.sales_tax_paid)
 
     @property
     def total_invested(self) -> float:
@@ -95,14 +109,6 @@ class PnLEntry:
         sold - invested - fees.
         """
         return self.total_bought_value + self.escrow_committed
-
-    @property
-    def realized_pnl_simple(self) -> float:
-        """Per-item realized P&L: sold - realized cost basis - all fees.
-
-        Excludes escrow (those buys aren't realized yet).
-        """
-        return self.total_sold_value - self.total_bought_value - self.total_fees
 
 
 class PnLManager:
@@ -457,7 +463,8 @@ class PnLManager:
         Returns:
             Dict with: realized_invested (cost basis of items owned), escrow_committed
             (ISK locked in open buy orders), total_invested (displayed = realized+escrow),
-            total_sold, fee breakdown, total_fees, net_pnl (realized only).
+            total_sold, fee breakdown, total_fees, net_pnl (= Σ per-item
+            realized_pnl — COGS-based, so unsold inventory is not a loss).
         """
         realized_invested = 0.0
         escrow_committed = 0.0
@@ -466,6 +473,7 @@ class PnLManager:
         total_sell_fees = 0.0
         total_mod_fees = 0.0
         total_tax = 0.0
+        net_pnl = 0.0
 
         for entry in self.entries.values():
             realized_invested += entry.total_bought_value
@@ -475,13 +483,12 @@ class PnLManager:
             total_sell_fees += entry.sell_broker_fees
             total_mod_fees += entry.modification_fees
             total_tax += entry.sales_tax_paid
+            net_pnl += entry.realized_pnl
 
         total_fees = total_buy_fees + total_sell_fees + total_mod_fees + total_tax
 
         # Display: invested = realized cost basis + escrow on open buy orders.
-        # Math:    net_pnl uses realized only — escrow isn't yet inventory.
         total_invested = realized_invested + escrow_committed
-        net_pnl = total_sold - realized_invested - total_fees
 
         return {
             "realized_invested": realized_invested,

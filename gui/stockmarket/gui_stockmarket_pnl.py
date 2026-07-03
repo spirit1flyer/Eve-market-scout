@@ -311,10 +311,9 @@ class PnLPanel:
                 except (ValueError, TypeError):
                     pass
             
-            # Per-item realized P&L. Uses realized cost basis (total_bought_value),
-            # NOT total_invested — the latter includes escrow on open buy orders,
-            # which isn't a realized cost yet.
-            item_pnl = entry.realized_pnl_simple
+            # Per-item realized P&L: COGS-based (see PnLEntry.realized_pnl) —
+            # unsold inventory is not a loss, escrow is not a cost.
+            item_pnl = entry.realized_pnl
             
             tag = "profit" if item_pnl >= 0 else "loss"
             
@@ -364,7 +363,7 @@ class PnLPanel:
             elif self.sort_column == "total_fees":
                 return entry.total_fees
             elif self.sort_column == "pnl":
-                return entry.realized_pnl_simple
+                return entry.realized_pnl
             return 0
         
         return sorted(entries, key=get_sort_key, reverse=self.sort_reverse)
