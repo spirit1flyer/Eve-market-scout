@@ -93,8 +93,12 @@ def get_broker_fee_rate(skills: Optional[TradingSkills] = None) -> float:
     
     If manual_broker_fee is set, returns that value instead.
     
-    Formula: max(0.01%, 3% - 0.3% * BrokerRelations - 0.03% * StationStanding - 0.02% * FactionStanding)
-    
+    Formula: max(0.01%, 3% - 0.3% * BrokerRelations - 0.03% * FactionStanding - 0.02% * CorpStanding)
+
+    The standings must be BASE standings (unmodified by Connections/
+    Diplomacy) — the in-game fee ignores social skills. Verified in-game
+    2026-07-03: Jita 1.46% = 1.5% - 0.03 x 1.41 base faction standing.
+
     Returns: Fee as percentage (e.g., 1.48 means 1.48%)
     """
     if skills is None:
@@ -110,9 +114,10 @@ def get_broker_fee_rate(skills: Optional[TradingSkills] = None) -> float:
     # Broker Relations reduction
     rate -= BROKER_RELATIONS_REDUCTION_PER_LEVEL * skills.broker_relations
     
-    # Standing reductions (smaller effect)
-    rate -= 0.03 * skills.station_standing
-    rate -= 0.02 * skills.faction_standing
+    # Standing reductions (smaller effect): 0.03 applies to FACTION,
+    # 0.02 to the station-owner CORP (they were swapped until 2026-07-03).
+    rate -= 0.03 * skills.faction_standing
+    rate -= 0.02 * skills.station_standing
     
     # Minimum 0.01%
     return max(0.01, rate)

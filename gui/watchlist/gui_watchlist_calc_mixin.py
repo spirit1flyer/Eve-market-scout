@@ -392,10 +392,14 @@ class MaxBuyCalcMixin:
             corp_std = 0.0
             faction_std = 0.0
             if standings_obj:
+                # base=True: broker fee math uses raw standings (the in-game
+                # fee ignores Connections/Diplomacy).
                 if corp_id:
-                    corp_std = standings_obj.get_corp_standing(corp_id, slot="seller")
+                    corp_std = standings_obj.get_corp_standing(
+                        corp_id, slot="seller", base=True)
                 if faction_id:
-                    faction_std = standings_obj.get_faction_standing(faction_id, slot="seller")
+                    faction_std = standings_obj.get_faction_standing(
+                        faction_id, slot="seller", base=True)
             adjusted = TradingSkills(
                 broker_relations=base.broker_relations,
                 accounting=base.accounting,

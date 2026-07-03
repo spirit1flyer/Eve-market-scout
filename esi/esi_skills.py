@@ -422,11 +422,15 @@ class ESIStandings:
         if not data:
             return None
         
-        # Parse into categories and apply skill modifiers
+        # Parse into categories and apply skill modifiers. The *_base dicts
+        # keep the raw ESI standings (no Connections/Diplomacy) — broker fee
+        # math needs those; display and reprocessing tax use the adjusted ones.
         standings = {
             'agents': {},
             'npc_corps': {},
-            'factions': {}
+            'factions': {},
+            'npc_corps_base': {},
+            'factions_base': {},
         }
         
         # Diagnostic: log raw response shape so we can verify ESI is returning
@@ -451,8 +455,10 @@ class ESIStandings:
                 standings['agents'][from_id] = effective_standing
             elif from_type == 'npc_corp':
                 standings['npc_corps'][from_id] = effective_standing
+                standings['npc_corps_base'][from_id] = base_standing
             elif from_type == 'faction':
                 standings['factions'][from_id] = effective_standing
+                standings['factions_base'][from_id] = base_standing
             else:
                 unknown_types.add(from_type)
 
@@ -488,35 +494,48 @@ class ESIStandings:
         
         return standings
     
-    def get_faction_standing(self, faction_id: int, slot: str = "seller") -> float:
-        """Get standing with a specific faction."""
+    def get_faction_standing(self, faction_id: int, slot: str = "seller",
+                             base: bool = False) -> float:
+        """Get standing with a specific faction.
+
+        base=True returns the raw ESI standing (no Connections/Diplomacy) —
+        required for broker fee math; the in-game fee ignores social skills.
+        """
         standings = self.fetch_standings(slot=slot)
         if not standings:
             return 0.0
-        return standings['factions'].get(faction_id, 0.0)
-    
-    def get_corp_standing(self, corp_id: int, slot: str = "seller") -> float:
-        """Get standing with a specific NPC corp."""
+        key = 'factions_base' if base else 'factions'
+        return standings.get(key, standings['factions']).get(faction_id, 0.0)
+
+    def get_corp_standing(self, corp_id: int, slot: str = "seller",
+                          base: bool = False) -> float:
+        """Get standing with a specific NPC corp (base=True: see get_faction_standing)."""
         standings = self.fetch_standings(slot=slot)
         if not standings:
             return 0.0
-        return standings['npc_corps'].get(corp_id, 0.0)
+        key = 'npc_corps_base' if base else 'npc_corps'
+        return standings.get(key, standings['npc_corps']).get(corp_id, 0.0)
     
-    def get_station_standings(self, station_id: int, slot: str = "seller") -> tuple[float, float]:
+    def get_station_standings(self, station_id: int, slot: str = "seller",
+                              base: bool = False) -> tuple[float, float]:
         """
         Get both corp and faction standings for a station.
-        
+
         Returns: (station_standing, faction_standing)
-        
+
+        base=True returns raw ESI standings (no Connections/Diplomacy) —
+        use that for broker fee math. Default (adjusted) is for display and
+        reprocessing tax, which DO scale with social skills.
+
         Uses config.TRADE_HUBS for station -> corp/faction mappings.
         For stations not in config, returns (0.0, 0.0)
         """
         from core.config import TRADE_HUBS
-        
+
         standings = self.fetch_standings(slot=slot)
         if not standings:
             return (0.0, 0.0)
-        
+
         # Find the hub config for this station
         corp_id = None
         faction_id = None
@@ -525,22 +544,28 @@ class ESIStandings:
                 corp_id = hub_config["corp_id"]
                 faction_id = hub_config["faction_id"]
                 break
-        
-        corp_standing = standings['npc_corps'].get(corp_id, 0.0) if corp_id else 0.0
-        faction_standing = standings['factions'].get(faction_id, 0.0) if faction_id else 0.0
-        
+
+        corp_key = 'npc_corps_base' if base else 'npc_corps'
+        fac_key = 'factions_base' if base else 'factions'
+        corps = standings.get(corp_key, standings['npc_corps'])
+        facs = standings.get(fac_key, standings['factions'])
+        corp_standing = corps.get(corp_id, 0.0) if corp_id else 0.0
+        faction_standing = facs.get(faction_id, 0.0) if faction_id else 0.0
+
         return (corp_standing, faction_standing)
-    
-    def get_standings_for_hub(self, hub_key: str, slot: str = "seller") -> tuple[float, float]:
+
+    def get_standings_for_hub(self, hub_key: str, slot: str = "seller",
+                              base: bool = False) -> tuple[float, float]:
         """
         Get standings for a hub by its config key (e.g., 'amarr', 'jita').
-        
-        Returns: (corp_standing, faction_standing)
+
+        Returns: (corp_standing, faction_standing); base=True -> raw ESI
+        standings for fee math (see get_station_standings).
         """
         from core.config import get_hub_config
-        
+
         hub = get_hub_config(hub_key)
-        return self.get_station_standings(hub["station_id"], slot)
+        return self.get_station_standings(hub["station_id"], slot, base=base)
     
     def get_amarr_standings(self, slot: str = "seller") -> tuple[float, float]:
         """

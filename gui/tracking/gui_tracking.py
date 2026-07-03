@@ -173,16 +173,20 @@ class TrackingTabManager:
         # Collect standings for all 5 hubs
         hub_keys = ["amarr", "jita", "dodixie", "hek", "rens"]
         
+        # base=True: these standings feed broker fee math, which uses raw
+        # standings (Connections/Diplomacy don't reduce fees in-game).
         seller_standings = {}
         for hub in hub_keys:
-            corp, faction = self.esi_standings.get_standings_for_hub(hub, slot="seller")
+            corp, faction = self.esi_standings.get_standings_for_hub(
+                hub, slot="seller", base=True)
             seller_standings[hub] = (corp, faction)
-        
+
         buyer_standings = None
         if self.auth.has_buyer:
             buyer_standings = {}
             for hub in hub_keys:
-                corp, faction = self.esi_standings.get_standings_for_hub(hub, slot="buyer")
+                corp, faction = self.esi_standings.get_standings_for_hub(
+                    hub, slot="buyer", base=True)
                 buyer_standings[hub] = (corp, faction)
         
         save_cached_skills(
@@ -580,9 +584,11 @@ class TrackingTabManager:
                     station_standing = 0.0
                     faction_standing = 0.0
                     if self.esi_standings:
-                        # Force-refresh standings so in-memory cache doesn't shadow ESI
+                        # Force-refresh standings so in-memory cache doesn't shadow ESI.
+                        # base=True: fee math wants raw standings, not Connections-adjusted.
                         self.esi_standings.fetch_standings(force_refresh=True, slot="seller")
-                        corp, fac = self.esi_standings.get_standings_for_hub(sell_hub, slot="seller")
+                        corp, fac = self.esi_standings.get_standings_for_hub(
+                            sell_hub, slot="seller", base=True)
                         station_standing = corp
                         faction_standing = fac
                     
@@ -602,9 +608,11 @@ class TrackingTabManager:
                     station_standing = 0.0
                     faction_standing = 0.0
                     if self.esi_standings:
-                        # Force-refresh standings so in-memory cache doesn't shadow ESI
+                        # Force-refresh standings so in-memory cache doesn't shadow ESI.
+                        # base=True: fee math wants raw standings, not Connections-adjusted.
                         self.esi_standings.fetch_standings(force_refresh=True, slot="buyer")
-                        corp, fac = self.esi_standings.get_standings_for_hub(buy_hub, slot="buyer")
+                        corp, fac = self.esi_standings.get_standings_for_hub(
+                            buy_hub, slot="buyer", base=True)
                         station_standing = corp
                         faction_standing = fac
                     
