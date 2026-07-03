@@ -371,21 +371,28 @@ class FilterManager:
         _check_thread("FilterManager.should_show_deal")
         name = deal.name.lower()
 
-        # Hub Only filter - compare against selected hub's system name
+        # Hub Only filter - match by id, never by display name: custom
+        # stations register `name` as the full ESI station name ("Ashab IV -
+        # Moon 1 - ..."), which never equals a system name, so name compares
+        # silently hid every deal at custom stations/structures.
         # For CrossHubDeal, check buy station (where you pick up items)
-        # For regular Deal, check system_name (where the deal is)
+        # For regular Deal, check system_id (where the deal is)
         if self.hub_only_var.get():
             hub_config = get_hub_config(self.selected_hub)
-            hub_name = hub_config["name"].lower()
-            
+
             # Check if this is a CrossHubDeal
             if CROSSHUB_AVAILABLE and CrossHubDeal and isinstance(deal, CrossHubDeal):
-                # For cross-hub, compare buy station against hub
-                if deal.buy_system_name.lower() != hub_name:
+                # deal.buy_station holds the hub KEY (scanner_crosshub passes
+                # buy_station_key through), so compare keys directly
+                if deal.buy_station != self.selected_hub:
                     return False
             else:
-                # For regular deals, compare system_name against hub
-                if deal.system_name.lower() != hub_name:
+                hub_system_id = hub_config.get("system_id")
+                if hub_system_id:
+                    if deal.system_id != hub_system_id:
+                        return False
+                elif deal.system_name.lower() != hub_config["name"].lower():
+                    # Legacy custom-station entry without system_id
                     return False
 
         return self.passes_category_filters(name)
