@@ -525,6 +525,10 @@ class MarketScoutGUI(MainControlsMixin, MainScanMixin):
             # Reset crosshub tree configuration flag so normal display works
             if hasattr(self, '_crosshub_trees_configured'):
                 delattr(self, '_crosshub_trees_configured')
+                # Undo the cross-hub takeover of the deals trees — otherwise
+                # its double-click/right-click/header handlers stay bound and
+                # resolve rows against the stale CrossHubDeal list.
+                self.deals_manager.restore_tree_bindings()
         else:
             self.mode_label.configure(text="[Cross-Hub]", foreground="blue")
 

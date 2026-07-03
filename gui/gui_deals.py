@@ -238,6 +238,25 @@ class DealsTabManager:
             else:
                 tree.heading(c, text=title)
 
+    def restore_tree_bindings(self):
+        """Re-apply this tab's own event bindings and header sort commands.
+
+        Cross-hub mode (CrossHubDisplayManager.configure_tree_for_crosshub)
+        rebinds double-click/right-click and every column header on these same
+        trees. Switching back to same-station must undo that, or the stale
+        cross-hub handlers keep resolving rows against the old CrossHubDeal
+        list.
+        """
+        for tree in (self.low_risk_tree, self.high_risk_tree):
+            tree.bind("<Double-1>", self._show_price_history)
+            tree.bind("<Button-3>", self._show_context_menu)
+            for col in DEAL_COLUMNS:
+                tree.heading(
+                    col,
+                    text=self.get_column_title(col),
+                    command=lambda c=col, t=tree: self._sort_tree(t, c),
+                )
+
     def _get_active_tree(self) -> ttk.Treeview:
         """Get currently active treeview based on selected tab."""
         current_tab = self.notebook.index(self.notebook.select())

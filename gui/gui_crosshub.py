@@ -39,6 +39,15 @@ def format_days(value: float) -> str:
     return f"{value:.1f}d"
 
 
+def et_flip_days(deal: CrossHubDeal) -> float:
+    """Estimated days to flip at the sell station's safe velocity."""
+    if deal.avg_volume_7d > 0 and deal.avg_volume_30d > 0:
+        safe_vel = min(deal.avg_volume_7d, deal.avg_volume_30d)
+    else:
+        safe_vel = max(deal.avg_volume_7d, deal.avg_volume_30d)
+    return deal.volume / safe_vel if safe_vel > 0 else float("inf")
+
+
 # Column definitions for Buy Station row (source)
 BUY_STATION_COLUMNS = (
     "name", "system", "buy_at", "buy_order", "volume", "available",
@@ -103,6 +112,28 @@ NUMERIC_COLUMNS = {
     "vol_7d", "vol_30d"
 }
 
+# Column-header sort keys for cross-hub mode. The buy and sell rows of a pair
+# show different data in the same column, so each key picks the pair's
+# decision-relevant value — sell-station side for market stats, matching the
+# row users read for margin. "system" is absent on purpose: that header resets
+# to the default color sort.
+PAIR_SORT_KEYS = {
+    "name": lambda d: d.name.lower(),
+    "buy_price": lambda d: d.buy_price,
+    "buy_order": lambda d: d.sell_station_buy,
+    "ceiling": lambda d: d.sell_price,
+    "break_even": lambda d: d.break_even,
+    "unit_profit": lambda d: d.net_profit,
+    "et_flip": et_flip_days,
+    "volume": lambda d: d.volume,
+    "raw_volume": lambda d: d.raw_volume,
+    "total_profit": lambda d: d.total_profit,
+    "avg_7d": lambda d: d.avg_price_7d,
+    "avg_30d": lambda d: d.avg_price_30d,
+    "vol_7d": lambda d: d.avg_volume_7d,
+    "vol_30d": lambda d: d.avg_volume_30d,
+}
+
 
 class CrossHubDisplayManager:
     """Manages dual-row display for cross-hub arbitrage deals."""
@@ -125,6 +156,10 @@ class CrossHubDisplayManager:
         
         # Sort state per tree
         self.sort_state = {}
+
+        # Per-tree display state (widget path -> {"deals", "is_low_risk"}) so
+        # header sorts reorder deal OBJECTS and repaint pairs, never rows.
+        self._tree_state: dict[str, dict] = {}
         
         # External references (set by gui_main)
         self.tracking_manager = None
@@ -400,17 +435,32 @@ class CrossHubDisplayManager:
         """
         # Sort deals by strike count (ascending) then by total profit (descending)
         sorted_deals = sorted(deals, key=lambda d: (self._get_strike_count(d, is_low_risk), -d.total_profit))
-        
+        self._tree_state[str(tree)] = {"deals": sorted_deals, "is_low_risk": is_low_risk}
+
         for deal in sorted_deals:
-            # Row 1: Buy Station (source) - where you buy
-            # Always use neutral color for buy station row
-            buy_values = self._format_buy_station_row(deal)
-            tree.insert("", tk.END, values=buy_values, tags=("buy_station",))
-            
-            # Row 2: Sell Station (destination) - color based on risk
-            sell_values = self._format_sell_station_row(deal)
-            sell_tag = self._determine_sell_tag(deal, is_low_risk)
-            tree.insert("", tk.END, values=sell_values, tags=(sell_tag,))
+            self._insert_deal_rows(tree, deal, is_low_risk)
+
+    def _insert_deal_rows(self, tree: ttk.Treeview, deal: CrossHubDeal, is_low_risk: bool):
+        """Insert the buy/sell row pair for one deal."""
+        # Row 1: Buy Station (source) - where you buy
+        # Always use neutral color for buy station row
+        buy_values = self._format_buy_station_row(deal)
+        tree.insert("", tk.END, values=buy_values, tags=("buy_station",))
+
+        # Row 2: Sell Station (destination) - color based on risk
+        sell_values = self._format_sell_station_row(deal)
+        sell_tag = self._determine_sell_tag(deal, is_low_risk)
+        tree.insert("", tk.END, values=sell_values, tags=(sell_tag,))
+
+    def _repaint_tree(self, tree: ttk.Treeview):
+        """Clear and re-insert all row pairs from the stored display state."""
+        state = self._tree_state.get(str(tree))
+        if not state:
+            return
+        for item in tree.get_children(""):
+            tree.delete(item)
+        for deal in state["deals"]:
+            self._insert_deal_rows(tree, deal, state["is_low_risk"])
 
     def _determine_sell_tag(self, deal: CrossHubDeal, is_low_risk: bool) -> str:
         """Determine color tag for sell station row based on risk flags.
@@ -493,8 +543,7 @@ class CrossHubDisplayManager:
         sell_hub_name = sell_config.get("name", deal.sell_system_name)
         
         # Calculate ET flip based on sell station velocity
-        safe_vel = min(deal.avg_volume_7d, deal.avg_volume_30d) if deal.avg_volume_7d > 0 and deal.avg_volume_30d > 0 else max(deal.avg_volume_7d, deal.avg_volume_30d)
-        et_flip = deal.volume / safe_vel if safe_vel > 0 else float("inf")
+        et_flip = et_flip_days(deal)
         
         # Column order matches DEAL_COLUMNS:
         # name, system, buy_price, buy_order, ceiling, break_even,
@@ -555,15 +604,22 @@ class CrossHubDisplayManager:
         tree.tag_configure("loss", foreground="red")
         tree.tag_configure("ignored", foreground="gray")
         
-        # Override System column heading to reset sort to default (color sort)
-        tree.heading("system", text="System", command=lambda t=tree: self._reset_to_color_sort(t))
-        
+        # Take over ALL column headers: DealsTabManager._sort_tree sorts rows
+        # individually, which tears the buy/sell row pairs apart. System resets
+        # to the default color sort; every other column sorts deal pairs.
+        for col in CROSSHUB_COLUMNS:
+            if col == "system":
+                command = lambda t=tree: self._reset_to_color_sort(t)
+            else:
+                command = lambda c=col, t=tree: self._sort_tree_pairs(t, c)
+            tree.heading(col, text=COLUMN_TITLES[col], command=command)
+
         # Store tree references for reset functionality
         if not hasattr(self, '_crosshub_trees'):
             self._crosshub_trees = []
         if tree not in self._crosshub_trees:
             self._crosshub_trees.append(tree)
-        
+
         # Bind context menu
         tree.bind("<Button-3>", lambda e: self._show_context_menu(e, tree))
         tree.bind("<Double-1>", lambda e: self._on_double_click(e, tree))
@@ -574,54 +630,48 @@ class CrossHubDisplayManager:
         if deal:
             self._show_price_history(deal)
 
+    def _sort_tree_pairs(self, tree: ttk.Treeview, col: str):
+        """Column-header sort that keeps buy/sell row pairs together.
+
+        Sorts the displayed deal OBJECTS and repaints both rows of each pair
+        (same pattern as gui_demand_tab._sort_by_column) instead of moving
+        tree rows individually, which interleaves buy and sell rows.
+        """
+        state = self._tree_state.get(str(tree))
+        key = PAIR_SORT_KEYS.get(col)
+        if not state or not state["deals"] or key is None:
+            return
+
+        dirs = self.sort_state.setdefault(str(tree), {})
+        reverse = dirs.get(col, False)
+        dirs[col] = not reverse
+
+        state["deals"].sort(key=key, reverse=reverse)
+        self._repaint_tree(tree)
+        self._update_heading_arrows(tree, col, reverse)
+
+    def _update_heading_arrows(self, tree: ttk.Treeview, sort_col: Optional[str], reverse: bool):
+        """Show the sort arrow on the active column, plain titles elsewhere."""
+        arrow = " [v]" if reverse else " [^]"
+        for c in CROSSHUB_COLUMNS:
+            title = COLUMN_TITLES[c]
+            tree.heading(c, text=title + arrow if c == sort_col else title)
+
     def _reset_to_color_sort(self, tree: ttk.Treeview):
         """Reset tree to default color sort (green -> yellow -> orange -> red).
-        
+
         Called when System column header is clicked in cross-hub mode.
         """
-        from scanning.scanner_common import RiskFlag
-        
-        # Determine if this is low risk or high risk tree
-        is_low_risk = False
-        for tab_idx in range(self.notebook.index("end")):
-            tab_name = self.notebook.tab(tab_idx, "text")
-            if "Low Risk" in tab_name:
-                frame = self.notebook.nametowidget(self.notebook.tabs()[tab_idx])
-                for child in frame.winfo_children():
-                    if child is tree or (isinstance(child, ttk.Frame) and tree in child.winfo_children()):
-                        is_low_risk = True
-                        break
-        
-        # Build list of (strike_count, total_profit, item_id) for all deals in tree
-        # We need to get the deal from each row pair (buy station + sell station rows)
-        items_to_sort = []
-        children = tree.get_children("")
-        
-        # Process in pairs (buy row, sell row)
-        i = 0
-        while i < len(children):
-            buy_row = children[i]
-            sell_row = children[i + 1] if i + 1 < len(children) else None
-            
-            # Get deal name from buy row (not indented)
-            values = tree.item(buy_row, "values")
-            if values:
-                name = values[0].strip()
-                # Find corresponding deal
-                for deal in self.all_deals:
-                    if deal.name == name:
-                        strike_count = self._get_strike_count(deal, is_low_risk)
-                        items_to_sort.append((strike_count, -deal.total_profit, buy_row, sell_row))
-                        break
-            i += 2
-        
-        # Sort by strike count (ascending) then total profit (descending, hence negative)
-        items_to_sort.sort(key=lambda x: (x[0], x[1]))
-        
-        # Rearrange items in tree
-        for idx, (_, _, buy_row, sell_row) in enumerate(items_to_sort):
-            tree.move(buy_row, "", idx * 2)
-            if sell_row:
-                tree.move(sell_row, "", idx * 2 + 1)
-        
+        state = self._tree_state.get(str(tree))
+        if not state:
+            return
+
+        is_low_risk = state["is_low_risk"]
+        state["deals"].sort(
+            key=lambda d: (self._get_strike_count(d, is_low_risk), -d.total_profit)
+        )
+        self.sort_state.pop(str(tree), None)
+        self._repaint_tree(tree)
+        self._update_heading_arrows(tree, None, False)
+
         self.set_status("Reset to color sort (green -> red)")
