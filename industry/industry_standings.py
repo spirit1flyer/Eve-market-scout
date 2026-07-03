@@ -15,6 +15,8 @@ import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
+from core.config import ESI_USER_AGENT
+
 BASE_URL = "https://esi.evetech.net/latest"
 
 
@@ -115,7 +117,9 @@ class IndustryStandings:
                 continue
             try:
                 resp = requests.post(f"{BASE_URL}/universe/names/",
-                                     json=chunk, timeout=30)
+                                     json=chunk,
+                                     headers={"User-Agent": ESI_USER_AGENT},
+                                     timeout=30)
                 resp.raise_for_status()
                 for entry in resp.json():
                     self._names[entry["id"]] = entry["name"]

@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from typing import Optional, Dict, Callable
 from datetime import datetime, timedelta
 
+from core.config import ESI_USER_AGENT
 from core.sound_manager import get_data_dir
 
 # File paths - use centralized data directory
@@ -180,17 +181,38 @@ class CharacterAuth:
 class ESIAuth:
     """Handles EVE SSO OAuth2 authentication using PKCE flow."""
 
+    # Shared-instance plumbing: EVE SSO may rotate refresh tokens on use
+    # (announced for native/PKCE apps), so separate instances holding
+    # independent token copies can invalidate each other, and any instance's
+    # _save_auth() overwrites esi_auth.json with its own possibly-stale
+    # snapshot. All app code should go through ESIAuth.singleton().
+    _singleton: Optional["ESIAuth"] = None
+    _singleton_lock = threading.Lock()
+
+    @classmethod
+    def singleton(cls) -> "ESIAuth":
+        """Return the shared process-wide ESIAuth instance."""
+        with cls._singleton_lock:
+            if cls._singleton is None:
+                cls._singleton = cls()
+            return cls._singleton
+
     def __init__(self):
         # Two character slots
         self.seller: Optional[CharacterAuth] = None  # Primary - always used for selling
         self.buyer: Optional[CharacterAuth] = None   # Secondary - used for buying in cross-hub
-        
+
         # Track which slot we're authenticating
         self._pending_slot: str = "seller"
-        
+
         # PKCE: store code_verifier during auth flow
         self._code_verifier: Optional[str] = None
-        
+
+        # Serializes token refresh + auth-file writes (RLock: refresh holds
+        # it while calling _save_auth). Concurrent refreshes with the same
+        # refresh token would deauth the app once SSO token rotation is live.
+        self._refresh_lock = threading.RLock()
+
         self._load_auth()
 
     # =========================================================================
@@ -257,15 +279,47 @@ class ESIAuth:
 
     def _save_auth(self):
         """Save auth to file."""
+        with self._refresh_lock:
+            try:
+                data = {
+                    "seller": self.seller.to_dict() if self.seller else None,
+                    "buyer": self.buyer.to_dict() if self.buyer else None,
+                }
+                with open(AUTH_FILE, 'w') as f:
+                    json.dump(data, f, indent=2)
+            except IOError as e:
+                print(f"Error saving ESI auth: {e}")
+
+    def _adopt_saved_tokens(self, char: CharacterAuth):
+        """Re-read AUTH_FILE and copy newer tokens for this character into char.
+
+        Another running checkout (all copies share esi_auth.json) may have
+        refreshed since we loaded. With SSO refresh-token rotation our
+        in-memory refresh token would then be dead — adopt the saved one
+        instead of burning it. No-op if the file has nothing newer.
+        """
+        if not char.character_id or not os.path.exists(AUTH_FILE):
+            return
         try:
-            data = {
-                "seller": self.seller.to_dict() if self.seller else None,
-                "buyer": self.buyer.to_dict() if self.buyer else None,
-            }
-            with open(AUTH_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
-        except IOError as e:
-            print(f"Error saving ESI auth: {e}")
+            with open(AUTH_FILE, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return
+        for slot in ("seller", "buyer"):
+            entry = data.get(slot) if isinstance(data, dict) else None
+            if not entry or entry.get("character_id") != char.character_id:
+                continue
+            saved = CharacterAuth(entry)
+            if saved.access_token and not saved.is_expired:
+                # Someone else already refreshed — take the whole token set
+                char.access_token = saved.access_token
+                char.refresh_token = saved.refresh_token or char.refresh_token
+                char.token_expiry = saved.token_expiry
+            elif saved.refresh_token and saved.refresh_token != char.refresh_token:
+                # Access token expired too, but the saved refresh token is
+                # newer than ours — refresh with that one
+                char.refresh_token = saved.refresh_token
+            return
 
     # =========================================================================
     # CHARACTER SLOT MANAGEMENT
@@ -437,7 +491,10 @@ class ESIAuth:
                     "client_id": CLIENT_ID,
                     "code_verifier": self._code_verifier
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": ESI_USER_AGENT,
+                },
                 timeout=30
             )
             
@@ -479,7 +536,10 @@ class ESIAuth:
         try:
             response = requests.get(
                 VERIFY_URL,
-                headers={"Authorization": f"Bearer {char.access_token}"},
+                headers={
+                    "Authorization": f"Bearer {char.access_token}",
+                    "User-Agent": ESI_USER_AGENT,
+                },
                 timeout=30
             )
             if response.status_code != 200:
@@ -496,40 +556,56 @@ class ESIAuth:
             return False
 
     def _refresh_token_for(self, char: CharacterAuth) -> bool:
-        """Refresh the access token for a specific character."""
+        """Refresh the access token for a specific character.
+
+        Serialized by _refresh_lock. Inside the lock we re-check expiry
+        (another thread may have refreshed while we waited) and re-read the
+        auth file (another running checkout may have rotated the token).
+        """
         if not char or not char.refresh_token:
             return False
 
-        try:
-            # PKCE refresh doesn't need code_verifier, just client_id
-            response = requests.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": char.refresh_token,
-                    "client_id": CLIENT_ID
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                print(f"Token refresh HTTP {response.status_code}: {response.text[:300]}")
+        with self._refresh_lock:
+            if char.access_token and not char.is_expired:
+                return True
+
+            self._adopt_saved_tokens(char)
+            if char.access_token and not char.is_expired:
+                return True
+
+            try:
+                # PKCE refresh doesn't need code_verifier, just client_id
+                response = requests.post(
+                    TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": char.refresh_token,
+                        "client_id": CLIENT_ID
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": ESI_USER_AGENT,
+                    },
+                    timeout=30
+                )
+
+                if response.status_code != 200:
+                    print(f"Token refresh HTTP {response.status_code}: {response.text[:300]}")
+                    return False
+
+                data = response.json()
+
+                char.access_token = data["access_token"]
+                char.refresh_token = data.get("refresh_token", char.refresh_token)
+                expires_in = data.get("expires_in", 1200)
+                char.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+
+                self._save_auth()
+                return True
+
+            except requests.RequestException as e:
+                print(f"Error refreshing token: {e}")
                 return False
-            
-            data = response.json()
-
-            char.access_token = data["access_token"]
-            char.refresh_token = data.get("refresh_token", char.refresh_token)
-            expires_in = data.get("expires_in", 1200)
-            char.token_expiry = datetime.now() + timedelta(seconds=expires_in)
-
-            self._save_auth()
-            return True
-
-        except requests.RequestException as e:
-            print(f"Error refreshing token: {e}")
-            return False
 
     def refresh_token(self) -> bool:
         """Legacy: refresh seller token."""
@@ -558,7 +634,8 @@ class ESIAuth:
             return {}
         return {
             "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "User-Agent": ESI_USER_AGENT,
         }
 
     def get_seller_headers(self) -> Dict[str, str]:

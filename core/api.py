@@ -616,7 +616,7 @@ class ESIClient(TypeNameMixin):
         from esi.esi_auth import ESIAuth
         from esi.esi_structures import fetch_structure_orders, StructureAccessError
 
-        auth = ESIAuth()
+        auth = ESIAuth.singleton()
         loop = asyncio.get_event_loop()
 
         def _blocking():

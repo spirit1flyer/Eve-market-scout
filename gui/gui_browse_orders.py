@@ -42,7 +42,7 @@ class BrowseStructureOrdersDialog(BrowseOrdersFilterMixin, tk.Toplevel):
         self.structure_id = structure_id
         self.structure_name = structure_name
         self.slot = slot
-        self.auth = ESIAuth()
+        self.auth = ESIAuth.singleton()
         self._type_names: dict[int, str] = {}
 
         self.title(f"Browse Orders — {structure_name}")

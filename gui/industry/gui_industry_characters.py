@@ -19,6 +19,7 @@ from tkinter import ttk
 import requests
 
 from core.tk_queue import submit
+from core.config import ESI_USER_AGENT
 from gui.gui_window_utils import fit_window, make_scrollable
 from core.sound_manager import get_data_dir
 from industry.industry_skills import INDUSTRY_SKILL_IDS
@@ -145,7 +146,7 @@ class CharactersPanel:
             path = _portrait_dir() / f"{cid}.png"
             try:
                 if not path.exists():
-                    resp = requests.get(PORTRAIT_URL.format(cid=cid), timeout=20)
+                    resp = requests.get(PORTRAIT_URL.format(cid=cid), headers={"User-Agent": ESI_USER_AGENT}, timeout=20)
                     resp.raise_for_status()
                     path.write_bytes(resp.content)
                 from PIL import Image

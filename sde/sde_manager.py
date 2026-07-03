@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from core.sound_manager import get_data_dir
 from core.ssl_context import make_connector
+from core.config import ESI_USER_AGENT
 
 
 # File locations
@@ -620,7 +621,7 @@ class SDEManager:
                     return b"".join(chunks)
 
             timeout = aiohttp.ClientTimeout(total=120)
-            async with aiohttp.ClientSession(connector=make_connector(), timeout=timeout) as session:
+            async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}, timeout=timeout) as session:
                 types_bytes = await _download(session, FUZZWORK_TYPES_URL, "invTypes")
                 update("Downloading market-group tree...", 35)
                 market_groups_bytes = await _download(

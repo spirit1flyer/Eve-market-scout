@@ -61,7 +61,7 @@ class TrackingTabManager:
         self._on_characters_changed: Callable = None
         
         # ESI components
-        self.auth = ESIAuth()
+        self.auth = ESIAuth.singleton()
         self.wallet: Optional[ESIWallet] = None
         self.esi_skills: Optional[ESISkills] = None
         self.esi_standings: Optional[ESIStandings] = None

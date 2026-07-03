@@ -8,7 +8,7 @@ from typing import Optional, Callable, List, TYPE_CHECKING
 from esi.esi_wallet import ESIWallet
 from analytics.trade_tracker import TradeTracker
 from core.calculate import format_isk
-from core.config import TRADE_HUBS
+from core.config import TRADE_HUBS, ESI_USER_AGENT
 from core.tk_queue import submit
 
 if TYPE_CHECKING:
@@ -32,17 +32,19 @@ def fetch_market_orders_sync(region_id: int) -> List[dict]:
         # First page to get total pages
         response = requests.get(
             f"{base_url}/markets/{region_id}/orders/",
+            headers={"User-Agent": ESI_USER_AGENT},
             params={"page": 1},
             timeout=30
         )
         response.raise_for_status()
         total_pages = int(response.headers.get("X-Pages", 1))
         all_orders.extend(response.json())
-        
+
         # Fetch remaining pages
         for page in range(2, min(total_pages + 1, 20)):  # Cap at 20 pages for safety
             response = requests.get(
                 f"{base_url}/markets/{region_id}/orders/",
+                headers={"User-Agent": ESI_USER_AGENT},
                 params={"page": page},
                 timeout=30
             )

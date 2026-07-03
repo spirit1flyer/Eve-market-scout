@@ -6,7 +6,7 @@ import asyncio
 import threading
 from typing import Callable, Optional, TYPE_CHECKING
 
-from core.config import DEFAULT_HUB, get_hub_config
+from core.config import DEFAULT_HUB, get_hub_config, ESI_USER_AGENT
 from core.tk_queue import submit
 from gui.watchlist.gui_watchlist_calc_mixin import MaxBuyCalcMixin
 from gui.gui_window_utils import fit_window, make_scrollable
@@ -179,7 +179,7 @@ class AddItemDialog(MaxBuyCalcMixin, tk.Toplevel):
                     
                     async def do_search():
                         client.reset_for_new_loop()
-                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
+                        async with aiohttp.ClientSession(headers={"User-Agent": ESI_USER_AGENT}, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
                             client.session = session
                             return await client.search_item_by_name(search_term)
                     

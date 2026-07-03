@@ -87,12 +87,13 @@ async def download_missing_dates(missing_dates: List[str],
         try:
             import aiohttp
             from core.ssl_context import make_connector
+            from core.config import ESI_USER_AGENT
             url = f"https://data.everef.net/market-history/{year}/market-history-{date_str}.csv.bz2"
             
             print(f"[Debug] Downloading: {url}")
             
             timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
-            async with aiohttp.ClientSession(connector=make_connector(), timeout=timeout) as session:
+            async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}, timeout=timeout) as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         content = await resp.read()

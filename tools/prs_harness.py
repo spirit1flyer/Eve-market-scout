@@ -154,7 +154,7 @@ def main() -> int:
         print(f"slot must be 'seller' or 'buyer', got {slot!r}")
         return 2
 
-    auth = ESIAuth()
+    auth = ESIAuth.singleton()
     char = auth.get_character(slot)
     if not char or not char.access_token:
         print(f"[FAIL] {slot} slot is not authenticated — log in via the app first.")

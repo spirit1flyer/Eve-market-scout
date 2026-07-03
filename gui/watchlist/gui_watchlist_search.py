@@ -81,11 +81,11 @@ class SearchMatchDialog(tk.Toplevel):
                 client = self.get_client() if self.get_client else None
                 if client:
                     import aiohttp
-                    from core.config import REQUEST_TIMEOUT
+                    from core.config import REQUEST_TIMEOUT, ESI_USER_AGENT
 
                     async def do_search():
                         client.reset_for_new_loop()
-                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
+                        async with aiohttp.ClientSession(headers={"User-Agent": ESI_USER_AGENT}, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
                             client.session = session
                             return await client.search_item_by_name(search_term)
 

@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 import aiohttp
 from core.tk_queue import submit
-from core.config import TRADE_HUBS, REQUEST_TIMEOUT
+from core.config import TRADE_HUBS, REQUEST_TIMEOUT, ESI_USER_AGENT
 from core.ssl_context import make_connector
 from core.custom_stations import (
     add_custom_station, get_custom_hub_key, is_custom_hub,
@@ -38,6 +38,7 @@ def _run_async(get_client, coro_fn, callback):
                 client.reset_for_new_loop()
                 async with aiohttp.ClientSession(
                     connector=make_connector(),
+                    headers={"User-Agent": ESI_USER_AGENT},
                     timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
                 ) as session:
                     client.session = session

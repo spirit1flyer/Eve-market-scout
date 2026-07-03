@@ -26,6 +26,7 @@ from dataclasses import dataclass, asdict
 
 from core.sound_manager import get_data_dir
 from core.ssl_context import make_connector
+from core.config import ESI_USER_AGENT
 
 
 # Constants
@@ -252,9 +253,9 @@ class ArchiveDownloader:
         # Estimate ~500KB per file based on typical sizes
         bytes_total_est = total_files * 500 * 1024
         
-        async with aiohttp.ClientSession(connector=make_connector()) as session:
+        async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}) as session:
             self._session = session
-            
+
             for date_str in missing:
                 if self._paused:
                     self._state.paused = True
@@ -436,9 +437,9 @@ class ArchiveDownloader:
         self._state = state
         self._state.paused = False
         
-        async with aiohttp.ClientSession(connector=make_connector()) as session:
+        async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}) as session:
             self._session = session
-            
+
             for date_str in remaining.copy():
                 if self._paused:
                     self._state.paused = True

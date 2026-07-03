@@ -25,6 +25,7 @@ from typing import Optional, List, Callable
 import requests
 
 from core.sound_manager import get_data_dir
+from core.config import ESI_USER_AGENT
 from esi.esi_auth import (
     CharacterAuth,
     OAuthCallbackHandler,
@@ -244,7 +245,10 @@ class IndustryRoster:
                     "client_id": CLIENT_ID,
                     "code_verifier": self._code_verifier,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": ESI_USER_AGENT,
+                },
                 timeout=30,
             )
             if response.status_code != 200:
@@ -271,7 +275,10 @@ class IndustryRoster:
         try:
             response = requests.get(
                 VERIFY_URL,
-                headers={"Authorization": f"Bearer {char.access_token}"},
+                headers={
+                    "Authorization": f"Bearer {char.access_token}",
+                    "User-Agent": ESI_USER_AGENT,
+                },
                 timeout=30,
             )
             if response.status_code != 200:
@@ -296,7 +303,10 @@ class IndustryRoster:
                     "refresh_token": char.refresh_token,
                     "client_id": CLIENT_ID,
                 },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": ESI_USER_AGENT,
+                },
                 timeout=30,
             )
             if response.status_code != 200:
@@ -331,4 +341,5 @@ class IndustryRoster:
         token = self.get_valid_token(character_id)
         if not token:
             return {}
-        return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        return {"Authorization": f"Bearer {token}", "Accept": "application/json",
+                "User-Agent": ESI_USER_AGENT}

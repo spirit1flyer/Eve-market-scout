@@ -6,7 +6,7 @@ import asyncio
 import threading
 from typing import Callable, TYPE_CHECKING
 
-from core.config import TRADE_HUBS, get_hub_config, DEFAULT_HUB
+from core.config import TRADE_HUBS, get_hub_config, DEFAULT_HUB, ESI_USER_AGENT
 from core.tk_queue import submit
 from gui.gui_window_utils import fit_window, make_scrollable
 
@@ -136,7 +136,7 @@ class AddStockItemDialog(tk.Toplevel):
                     
                     async def do_search():
                         client.reset_for_new_loop()
-                        async with aiohttp.ClientSession(connector=make_connector(), timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
+                        async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
                             client.session = session
                             return await client.search_item_by_name(query)
                     

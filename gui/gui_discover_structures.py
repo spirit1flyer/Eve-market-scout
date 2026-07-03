@@ -30,7 +30,7 @@ class DiscoverStructuresDialog(tk.Toplevel):
         on_station_added: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(parent)
-        self.auth = ESIAuth()
+        self.auth = ESIAuth.singleton()
         self.on_station_added = on_station_added
 
         self.title("Find Player Structures")

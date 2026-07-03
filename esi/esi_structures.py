@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from core.config import ESI_USER_AGENT
 from esi.esi_auth import ESIAuth
 
 BASE_URL = "https://esi.evetech.net/latest"
@@ -107,13 +108,15 @@ def is_structure_id(value: int) -> bool:
 def resolve_region_for_system(system_id: int) -> int:
     """Walk system → constellation → region via public ESI (no auth)."""
     r1 = requests.get(
-        f"{BASE_URL}/universe/systems/{system_id}/", timeout=30
+        f"{BASE_URL}/universe/systems/{system_id}/",
+        headers={"User-Agent": ESI_USER_AGENT}, timeout=30
     )
     r1.raise_for_status()
     const_id = r1.json()["constellation_id"]
 
     r2 = requests.get(
-        f"{BASE_URL}/universe/constellations/{const_id}/", timeout=30
+        f"{BASE_URL}/universe/constellations/{const_id}/",
+        headers={"User-Agent": ESI_USER_AGENT}, timeout=30
     )
     r2.raise_for_status()
     return r2.json()["region_id"]

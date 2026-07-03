@@ -171,12 +171,12 @@ class BulkAddDialog(tk.Toplevel):
                 client = self.get_client() if self.get_client else None
                 if client:
                     import aiohttp
-                    from core.config import REQUEST_TIMEOUT
+                    from core.config import REQUEST_TIMEOUT, ESI_USER_AGENT
                     from core.ssl_context import make_connector
-                    
+
                     async def do_match():
                         client.reset_for_new_loop()
-                        async with aiohttp.ClientSession(connector=make_connector(), timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
+                        async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
                             client.session = session
                             
                             for item in self.parsed_items:
