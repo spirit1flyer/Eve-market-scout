@@ -263,6 +263,7 @@ def process_crosshub_low_risk(
     min_total_profit: float,
     min_margin_percent: float,
     min_guaranteed_volume: int = 5,  # Minimum buy order volume at destination
+    reference_date: Optional[str] = None,
 ) -> list[CrossHubDeal]:
     """
     Find guaranteed profit cross-hub deals.
@@ -286,7 +287,9 @@ def process_crosshub_low_risk(
         min_total_profit: Filter
         min_margin_percent: Filter
         min_guaranteed_volume: Minimum buy order volume to consider
-    
+        reference_date: History DB's latest date (YYYY-MM-DD) — anchors the
+                        7d/30d windows so a lagging DB doesn't deflate them
+
     Returns:
         List of CrossHubDeal (guaranteed profit deals)
     """
@@ -334,10 +337,14 @@ def process_crosshub_low_risk(
             continue
         
         # Get sell station history for reference
-        sell_stats = parse_history_stats(sell_station_history.get(type_id, []))
-        
+        sell_stats = parse_history_stats(
+            sell_station_history.get(type_id, []), reference_date
+        )
+
         # Get buy station history for dual-row display
-        buy_stats = parse_history_stats(buy_station_history.get(type_id, []))
+        buy_stats = parse_history_stats(
+            buy_station_history.get(type_id, []), reference_date
+        )
         
         # Get buy station buy order for display
         buy_station_info = buy_station_data.get(type_id, {})
@@ -406,6 +413,7 @@ def process_crosshub_high_risk(
     min_total_profit: float,
     min_margin_percent: float,
     min_velocity: float,
+    reference_date: Optional[str] = None,
 ) -> list[CrossHubDeal]:
     """
     Find high risk cross-hub deals (relist at destination).
@@ -438,7 +446,9 @@ def process_crosshub_high_risk(
         min_total_profit: Filter
         min_margin_percent: Filter
         min_velocity: Minimum daily volume at sell station
-    
+        reference_date: History DB's latest date (YYYY-MM-DD) — anchors the
+                        7d/30d windows so a lagging DB doesn't deflate them
+
     Returns:
         List of CrossHubDeal (high risk deals)
     """
@@ -449,10 +459,14 @@ def process_crosshub_high_risk(
         name = names.get(type_id, f"Unknown ({type_id})")
         
         # Get sell station history - essential for High Risk
-        sell_stats = parse_history_stats(sell_station_history.get(type_id, []))
-        
+        sell_stats = parse_history_stats(
+            sell_station_history.get(type_id, []), reference_date
+        )
+
         # Get Jita history for ceiling cap and price validation
-        jita_stats = parse_history_stats(jita_history.get(type_id, []))
+        jita_stats = parse_history_stats(
+            jita_history.get(type_id, []), reference_date
+        )
         
         # Calculate ceiling at sell station (undercut competition)
         if candidate.sell_station_sell_2nd < float("inf"):
@@ -534,12 +548,14 @@ def process_crosshub_high_risk(
         sell_system_name = sell_sys_info.get("name", "Unknown")
         
         # Get buy station history for dual-row display
-        buy_stats = parse_history_stats(buy_station_history.get(type_id, []))
-        
+        buy_stats = parse_history_stats(
+            buy_station_history.get(type_id, []), reference_date
+        )
+
         # Get buy station buy order for display
         buy_station_info = buy_station_data.get(type_id, {})
         buy_station_buy_price = buy_station_info.get("buy", 0)
-        
+
         deal = CrossHubDeal(
             type_id=type_id,
             name=name,
@@ -605,10 +621,15 @@ def process_crosshub(
     min_velocity: float,
     max_cost: float = None,
     min_guaranteed_volume: int = 5,
+    reference_date: Optional[str] = None,
 ) -> tuple[list[CrossHubDeal], list[CrossHubDeal]]:
     """
     Main entry point for cross-hub scanning.
-    
+
+    reference_date: History DB's latest date (YYYY-MM-DD), threaded into all
+    parse_history_stats calls (same as build_demand_rows) so the everef DB's
+    1-4 day lag doesn't deflate the 7d/30d velocity windows.
+
     Returns:
         (low_risk_deals, high_risk_deals)
     """
@@ -638,6 +659,7 @@ def process_crosshub(
         min_total_profit=min_total_profit,
         min_margin_percent=min_margin_percent,
         min_guaranteed_volume=min_guaranteed_volume,
+        reference_date=reference_date,
     )
     
     # Process High Risk (relist at destination)
@@ -657,6 +679,7 @@ def process_crosshub(
         min_total_profit=min_total_profit,
         min_margin_percent=min_margin_percent,
         min_velocity=min_velocity,
+        reference_date=reference_date,
     )
     
     # Remove duplicates - if something is Low Risk, don't also show in High Risk

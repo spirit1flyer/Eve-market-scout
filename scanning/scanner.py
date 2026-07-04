@@ -446,6 +446,10 @@ class MarketScanner:
         
         update("Finding guaranteed profits...", 80)
         from scanning.scanner_crosshub import process_crosshub
+        # Anchor 7d/30d windows at the history DB's latest date, not the wall
+        # clock — the everef DB lags 1-4 days and would deflate velocity.
+        reference_date = (self.client.market_history.get_latest_date()
+                          if self.client.market_history else None)
         low_risk, high_risk = process_crosshub(
             buy_station_data=buy_data,
             sell_station_data=sell_data,
@@ -464,6 +468,7 @@ class MarketScanner:
             min_velocity=volume_threshold,
             max_cost=max_cost,
             min_guaranteed_volume=min_guaranteed_volume,
+            reference_date=reference_date,
         )
         
         print(f"Cross-hub Low Risk: {len(low_risk)}")
@@ -485,8 +490,7 @@ class MarketScanner:
                 sell_station_key=sell_station_key,
                 buy_skills=buy_skills,
                 sell_skills=sell_skills,
-                reference_date=(self.client.market_history.get_latest_date()
-                                if self.client.market_history else None),
+                reference_date=reference_date,
             )
             print(f"Demand/Restock rows: {len(demand_rows)}")
         except Exception as e:
