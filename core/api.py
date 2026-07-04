@@ -37,8 +37,9 @@ class ESIClient(TypeNameMixin):
         # event loop and gets its own semaphore + session, so concurrent
         # threads can't stomp each other (was the cause of "Semaphore is
         # bound to a different event loop" cross-loop races on cold start).
-        # Entries for closed loops leak in this dict but the loops themselves
-        # are GC'd; cleanup is a TODO for later.
+        # Throwaway-loop owners must call close_loop_state(loop) before
+        # loop.close(), or the entry (and its live session) leaks and can be
+        # inherited by a future loop that reuses the same id().
         self._per_loop: dict[int, dict] = {}
         self._per_loop_lock = threading.Lock()
 
@@ -289,6 +290,24 @@ class ESIClient(TypeNameMixin):
                 headers={"User-Agent": ESI_USER_AGENT},
             )
         return state["session"]
+
+    def close_loop_state(self, loop) -> None:
+        """Close the session tied to `loop` and forget its per-loop entry.
+
+        Must run BEFORE loop.close() (the session close is awaited on that
+        loop). Skipping this leaks the session's sockets, and worse: a future
+        new_event_loop() that lands on the same id() inherits the stale entry —
+        the never-closed session passes ensure_session's .closed check and
+        requests then die with "Event loop is closed".
+        """
+        with self._per_loop_lock:
+            state = self._per_loop.pop(id(loop), None)
+        session = (state or {}).get("session")
+        if session is not None and not session.closed:
+            try:
+                loop.run_until_complete(session.close())
+            except Exception as e:
+                print(f"[API] close_loop_state: session close failed: {e}")
 
     def clear_jita_cache(self):
         """Clear Jita orders cache to force refresh on next scan."""

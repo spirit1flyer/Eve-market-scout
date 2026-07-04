@@ -124,6 +124,16 @@ class ContractsScheduler:
         try:
             loop.run_until_complete(self._cycle_async())
         finally:
+            # Release the shared client's session for this throwaway loop
+            # before closing it — otherwise the session leaks every cycle and
+            # its stale _per_loop entry can be picked up by a later loop with
+            # the same id() ("Event loop is closed" errors).
+            try:
+                client = self.engine.get_client() if self.engine.get_client else None
+                if client is not None:
+                    client.close_loop_state(loop)
+            except Exception as e:
+                _print(f"loop-state cleanup failed: {e}")
             loop.close()
 
     async def _cycle_async(self) -> None:
