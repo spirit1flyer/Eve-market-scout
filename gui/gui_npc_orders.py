@@ -13,6 +13,7 @@ from dataclasses import asdict
 
 from gui.watchlist.gui_watchlist_dialogs import (
     WatchlistItem,
+    watchlist_item_from_dict,
     AddItemDialog,
     BulkAddDialog,
     EditItemDialog
@@ -28,7 +29,7 @@ NPC_ORDERS_FILE = str(get_data_dir() / "npc_orders.json")
 WATCHLIST_TSV_HEADER = "EVE_MARKET_SCOUT_WATCHLIST_V1"
 
 # Columns that should sort numerically
-NPC_ORDERS_NUMERIC_COLUMNS = {"price_under", "price_over", "margin_over", "current_price", "qty"}
+NPC_ORDERS_NUMERIC_COLUMNS = {"price_under", "price_over", "current_price", "qty"}
 
 
 def _trends_from_activity(sales, buys) -> dict:
@@ -185,11 +186,10 @@ class NPCOrdersTabManager:
                 with open(NPC_ORDERS_FILE, "r") as f:
                     data = json.load(f)
                     for item_data in data.get("items", []):
-                        item = WatchlistItem(**item_data)
+                        item = watchlist_item_from_dict(item_data)
                         # Clear market data - should only come from fresh scans
                         item.current_price = None
                         item.current_qty = None
-                        item.current_margin = None
                         self.orders[item.type_id] = item
         except Exception as e:
             print(f"Error loading NPC orders: {e}")
@@ -238,7 +238,7 @@ class NPCOrdersTabManager:
         tree_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Treeview with EXTENDED selection for multi-select
-        columns = ("name", "price_under", "price_over", "margin_over", "current_price", "qty", "status", "notes")
+        columns = ("name", "price_under", "price_over", "current_price", "qty", "status", "notes")
         self.tree = ttk.Treeview(
             tree_pane,
             columns=columns,
@@ -251,7 +251,6 @@ class NPCOrdersTabManager:
         self.tree.heading("name", text="Item Name", command=lambda: self._sort_tree("name"))
         self.tree.heading("price_under", text="Price Under", command=lambda: self._sort_tree("price_under"))
         self.tree.heading("price_over", text="Price Over", command=lambda: self._sort_tree("price_over"))
-        self.tree.heading("margin_over", text="Margin Over %", command=lambda: self._sort_tree("margin_over"))
         self.tree.heading("current_price", text="Current Price", command=lambda: self._sort_tree("current_price"))
         self.tree.heading("qty", text="Qty", command=lambda: self._sort_tree("qty"))
         self.tree.heading("status", text="Status", command=lambda: self._sort_tree("status"))
@@ -261,7 +260,6 @@ class NPCOrdersTabManager:
         self.tree.column("name", width=200, minwidth=150)
         self.tree.column("price_under", width=100, anchor=tk.E)
         self.tree.column("price_over", width=100, anchor=tk.E)
-        self.tree.column("margin_over", width=100, anchor=tk.E)
         self.tree.column("current_price", width=100, anchor=tk.E)
         self.tree.column("qty", width=70, anchor=tk.E)
         self.tree.column("status", width=100, anchor=tk.CENTER)
@@ -337,7 +335,6 @@ class NPCOrdersTabManager:
             "name": "Item Name",
             "price_under": "Price Under",
             "price_over": "Price Over",
-            "margin_over": "Margin Over %",
             "current_price": "Current Price",
             "qty": "Qty",
             "status": "Status",
@@ -383,14 +380,13 @@ class NPCOrdersTabManager:
             status_msg = f"Copied name: {items[0].name}"
         else:
             lines = [WATCHLIST_TSV_HEADER]
-            lines.append("type_id\tname\tprice_under\tprice_over\tmargin_over\tnotes")
+            lines.append("type_id\tname\tprice_under\tprice_over\tnotes")
             for it in items:
                 lines.append("\t".join([
                     str(it.type_id),
                     it.name,
                     str(it.price_under) if it.price_under else "",
                     str(it.price_over) if it.price_over else "",
-                    str(it.margin_over) if it.margin_over else "",
                     (it.notes or "").replace("\t", " ").replace("\n", " "),
                 ]))
             text = "\n".join(lines)
@@ -435,6 +431,10 @@ class NPCOrdersTabManager:
 
         added = 0
         skipped = 0
+        # Old exports carried a margin_over column between price_over and
+        # notes; detect it via the column header so both layouts paste.
+        legacy_margin = "margin_over" in lines[1].split("\t")
+        notes_idx = 5 if legacy_margin else 4
         for line in lines[2:]:
             if not line.strip():
                 continue
@@ -453,15 +453,13 @@ class NPCOrdersTabManager:
             name = parts[1]
             price_under = self._parse_optional_float(parts[2] if len(parts) > 2 else "")
             price_over = self._parse_optional_float(parts[3] if len(parts) > 3 else "")
-            margin_over = self._parse_optional_float(parts[4] if len(parts) > 4 else "")
-            notes = parts[5] if len(parts) > 5 else ""
+            notes = parts[notes_idx] if len(parts) > notes_idx else ""
 
             self.orders[type_id] = WatchlistItem(
                 type_id=type_id,
                 name=name,
                 price_under=price_under,
                 price_over=price_over,
-                margin_over=margin_over,
                 notes=notes,
             )
             added += 1
@@ -713,8 +711,7 @@ class NPCOrdersTabManager:
         """Insert an item into the tree."""
         price_under = f"{item.price_under:,.0f}" if item.price_under else "-"
         price_over = f"{item.price_over:,.0f}" if item.price_over else "-"
-        margin_over = f"{item.margin_over:.1f}%" if item.margin_over else "-"
-        
+
         # Distinguish "no listings" (qty=0) from "never scanned" (qty=None)
         if item.current_price:
             current = f"{item.current_price:,.0f}"
@@ -735,9 +732,7 @@ class NPCOrdersTabManager:
                 alerts.append("UNDER")
             if item.price_over and item.current_price >= item.price_over:
                 alerts.append("OVER")
-            if item.margin_over and item.current_margin and item.current_margin >= item.margin_over:
-                alerts.append("MARGIN")
-            
+
             if alerts:
                 status = " | ".join(alerts)
                 tag = "alert"
@@ -748,7 +743,6 @@ class NPCOrdersTabManager:
             item.name,
             price_under,
             price_over,
-            margin_over,
             current,
             qty,
             status,
@@ -793,7 +787,6 @@ class NPCOrdersTabManager:
             item = self.orders[type_id]
             item.price_under = conditions.get("price_under")
             item.price_over = conditions.get("price_over")
-            item.margin_over = conditions.get("margin_over")
             item.notes = conditions.get("notes", "")
         else:
             self.orders[type_id] = WatchlistItem(
@@ -801,7 +794,6 @@ class NPCOrdersTabManager:
                 name=name,
                 price_under=conditions.get("price_under"),
                 price_over=conditions.get("price_over"),
-                margin_over=conditions.get("margin_over"),
                 notes=conditions.get("notes", "")
             )
         
@@ -847,9 +839,8 @@ class NPCOrdersTabManager:
             item = self.orders[type_id]
             item.price_under = conditions.get("price_under")
             item.price_over = conditions.get("price_over")
-            item.margin_over = conditions.get("margin_over")
             item.notes = conditions.get("notes", "")
-            
+
             self._save_orders()
             self._refresh_display()
 
@@ -940,7 +931,5 @@ class NPCOrdersTabManager:
                 if item.price_under and item.current_price <= item.price_under:
                     alerts.append(item)
                 elif item.price_over and item.current_price >= item.price_over:
-                    alerts.append(item)
-                elif item.margin_over and item.current_margin and item.current_margin >= item.margin_over:
                     alerts.append(item)
         return alerts

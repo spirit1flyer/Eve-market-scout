@@ -8,7 +8,7 @@ for backward compatibility. The actual implementations are split across:
 """
 
 from typing import Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 # Re-export all dialog classes for backward compatibility
 from gui.watchlist.gui_watchlist_add import AddItemDialog
@@ -24,22 +24,28 @@ class WatchlistItem:
     # Alert conditions (None = disabled)
     price_under: Optional[float] = None      # Alert if sell price drops below this
     price_over: Optional[float] = None       # Alert if sell price rises above this
-    margin_over: Optional[float] = None      # Alert if margin % exceeds this
     notes: str = ""                          # Personal notes
     categories: list[str] = field(default_factory=list)  # User-defined category tags (multi)
 
     # Current market data (populated during scan)
     current_price: Optional[float] = None
-    current_margin: Optional[float] = None
     current_qty: Optional[int] = None        # Quantity available at current_price
     last_updated: Optional[str] = None
+
+
+def watchlist_item_from_dict(data: dict) -> WatchlistItem:
+    """Build a WatchlistItem from persisted JSON, dropping unknown keys
+    (e.g. the removed margin_over/current_margin fields in old files)."""
+    known = {f.name for f in fields(WatchlistItem)}
+    return WatchlistItem(**{k: v for k, v in data.items() if k in known})
 
 
 # Expose all public classes
 __all__ = [
     'WatchlistItem',
+    'watchlist_item_from_dict',
     'AddItemDialog',
-    'BulkAddDialog', 
+    'BulkAddDialog',
     'SearchMatchDialog',
     'EditItemDialog',
 ]

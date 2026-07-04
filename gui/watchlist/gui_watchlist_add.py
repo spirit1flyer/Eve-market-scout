@@ -139,16 +139,9 @@ class AddItemDialog(MaxBuyCalcMixin, tk.Toplevel):
 
         row3 = ttk.Frame(cond_frame)
         row3.pack(fill=tk.X, pady=2)
-        ttk.Label(row3, text="Alert if margin OVER:", width=20).pack(side=tk.LEFT)
-        self.margin_over_var = tk.StringVar()
-        ttk.Entry(row3, textvariable=self.margin_over_var, width=15).pack(side=tk.LEFT)
-        ttk.Label(row3, text="%").pack(side=tk.LEFT, padx=5)
-
-        row4 = ttk.Frame(cond_frame)
-        row4.pack(fill=tk.X, pady=2)
-        ttk.Label(row4, text="Notes:", width=20).pack(side=tk.LEFT)
+        ttk.Label(row3, text="Notes:", width=20).pack(side=tk.LEFT)
         self.notes_var = tk.StringVar()
-        ttk.Entry(row4, textvariable=self.notes_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(row3, textvariable=self.notes_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Bind Enter key to search
         self.search_entry.bind("<Return>", lambda e: self._do_search())
@@ -262,13 +255,6 @@ class AddItemDialog(MaxBuyCalcMixin, tk.Toplevel):
             val = self.price_over_var.get().strip().replace(",", "")
             if val:
                 conditions["price_over"] = float(val)
-        except ValueError:
-            pass
-
-        try:
-            val = self.margin_over_var.get().strip().replace("%", "")
-            if val:
-                conditions["margin_over"] = float(val)
         except ValueError:
             pass
 

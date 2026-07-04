@@ -204,20 +204,12 @@ class EditItemDialog(MaxBuyCalcMixin, tk.Toplevel):
         ttk.Entry(row2, textvariable=self.price_over_var, width=15).pack(side=tk.LEFT)
         ttk.Label(row2, text="ISK").pack(side=tk.LEFT, padx=5)
 
-        # Margin over
+        # Notes
         row3 = ttk.Frame(cond_frame)
         row3.pack(fill=tk.X, pady=2)
-        ttk.Label(row3, text="Alert if margin OVER:", width=20).pack(side=tk.LEFT)
-        self.margin_over_var = tk.StringVar(value=str(self.item.margin_over) if self.item.margin_over else "")
-        ttk.Entry(row3, textvariable=self.margin_over_var, width=15).pack(side=tk.LEFT)
-        ttk.Label(row3, text="%").pack(side=tk.LEFT, padx=5)
-
-        # Notes
-        row4 = ttk.Frame(cond_frame)
-        row4.pack(fill=tk.X, pady=2)
-        ttk.Label(row4, text="Notes:", width=20).pack(side=tk.LEFT)
+        ttk.Label(row3, text="Notes:", width=20).pack(side=tk.LEFT)
         self.notes_var = tk.StringVar(value=self.item.notes)
-        ttk.Entry(row4, textvariable=self.notes_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Entry(row3, textvariable=self.notes_var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _on_save(self):
         """Save changes."""
@@ -234,12 +226,6 @@ class EditItemDialog(MaxBuyCalcMixin, tk.Toplevel):
             conditions["price_over"] = float(val) if val else None
         except ValueError:
             conditions["price_over"] = None
-
-        try:
-            val = self.margin_over_var.get().strip().replace("%", "")
-            conditions["margin_over"] = float(val) if val else None
-        except ValueError:
-            conditions["margin_over"] = None
 
         conditions["notes"] = self.notes_var.get().strip()
 

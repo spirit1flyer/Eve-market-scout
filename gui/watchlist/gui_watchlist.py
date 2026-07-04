@@ -3,7 +3,7 @@
 Features:
 - Add items by name (ESI search or local cache)
 - Bulk add from pasted fitting/market format
-- Set custom alert conditions per item (price under X, margin over Y, etc.)
+- Set custom alert conditions per item (price under X, price over Y)
 - Persist watchlist to JSON
 - Right-click to edit/remove items
 - Green tab + row highlighting when alerts trigger
@@ -29,6 +29,7 @@ from dataclasses import asdict
 
 from gui.watchlist.gui_watchlist_dialogs import (
     WatchlistItem,
+    watchlist_item_from_dict,
     AddItemDialog,
     BulkAddDialog,
     EditItemDialog
@@ -44,15 +45,14 @@ WATCHLIST_TSV_HEADER = "EVE_MARKET_SCOUT_WATCHLIST_V1"
 
 
 # Columns that should sort numerically
-WATCHLIST_NUMERIC_COLUMNS = {"price_under", "price_over", "margin_over", "current_price", "qty"}
+WATCHLIST_NUMERIC_COLUMNS = {"price_under", "price_over", "current_price", "qty"}
 
 # Treeview columns + their display titles (shared by every panel).
-WATCHLIST_COLUMNS = ("name", "price_under", "price_over", "margin_over", "current_price", "qty", "system", "status", "notes")
+WATCHLIST_COLUMNS = ("name", "price_under", "price_over", "current_price", "qty", "system", "status", "notes")
 WATCHLIST_COLUMN_TITLES = {
     "name": "Item Name",
     "price_under": "Price Under",
     "price_over": "Price Over",
-    "margin_over": "Margin Over %",
     "current_price": "Current Price",
     "qty": "Qty",
     "system": "System",
@@ -107,7 +107,6 @@ class WatchlistTreePanel:
         self.tree.column("name", width=200, minwidth=150)
         self.tree.column("price_under", width=100, anchor=tk.E)
         self.tree.column("price_over", width=100, anchor=tk.E)
-        self.tree.column("margin_over", width=100, anchor=tk.E)
         self.tree.column("current_price", width=100, anchor=tk.E)
         self.tree.column("qty", width=70, anchor=tk.E)
         self.tree.column("system", width=110, anchor=tk.W)
@@ -168,7 +167,6 @@ class WatchlistTreePanel:
         # Format values
         price_under = f"{item.price_under:,.0f}" if item.price_under else "-"
         price_over = f"{item.price_over:,.0f}" if item.price_over else "-"
-        margin_over = f"{item.margin_over:.1f}%" if item.margin_over else "-"
 
         # Distinguish "no listings" (qty=0) from "never scanned" (qty=None)
         if item.current_price:
@@ -191,8 +189,6 @@ class WatchlistTreePanel:
                 alerts.append("UNDER")
             if item.price_over and item.current_price >= item.price_over:
                 alerts.append("OVER")
-            if item.margin_over and item.current_margin and item.current_margin >= item.margin_over:
-                alerts.append("MARGIN")
 
             if alerts:
                 status = " | ".join(alerts)
@@ -206,7 +202,6 @@ class WatchlistTreePanel:
             item.name,
             price_under,
             price_over,
-            margin_over,
             current,
             qty,
             system,
@@ -343,14 +338,13 @@ class WatchlistTreePanel:
             status_msg = f"Copied name: {items[0].name}"
         else:
             lines = [WATCHLIST_TSV_HEADER]
-            lines.append("type_id\tname\tprice_under\tprice_over\tmargin_over\tnotes")
+            lines.append("type_id\tname\tprice_under\tprice_over\tnotes")
             for it in items:
                 lines.append("\t".join([
                     str(it.type_id),
                     it.name,
                     str(it.price_under) if it.price_under else "",
                     str(it.price_over) if it.price_over else "",
-                    str(it.margin_over) if it.margin_over else "",
                     (it.notes or "").replace("\t", " ").replace("\n", " "),
                 ]))
             text = "\n".join(lines)
@@ -445,12 +439,11 @@ class WatchlistTabManager:
                     data = json.load(f)
                     self.categories = list(data.get("categories", []))
                     for item_data in data.get("items", []):
-                        item = WatchlistItem(**item_data)
+                        item = watchlist_item_from_dict(item_data)
                         # Clear market data - should only come from fresh scans
                         old_price = item.current_price
                         item.current_price = None
                         item.current_qty = None
-                        item.current_margin = None
                         print(f"[Watchlist] Loaded '{item.name}': cleared price {old_price} -> None")
                         self.watchlist[item.type_id] = item
                     # Reconcile: surface any category referenced by an item but
@@ -836,7 +829,11 @@ class WatchlistTabManager:
 
         added = 0
         skipped = 0
-        # lines[0] = magic header, lines[1] = column header, lines[2:] = data
+        # lines[0] = magic header, lines[1] = column header, lines[2:] = data.
+        # Old exports carried a margin_over column between price_over and
+        # notes; detect it via the column header so both layouts paste.
+        legacy_margin = "margin_over" in lines[1].split("\t")
+        notes_idx = 5 if legacy_margin else 4
         for line in lines[2:]:
             if not line.strip():
                 continue
@@ -855,15 +852,13 @@ class WatchlistTabManager:
             name = parts[1]
             price_under = self._parse_optional_float(parts[2] if len(parts) > 2 else "")
             price_over = self._parse_optional_float(parts[3] if len(parts) > 3 else "")
-            margin_over = self._parse_optional_float(parts[4] if len(parts) > 4 else "")
-            notes = parts[5] if len(parts) > 5 else ""
+            notes = parts[notes_idx] if len(parts) > notes_idx else ""
 
             self.watchlist[type_id] = WatchlistItem(
                 type_id=type_id,
                 name=name,
                 price_under=price_under,
                 price_over=price_over,
-                margin_over=margin_over,
                 notes=notes,
                 categories=self._default_categories_for_new(),
             )
@@ -988,7 +983,6 @@ class WatchlistTabManager:
             item = self.watchlist[type_id]
             item.price_under = conditions.get("price_under")
             item.price_over = conditions.get("price_over")
-            item.margin_over = conditions.get("margin_over")
             item.notes = conditions.get("notes", "")
         else:
             # Create new (lands in the active sub-tab's category, if any)
@@ -997,7 +991,6 @@ class WatchlistTabManager:
                 name=name,
                 price_under=conditions.get("price_under"),
                 price_over=conditions.get("price_over"),
-                margin_over=conditions.get("margin_over"),
                 notes=conditions.get("notes", ""),
                 categories=self._default_categories_for_new(),
             )
@@ -1031,7 +1024,6 @@ class WatchlistTabManager:
             item = self.watchlist[type_id]
             item.price_under = conditions.get("price_under")
             item.price_over = conditions.get("price_over")
-            item.margin_over = conditions.get("margin_over")
             item.notes = conditions.get("notes", "")
 
             self._save_watchlist()
@@ -1132,8 +1124,6 @@ class WatchlistTabManager:
         if item.price_under and item.current_price <= item.price_under:
             return True
         if item.price_over and item.current_price >= item.price_over:
-            return True
-        if item.margin_over and item.current_margin and item.current_margin >= item.margin_over:
             return True
         return False
 
