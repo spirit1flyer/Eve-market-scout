@@ -14,7 +14,7 @@ from typing import Optional
 
 from core.config import (
     MIN_PROFIT_PER_UNIT, MIN_TOTAL_PROFIT, SCAM_THRESHOLD,
-    JITA_REGION_ID, MIN_MARGIN_PERCENT, MIN_DAILY_VOLUME,
+    JITA_REGION_ID, JITA_STATION_ID, MIN_MARGIN_PERCENT, MIN_DAILY_VOLUME,
     get_hub_config, DEFAULT_HUB
 )
 from core.api import ESIClient
@@ -152,7 +152,13 @@ class MarketScanner:
         
         update("Processing orders...", 40)
         local_data = self._process_orders(local_orders_filtered)
-        jita_data = self._process_orders(jita_orders)
+        # Jita reference = the 4-4 station book only. The regional dump covers
+        # every Forge station and public citadel, where a single 1-ISK scam or
+        # freeport listing becomes jita_sell — collapsing the scam check and
+        # dragging the jita_sell*1.05 price ceilings down with it.
+        jita_reference = [o for o in jita_orders
+                          if o.get("location_id") == JITA_STATION_ID]
+        jita_data = self._process_orders(jita_reference)
 
         update("Building candidates...", 50)
         candidates = self._build_candidates(local_data, jita_data, max_cost, skip_scam_check=is_jita)
