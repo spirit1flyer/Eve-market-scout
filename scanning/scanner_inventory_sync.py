@@ -232,12 +232,16 @@ def sync_inventory_from_wallet(inventory: "InventoryManager",
                     )
                     results["relists_recorded"] += 1
 
-    # 3. Sales -- after buys so FIFO has lots to consume.
-    for tx in wallet.transactions:
-        if tx.is_buy:
-            continue
-        if tx.type_id not in tracked_type_ids:
-            continue
+    # 3. Sales -- after buys so FIFO has lots to consume. ESI returns
+    # transactions newest-first; consume in chronological order so each
+    # sale draws from the lots it actually sold (processing newest-first
+    # hands the newest sale the oldest lot's cost basis).
+    sells = sorted(
+        (tx for tx in wallet.transactions
+         if not tx.is_buy and tx.type_id in tracked_type_ids),
+        key=lambda t: t.date,
+    )
+    for tx in sells:
         entry = inventory.entries[tx.type_id]
         sales_tax = _sales_tax_for(wallet, tx)
         _, was_new = inventory.record_sale(

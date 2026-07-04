@@ -119,8 +119,13 @@ class InventoryEntry:
 
     @property
     def quantity_held(self) -> int:
-        """Items currently owned (in hangar + currently listed)."""
-        return self.quantity_in - self.quantity_out
+        """Items currently owned (in hangar + currently listed).
+
+        Clamped at 0: an orphan sale (its buy aged out of the ESI window)
+        pushes quantity_out above quantity_in; that imbalance stays visible
+        on the raw counters, but held stock can't be negative.
+        """
+        return max(0, self.quantity_in - self.quantity_out)
 
     @property
     def quantity_listed(self) -> int:
@@ -358,7 +363,8 @@ class InventoryManager:
         """Record a sell transaction with FIFO lot consumption.
 
         Returns (entry, was_new). was_new=False if already recorded.
-        Returns (None, False) if no inventory exists for this type (orphan sale).
+        An orphan sale (no inventory for this type) gets a minimal entry
+        created; unmatched units carry cost basis 0.
         """
         entry = self.entries.get(type_id)
         if entry is None:
