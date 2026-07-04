@@ -28,18 +28,15 @@ from core.sound_manager import get_data_dir
 from core.config import ESI_USER_AGENT
 from esi.esi_auth import (
     CharacterAuth,
-    OAuthCallbackHandler,
     generate_code_verifier,
     generate_code_challenge,
-    _open_url_robust,
+    perform_sso_callback_flow,
     CLIENT_ID,
-    CALLBACK_PORT,
     CALLBACK_URL,
     AUTH_URL,
     TOKEN_URL,
     VERIFY_URL,
 )
-from http.server import HTTPServer
 
 # File path - shared data directory, separate from esi_auth.json
 ROSTER_FILE = str(get_data_dir() / "industry_characters.json")
@@ -200,31 +197,16 @@ class IndustryRoster:
 
         def do_auth():
             try:
-                server = HTTPServer(("localhost", CALLBACK_PORT), OAuthCallbackHandler)
-                server.auth_code = None
-                server.auth_error = None
-                server.timeout = 120
+                code, error = perform_sso_callback_flow(self._get_auth_url())
 
-                auth_url = self._get_auth_url()
-                opened = _open_url_robust(auth_url)
-                if not opened:
-                    print("=" * 70)
-                    print("BROWSER DID NOT OPEN AUTOMATICALLY.")
-                    print("Paste this URL into any browser to continue login:")
-                    print(auth_url)
-                    print("=" * 70)
-
-                while server.auth_code is None and server.auth_error is None:
-                    server.handle_request()
-
-                if server.auth_code:
-                    success, detail = self._exchange_code(server.auth_code)
+                if code:
+                    success, detail = self._exchange_code(code)
                     if success and callback:
                         callback(True, detail)
                     elif callback:
                         callback(False, f"Failed to exchange code: {detail}")
                 elif callback:
-                    callback(False, f"Authorization failed: {server.auth_error}")
+                    callback(False, f"Authorization failed: {error}")
 
             except Exception as e:
                 if callback:

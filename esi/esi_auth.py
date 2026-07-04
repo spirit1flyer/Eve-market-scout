@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import webbrowser
 import threading
 import requests
@@ -141,6 +142,85 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
                 <p>Error: {error}</p>
                 </body></html>
             """.encode())
+
+
+# Only one login flow at a time can hold CALLBACK_PORT. server.timeout is
+# per-handle_request, not overall, so without a deadline an abandoned login
+# (browser closed mid-SSO) listens forever and wedges the port until app
+# restart. The helper below is the single place that binds/releases the port;
+# both the trading login and the industry roster login go through it.
+
+SSO_FLOW_TIMEOUT = 300   # seconds a login may sit unanswered before giving up
+_SSO_POLL_SECONDS = 2    # per-handle_request timeout: cancel/deadline latency
+_SSO_BIND_WAIT = 15      # seconds to wait for a cancelled predecessor to let go
+
+_pending_sso_server = None
+_pending_sso_lock = threading.Lock()
+
+
+def perform_sso_callback_flow(auth_url: str):
+    """Bind the callback port, open the SSO page, wait for the redirect.
+
+    Returns (auth_code, error) — exactly one is set. The port is released on
+    every exit path, and a new call cancels a still-listening previous attempt
+    instead of failing with "Address already in use".
+    """
+    global _pending_sso_server
+
+    with _pending_sso_lock:
+        prev = _pending_sso_server
+    if prev is not None:
+        prev.sso_cancelled = True  # its thread notices within _SSO_POLL_SECONDS
+
+    server = None
+    bind_deadline = time.monotonic() + _SSO_BIND_WAIT
+    while server is None:
+        try:
+            server = HTTPServer(("localhost", CALLBACK_PORT), OAuthCallbackHandler)
+        except OSError as e:
+            if time.monotonic() >= bind_deadline:
+                return None, (f"Port {CALLBACK_PORT} is in use "
+                              f"(maybe another program): {e}")
+            time.sleep(0.5)
+
+    server.auth_code = None
+    server.auth_error = None
+    server.sso_cancelled = False
+    server.timeout = _SSO_POLL_SECONDS
+
+    with _pending_sso_lock:
+        _pending_sso_server = server
+
+    try:
+        opened = _open_url_robust(auth_url)
+
+        # Surface URL if auto-open failed, but keep listening: EVE redirects
+        # to localhost:8888 regardless of how the auth page was reached, so
+        # paste-manually completes the same flow.
+        if not opened:
+            print("=" * 70)
+            print("BROWSER DID NOT OPEN AUTOMATICALLY.")
+            print("Paste this URL into any browser to continue login:")
+            print(auth_url)
+            print("=" * 70)
+
+        deadline = time.monotonic() + SSO_FLOW_TIMEOUT
+        while server.auth_code is None and server.auth_error is None:
+            if server.sso_cancelled:
+                return None, "Login attempt replaced by a newer one"
+            if time.monotonic() >= deadline:
+                return None, (f"Login timed out after {SSO_FLOW_TIMEOUT // 60} "
+                              "minutes - click login again to retry")
+            server.handle_request()
+        return server.auth_code, server.auth_error
+    finally:
+        with _pending_sso_lock:
+            if _pending_sso_server is server:
+                _pending_sso_server = None
+        try:
+            server.server_close()
+        except Exception:
+            pass
 
 
 class CharacterAuth:
@@ -431,30 +511,10 @@ class ESIAuth:
         
         def do_auth():
             try:
-                server = HTTPServer(('localhost', CALLBACK_PORT), OAuthCallbackHandler)
-                server.auth_code = None
-                server.auth_error = None
-                server.timeout = 120
+                code, error = perform_sso_callback_flow(self.get_auth_url())
 
-                auth_url = self.get_auth_url()
-                opened = _open_url_robust(auth_url)
-
-                # Surface URL if auto-open failed, but keep listening: EVE
-                # redirects to localhost:8888 regardless of how the auth page
-                # was reached, so paste-manually completes the same flow.
-                if not opened:
-                    print("=" * 70)
-                    print("BROWSER DID NOT OPEN AUTOMATICALLY.")
-                    print("Paste this URL into any browser to continue login:")
-                    print(auth_url)
-                    print("=" * 70)
-
-                # Wait for callback
-                while server.auth_code is None and server.auth_error is None:
-                    server.handle_request()
-
-                if server.auth_code:
-                    success, error_detail = self._exchange_code(server.auth_code)
+                if code:
+                    success, error_detail = self._exchange_code(code)
                     if success:
                         char = self.get_character(self._pending_slot)
                         if callback:
@@ -463,7 +523,7 @@ class ESIAuth:
                         callback(False, f"Failed to exchange code: {error_detail}")
                 else:
                     if callback:
-                        callback(False, f"Authorization failed: {server.auth_error}")
+                        callback(False, f"Authorization failed: {error}")
 
             except Exception as e:
                 if callback:
