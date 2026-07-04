@@ -164,7 +164,8 @@ class MarketScoutGUI(MainControlsMixin, MainScanMixin):
         # Initialize tracking tab (created last, accesses other managers)
         self.tracking_manager = TrackingTabManager(
             self.notebook,
-            set_status=self._set_status
+            set_status=self._set_status,
+            get_client=self.get_client
         )
         
         # Connect deals manager to tracking for "Track Trade" context menu

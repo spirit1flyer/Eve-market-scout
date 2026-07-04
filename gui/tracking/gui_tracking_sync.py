@@ -15,56 +15,72 @@ if TYPE_CHECKING:
     from gui.tracking.gui_tracking import TrackingTabManager
 
 
-def fetch_market_orders_sync(region_id: int) -> List[dict]:
+def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = None,
+                             order_cache=None) -> List[dict]:
     """
     Fetch market orders synchronously for underbid checking.
-    
+
+    Prefers the scanner's shared region dump (complete order book, no
+    duplicate download). On a cache miss, queries ESI per listed type_id
+    (`?type_id=&order_type=sell`) instead of paging the whole region — the
+    old whole-region path truncated at 20 pages, so hub regions (300+ pages)
+    gave the underbid check a partial book that could miss undercuts.
+
     Args:
         region_id: Region ID to fetch orders from
-        
+        type_ids: type_ids of the user's listings (fallback path fetches
+            only these; empty/None means nothing to check)
+        order_cache: shared OrderCacheStore to peek before hitting ESI
+
     Returns:
         List of market order dicts
     """
+    if order_cache is not None:
+        peeked = order_cache.peek_cached_orders(region_id, max_age_seconds=300)
+        if peeked is not None:
+            orders, age = peeked
+            print(f"[Underbid] Using shared order dump for region {region_id} "
+                  f"(age: {age:.0f}s, {len(orders)} orders)")
+            return orders
+
+    if not type_ids:
+        return []
+
     all_orders = []
     base_url = "https://esi.evetech.net/latest"
-    
-    try:
-        # First page to get total pages
-        response = requests.get(
-            f"{base_url}/markets/{region_id}/orders/",
-            headers={"User-Agent": ESI_USER_AGENT},
-            params={"page": 1},
-            timeout=30
-        )
-        response.raise_for_status()
-        total_pages = int(response.headers.get("X-Pages", 1))
-        all_orders.extend(response.json())
 
-        # Fetch remaining pages
-        for page in range(2, min(total_pages + 1, 20)):  # Cap at 20 pages for safety
-            response = requests.get(
-                f"{base_url}/markets/{region_id}/orders/",
-                headers={"User-Agent": ESI_USER_AGENT},
-                params={"page": page},
-                timeout=30
-            )
-            if response.status_code == 200:
+    for type_id in type_ids:
+        try:
+            page = 1
+            while True:
+                response = requests.get(
+                    f"{base_url}/markets/{region_id}/orders/",
+                    headers={"User-Agent": ESI_USER_AGENT},
+                    params={"type_id": type_id, "order_type": "sell", "page": page},
+                    timeout=30
+                )
+                if response.status_code == 404:
+                    break  # Page vanished, stop
+                response.raise_for_status()
+                total_pages = int(response.headers.get("X-Pages", 1))
                 all_orders.extend(response.json())
-            elif response.status_code == 404:
-                break  # Page vanished, stop
-                
-    except Exception as e:
-        print(f"Error fetching market orders: {e}")
-    
+                if page >= total_pages:
+                    break
+                page += 1
+        except Exception as e:
+            print(f"Error fetching market orders for type {type_id}: {e}")
+
     return all_orders
 
 
 class ESISyncManager:
     """Handles ESI data sync, backfill, and auto-refresh timing."""
     
-    def __init__(self, tracker: TradeTracker, set_status: Callable[[str], None]):
+    def __init__(self, tracker: TradeTracker, set_status: Callable[[str], None],
+                 get_client: Optional[Callable] = None):
         self.tracker = tracker
         self.set_status = set_status
+        self.get_client = get_client  # () -> api.ESIClient (shared instance)
         self.wallet: Optional[ESIWallet] = None
         
         # Auto-refresh state
@@ -261,8 +277,14 @@ class ESISyncManager:
                 hub_config = TRADE_HUBS.get(self.hub_key)
                 if hub_config:
                     region_id = hub_config["region_id"]
+                    listed_type_ids = sorted({
+                        o.type_id for o in self.wallet.orders if not o.is_buy_order
+                    }) if self.wallet else []
+                    order_cache = self.get_client().order_cache if self.get_client else None
                     print(f"Fetching market orders ({self.hub_key})...")
-                    self.market_orders_cache = fetch_market_orders_sync(region_id)
+                    self.market_orders_cache = fetch_market_orders_sync(
+                        region_id, listed_type_ids, order_cache
+                    )
                     print(f"  Got {len(self.market_orders_cache)} orders")
             
             def update():

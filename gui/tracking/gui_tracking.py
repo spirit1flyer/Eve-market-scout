@@ -46,9 +46,11 @@ TRADE_NUMERIC_COLS = {"held", "listed", "avg_buy", "list_price", "profit", "fees
 class TrackingTabManager:
     """Manages the Trade Tracking tab with ESI integration."""
 
-    def __init__(self, notebook: ttk.Notebook, set_status: Callable[[str], None]):
+    def __init__(self, notebook: ttk.Notebook, set_status: Callable[[str], None],
+                 get_client: Callable = None):
         self.notebook = notebook
         self.set_status = set_status
+        self.get_client = get_client
         
         # Selected hub (can be changed by gui_main)
         self.selected_hub = "amarr"
@@ -80,7 +82,8 @@ class TrackingTabManager:
         self._backfill_inventory_from_tracker()
 
         # Sync manager
-        self.sync_manager = ESISyncManager(self.tracker, set_status)
+        self.sync_manager = ESISyncManager(self.tracker, set_status,
+                                           get_client=get_client)
 
         # Underbid monitoring -- now keyed by type_id, fed by inventory listings
         # in _on_esi_refresh. Seed ignored set from persisted entry flags.
