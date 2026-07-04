@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from core.sound_manager import get_data_dir
 from core.ssl_context import make_connector
 from core.config import ESI_USER_AGENT
+from sde.sde_swap import build_then_swap
 
 
 # File locations
@@ -595,18 +596,7 @@ class SDEManager:
                 progress_callback(msg, pct)
         
         update("Starting SDE download...", 0)
-        
-        # Close existing connection
-        self.close()
-        
-        # Remove old database if exists
-        if self.db_path.exists():
-            try:
-                self.db_path.unlink()
-            except Exception as e:
-                update(f"Failed to remove old database: {e}", 0)
-                return False
-        
+
         try:
             # Download invTypes.csv.bz2 + invMarketGroups.csv.bz2
             update("Downloading type data from Fuzzwork...", 5)
@@ -661,76 +651,92 @@ class SDEManager:
             
             update("Building database...", 55)
             
-            # Create database
-            conn = sqlite3.connect(str(self.db_path))
-            conn.execute("""
-                CREATE TABLE types (
-                    type_id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    volume REAL,
-                    market_group_id INTEGER,
-                    published INTEGER,
-                    portion_size INTEGER,
-                    group_id INTEGER,
-                    meta_group_id INTEGER
-                )
-            """)
-            conn.execute("CREATE INDEX idx_market_group ON types(market_group_id)")
-            conn.execute("CREATE INDEX idx_published ON types(published)")
-            conn.execute("CREATE INDEX idx_group ON types(group_id)")
+            # Build the replacement at <db>.new; build_then_swap swaps it
+            # in only on success, so a failed download/build leaves the
+            # previous working DB in place (finding 5-5).
+            with build_then_swap(self.db_path) as tmp_path:
+                conn = sqlite3.connect(str(tmp_path))
+                conn.execute("""
+                    CREATE TABLE types (
+                        type_id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        volume REAL,
+                        market_group_id INTEGER,
+                        published INTEGER,
+                        portion_size INTEGER,
+                        group_id INTEGER,
+                        meta_group_id INTEGER
+                    )
+                """)
+                conn.execute("CREATE INDEX idx_market_group ON types(market_group_id)")
+                conn.execute("CREATE INDEX idx_published ON types(published)")
+                conn.execute("CREATE INDEX idx_group ON types(group_id)")
 
-            conn.execute("""
-                CREATE TABLE market_groups (
-                    market_group_id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    parent_group_id INTEGER
-                )
-            """)
-            conn.execute("CREATE INDEX idx_mg_parent ON market_groups(parent_group_id)")
+                conn.execute("""
+                    CREATE TABLE market_groups (
+                        market_group_id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        parent_group_id INTEGER
+                    )
+                """)
+                conn.execute("CREATE INDEX idx_mg_parent ON market_groups(parent_group_id)")
 
-            # Reprocessing yields. One row per (source type, output material).
-            # quantity is the base yield per portion_size units of type_id.
-            conn.execute("""
-                CREATE TABLE type_materials (
-                    type_id INTEGER NOT NULL,
-                    material_type_id INTEGER NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    PRIMARY KEY (type_id, material_type_id)
-                )
-            """)
-            conn.execute("CREATE INDEX idx_tm_type ON type_materials(type_id)")
+                # Reprocessing yields. One row per (source type, output material).
+                # quantity is the base yield per portion_size units of type_id.
+                conn.execute("""
+                    CREATE TABLE type_materials (
+                        type_id INTEGER NOT NULL,
+                        material_type_id INTEGER NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        PRIMARY KEY (type_id, material_type_id)
+                    )
+                """)
+                conn.execute("CREATE INDEX idx_tm_type ON type_materials(type_id)")
 
-            # Parse CSV
-            # Fuzzwork invTypes columns:
-            # typeID,groupID,typeName,description,mass,volume,capacity,portionSize,
-            # raceID,basePrice,published,marketGroupID,iconID,soundID,graphicID
-            reader = csv.DictReader(io.StringIO(csv_data))
+                # Parse CSV
+                # Fuzzwork invTypes columns:
+                # typeID,groupID,typeName,description,mass,volume,capacity,portionSize,
+                # raceID,basePrice,published,marketGroupID,iconID,soundID,graphicID
+                reader = csv.DictReader(io.StringIO(csv_data))
             
-            update("Importing types...", 60)
+                update("Importing types...", 60)
             
-            records = []
-            count = 0
-            for row in reader:
-                try:
-                    type_id = int(row["typeID"])
-                except (ValueError, KeyError, TypeError):
-                    continue
-                name = row.get("typeName", "") or f"#{type_id}"
-                volume = _parse_optional_float(row.get("volume")) or 0.0
-                market_group = _parse_optional_int(row.get("marketGroupID"))
-                published = _parse_optional_int(row.get("published")) or 0
-                portion_size = _parse_optional_int(row.get("portionSize")) or 1
-                group_id = _parse_optional_int(row.get("groupID"))
-                meta_group = meta_by_type.get(type_id)  # None = Tech I
+                records = []
+                count = 0
+                for row in reader:
+                    try:
+                        type_id = int(row["typeID"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    name = row.get("typeName", "") or f"#{type_id}"
+                    volume = _parse_optional_float(row.get("volume")) or 0.0
+                    market_group = _parse_optional_int(row.get("marketGroupID"))
+                    published = _parse_optional_int(row.get("published")) or 0
+                    portion_size = _parse_optional_int(row.get("portionSize")) or 1
+                    group_id = _parse_optional_int(row.get("groupID"))
+                    meta_group = meta_by_type.get(type_id)  # None = Tech I
 
-                records.append((
-                    type_id, name, volume, market_group,
-                    published, portion_size, group_id, meta_group
-                ))
-                count += 1
+                    records.append((
+                        type_id, name, volume, market_group,
+                        published, portion_size, group_id, meta_group
+                    ))
+                    count += 1
 
-                # Batch insert
-                if len(records) >= 5000:
+                    # Batch insert
+                    if len(records) >= 5000:
+                        conn.executemany(
+                            """INSERT INTO types
+                               (type_id, name, volume, market_group_id,
+                                published, portion_size, group_id, meta_group_id)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            records
+                        )
+                        records = []
+                        pct = int(60 + (count / 50000) * 30)  # Estimate ~47k types
+                        update(f"Imported {count:,} types...", min(pct, 90))
+
+                # Insert remaining
+                if records:
                     conn.executemany(
                         """INSERT INTO types
                            (type_id, name, volume, market_group_id,
@@ -738,64 +744,51 @@ class SDEManager:
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         records
                     )
-                    records = []
-                    pct = int(60 + (count / 50000) * 30)  # Estimate ~47k types
-                    update(f"Imported {count:,} types...", min(pct, 90))
 
-            # Insert remaining
-            if records:
-                conn.executemany(
-                    """INSERT INTO types
-                       (type_id, name, volume, market_group_id,
-                        published, portion_size, group_id, meta_group_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    records
-                )
+                # Import invMarketGroups
+                # Fuzzwork columns: marketGroupID,parentGroupID,marketGroupName,
+                # description,iconID,hasTypes
+                # NOTE: Fuzzwork represents NULL as the literal string "None", not
+                # an empty cell. Naive `int(row["parentGroupID"])` would explode on
+                # every top-level market group (parent is None) and we'd drop those
+                # rows entirely — which is exactly what bit us. Parse defensively.
+                update("Importing market groups...", 94)
+                mg_records = []
+                for row in csv.DictReader(io.StringIO(market_groups_csv)):
+                    try:
+                        mg_id = int(row["marketGroupID"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    name = row.get("marketGroupName", "") or f"#{mg_id}"
+                    parent = _parse_optional_int(row.get("parentGroupID"))
+                    mg_records.append((mg_id, name, parent))
+                if mg_records:
+                    conn.executemany(
+                        "INSERT INTO market_groups (market_group_id, name, parent_group_id) "
+                        "VALUES (?, ?, ?)",
+                        mg_records,
+                    )
 
-            # Import invMarketGroups
-            # Fuzzwork columns: marketGroupID,parentGroupID,marketGroupName,
-            # description,iconID,hasTypes
-            # NOTE: Fuzzwork represents NULL as the literal string "None", not
-            # an empty cell. Naive `int(row["parentGroupID"])` would explode on
-            # every top-level market group (parent is None) and we'd drop those
-            # rows entirely — which is exactly what bit us. Parse defensively.
-            update("Importing market groups...", 94)
-            mg_records = []
-            for row in csv.DictReader(io.StringIO(market_groups_csv)):
-                try:
-                    mg_id = int(row["marketGroupID"])
-                except (ValueError, KeyError, TypeError):
-                    continue
-                name = row.get("marketGroupName", "") or f"#{mg_id}"
-                parent = _parse_optional_int(row.get("parentGroupID"))
-                mg_records.append((mg_id, name, parent))
-            if mg_records:
-                conn.executemany(
-                    "INSERT INTO market_groups (market_group_id, name, parent_group_id) "
-                    "VALUES (?, ?, ?)",
-                    mg_records,
-                )
+                # Import invTypeMaterials (reprocessing yields).
+                # Fuzzwork columns: typeID,materialTypeID,quantity
+                update("Importing reprocessing yields...", 96)
+                tm_records = []
+                for row in csv.DictReader(io.StringIO(type_materials_csv)):
+                    tid = _parse_optional_int(row.get("typeID"))
+                    mtid = _parse_optional_int(row.get("materialTypeID"))
+                    qty = _parse_optional_int(row.get("quantity"))
+                    if tid is None or mtid is None or qty is None:
+                        continue
+                    tm_records.append((tid, mtid, qty))
+                if tm_records:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO type_materials "
+                        "(type_id, material_type_id, quantity) VALUES (?, ?, ?)",
+                        tm_records,
+                    )
 
-            # Import invTypeMaterials (reprocessing yields).
-            # Fuzzwork columns: typeID,materialTypeID,quantity
-            update("Importing reprocessing yields...", 96)
-            tm_records = []
-            for row in csv.DictReader(io.StringIO(type_materials_csv)):
-                tid = _parse_optional_int(row.get("typeID"))
-                mtid = _parse_optional_int(row.get("materialTypeID"))
-                qty = _parse_optional_int(row.get("quantity"))
-                if tid is None or mtid is None or qty is None:
-                    continue
-                tm_records.append((tid, mtid, qty))
-            if tm_records:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO type_materials "
-                    "(type_id, material_type_id, quantity) VALUES (?, ?, ?)",
-                    tm_records,
-                )
-
-            conn.commit()
-            conn.close()
+                conn.commit()
+                conn.close()
             
             # Save version info
             version_info = {
@@ -823,13 +816,9 @@ class SDEManager:
             return True
             
         except Exception as e:
+            # The working DB (if any) was never touched — build_then_swap
+            # already removed the partial .new file.
             update(f"Error: {e}", 0)
-            # Clean up partial database
-            if self.db_path.exists():
-                try:
-                    self.db_path.unlink()
-                except Exception:
-                    pass
             return False
 
 

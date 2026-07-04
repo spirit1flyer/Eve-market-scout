@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from core.sound_manager import get_data_dir
 from core.ssl_context import make_connector
 from core.config import ESI_USER_AGENT
+from sde.sde_swap import build_then_swap
 
 
 # Database and version files
@@ -366,21 +367,7 @@ class SDEIndustryDB:
                 progress_callback(msg, pct)
         
         update("Starting industry data download...", 0)
-        
-        # Clear caches
-        self._product_to_blueprint.clear()
-        self._blueprint_materials.clear()
-        self._activity_time.clear()
-        self._has_activity_time = None
-        
-        # Remove old database
-        if self.db_path.exists():
-            try:
-                self.db_path.unlink()
-            except Exception as e:
-                update(f"Failed to remove old database: {e}", 0)
-                return False
-        
+
         try:
             timeout = aiohttp.ClientTimeout(total=120)
             async with aiohttp.ClientSession(connector=make_connector(), headers={"User-Agent": ESI_USER_AGENT}, timeout=timeout) as session:
@@ -403,11 +390,20 @@ class SDEIndustryDB:
                 if activity_data is None:
                     return False
 
-            # Build database
+            # Build the replacement at <db>.new; build_then_swap swaps it
+            # in only on success, so a failed download/build leaves the
+            # previous working DB in place (finding 5-5).
             update("Building database...", 55)
-            materials_count, products_count, activity_count = self._build_database(
-                materials_data, products_data, activity_data, update
-            )
+            with build_then_swap(self.db_path) as tmp_path:
+                materials_count, products_count, activity_count = self._build_database(
+                    materials_data, products_data, activity_data, update, tmp_path
+                )
+
+            # Clear caches so readers reload from the new DB
+            self._product_to_blueprint.clear()
+            self._blueprint_materials.clear()
+            self._activity_time.clear()
+            self._has_activity_time = None
 
             # Save version info
             version_info = {
@@ -425,12 +421,9 @@ class SDEIndustryDB:
             return True
             
         except Exception as e:
+            # The working DB (if any) was never touched — build_then_swap
+            # already removed the partial .new file.
             update(f"Error: {e}", 0)
-            if self.db_path.exists():
-                try:
-                    self.db_path.unlink()
-                except Exception:
-                    pass
             return False
     
     async def _download_csv(
@@ -472,10 +465,11 @@ class SDEIndustryDB:
         materials_csv: str,
         products_csv: str,
         activity_csv: str,
-        update: Callable
+        update: Callable,
+        db_path: Path
     ) -> Tuple[int, int, int]:
-        """Build SQLite database from CSV data."""
-        conn = sqlite3.connect(str(self.db_path))
+        """Build SQLite database from CSV data at db_path (a swap temp file)."""
+        conn = sqlite3.connect(str(db_path))
 
         # Create tables
         conn.execute("""
