@@ -429,7 +429,10 @@ class HubFilterPhaseMixin:
         Med Risk and High Risk panels also get their indicator column.
         Items with no history return None and are skipped.
         """
-        from analytics.leading_indicators_batch import compute_leading_indicators
+        from analytics.leading_indicators_batch import (
+            compute_leading_indicators,
+            get_reference_date,
+        )
         from analytics.leading_indicators_tracker import (
             get_leading_indicators_tracker,
         )
@@ -468,6 +471,12 @@ class HubFilterPhaseMixin:
             print(f"[StockMarket-{self.hub_key}] LI history pre-fetched "
                   f"({sum(len(v) for v in all_history.values())} rows)")
 
+            # Anchor trend windows at the DB's latest date, not the wall
+            # clock — the everef archive lags 1-4 days (review finding 6-2).
+            reference_date = get_reference_date(market_db)
+            print(f"[StockMarket-{self.hub_key}] LI window anchor: "
+                  f"{reference_date or 'wall clock (DB empty)'}")
+
             # Switch overlay to determinate progress
             submit(lambda t=total: self._show_filter_overlay(
                 f"Computing indicators ({t} items)...", total=t
@@ -487,6 +496,7 @@ class HubFilterPhaseMixin:
                     result = compute_leading_indicators(
                         profile.type_id, self.region_id,
                         history=all_history.get(profile.type_id, []),
+                        reference_date=reference_date,
                     )
                     if result is not None:
                         results.append(result)

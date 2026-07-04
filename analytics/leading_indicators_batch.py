@@ -56,6 +56,10 @@ MIN_SPREAD_BASELINE = 10
 MIN_COMPRESSION_RECENT = 20
 MIN_COMPRESSION_YEARLY = 60
 
+# The everef archive normally lags 1-4 days behind the wall clock. Beyond
+# this many days the daily update is presumed broken and we log an error.
+STALE_DB_ERROR_DAYS = 7
+
 
 # Flags that trigger tier promotion (Low -> Med, Med -> High)
 PROMOTION_FLAGS = {"UNDERCUT SPIRAL", "LIQUIDITY DRAIN"}
@@ -133,10 +137,48 @@ class LeadingIndicatorResult:
 # Public API
 # =============================================================================
 
+def get_reference_date(market_db=None, log=print) -> Optional[str]:
+    """Return the history DB's latest date ('YYYY-MM-DD') for window anchoring.
+
+    The everef archive lags 1-4 days behind the wall clock. Anchoring the
+    30d/7d windows at date.today() leaves the missing days in ONLY the
+    recent window, deflating it up to ~13% against a 5% STABLE threshold —
+    systematic false FALLING verdicts. Anchor at the DB's latest date
+    instead: days after it are "not gathered yet" (window slides back to
+    stay a full 30 days), days before it with no row are genuine
+    zero-trade days.
+
+    Logs an error via log() if the DB has had no new data for more than
+    STALE_DB_ERROR_DAYS — that means the daily archive update is broken.
+    Returns None if the DB is unavailable/empty (callers fall back to the
+    wall clock).
+    """
+    try:
+        if market_db is None:
+            from history.market_history import get_market_history_db
+            market_db = get_market_history_db()
+        latest = market_db.get_latest_date()
+    except Exception as e:
+        print(f"[LeadingIndicators] reference date lookup failed: {e}")
+        return None
+
+    if not latest:
+        return None
+
+    lag_days = (date.today() - date.fromisoformat(latest)).days
+    if lag_days > STALE_DB_ERROR_DAYS:
+        log(f"[LeadingIndicators] ERROR: market history DB has had no new "
+            f"data in {lag_days} days (latest: {latest}). The daily archive "
+            f"update appears broken — indicators are anchored at that date "
+            f"and reflect the market as of then, not today.")
+    return latest
+
+
 def compute_leading_indicators(
     type_id: int,
     region_id: int,
     history: Optional[List[dict]] = None,
+    reference_date: Optional[str] = None,
 ) -> Optional[LeadingIndicatorResult]:
     """Compute leading indicators for one (type_id, region_id) pair.
 
@@ -144,6 +186,12 @@ def compute_leading_indicators(
         history: Pre-fetched history records (from get_full_history_bulk).
             When provided the DB fetch is skipped entirely.  Pass None to
             let this function fetch its own history (single-item path).
+        reference_date: The history DB's latest date ('YYYY-MM-DD') —
+            anchors all trend windows so the archive's 1-4 day lag doesn't
+            deflate the recent side (see get_reference_date). Batch callers
+            should resolve it once and pass it to every item. When None the
+            single-item path resolves it itself; last resort is the wall
+            clock.
 
     Returns None if no history data is available.
     """
@@ -152,6 +200,8 @@ def compute_leading_indicators(
         try:
             market_db = get_market_history_db()
             history = market_db.get_full_history(region_id, type_id, years=3)
+            if reference_date is None:
+                reference_date = get_reference_date(market_db)
         except Exception as e:
             print(f"[LeadingIndicators] fetch error type={type_id} "
                   f"region={region_id}: {e}")
@@ -160,7 +210,8 @@ def compute_leading_indicators(
     if not history:
         return None
 
-    today = date.today()
+    today = (date.fromisoformat(reference_date) if reference_date
+             else date.today())
 
     # Build date->record map
     by_date = {}

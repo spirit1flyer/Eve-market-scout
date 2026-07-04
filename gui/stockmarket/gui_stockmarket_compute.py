@@ -227,7 +227,10 @@ def run_leading_indicators_compute(
     Returns counts: {"computed": N, "skipped": M, "errored": K}.
     Skipped = no-history items.
     """
-    from analytics.leading_indicators_batch import compute_leading_indicators
+    from analytics.leading_indicators_batch import (
+        compute_leading_indicators,
+        get_reference_date,
+    )
     from analytics.leading_indicators_tracker import get_leading_indicators_tracker
     from history.market_history import get_market_history_db
     from analytics import leading_indicators_storage
@@ -255,6 +258,12 @@ def run_leading_indicators_compute(
     history_rows = sum(len(v) for v in all_history.values())
     print(f"[ColdStart-{hub_key}] LI history pre-fetched ({history_rows} rows)")
 
+    # Anchor trend windows at the DB's latest date, not the wall clock —
+    # the everef archive lags 1-4 days (review finding 6-2).
+    reference_date = get_reference_date(market_db)
+    print(f"[ColdStart-{hub_key}] LI window anchor: "
+          f"{reference_date or 'wall clock (DB empty)'}")
+
     if progress_cb:
         progress_cb(0, total, "Computing indicators")
 
@@ -268,6 +277,7 @@ def run_leading_indicators_compute(
             result = compute_leading_indicators(
                 profile.type_id, region_id,
                 history=all_history.get(profile.type_id, []),
+                reference_date=reference_date,
             )
             if result is not None:
                 results.append(result)

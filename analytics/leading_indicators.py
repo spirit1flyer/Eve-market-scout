@@ -84,7 +84,20 @@ def run_leading_indicators(type_id: int, region_id: int, region_name: str, log):
 
     log(f"Days of data: {len(history)}")
 
-    today = date.today()
+    # Anchor windows at the DB's latest date, not the wall clock — the
+    # everef archive lags 1-4 days and would deflate only the recent
+    # window (review finding 6-2). get_reference_date logs an error via
+    # log() if the DB has gone stale (>7 days without new data).
+    from analytics.leading_indicators_batch import get_reference_date
+    reference_date = get_reference_date(market_db, log=log)
+    if reference_date:
+        today = date.fromisoformat(reference_date)
+        lag = (date.today() - today).days
+        log(f"Window anchor: {reference_date} (DB latest, "
+            f"{lag}d behind wall clock)")
+    else:
+        today = date.today()
+        log("Window anchor: wall clock (DB latest date unavailable)")
 
     # Need at least 60 days for trend comparisons
     min_required = RECENT_WINDOW_DAYS + PRIOR_WINDOW_DAYS
