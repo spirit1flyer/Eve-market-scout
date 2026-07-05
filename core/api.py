@@ -103,8 +103,17 @@ class ESIClient(TypeNameMixin):
         key = id(loop)
         with self._per_loop_lock:
             state = self._per_loop.get(key)
+            # id(loop) is only unique among LIVE loops: once a throwaway loop
+            # is GC'd its id can be reused by a fresh loop, resurrecting the
+            # dead loop's semaphore/session (both bound to the now-dead loop).
+            # Identity-check the stored loop and discard any stale entry.
+            if state is not None and state.get("loop") is not loop:
+                print("[API] per-loop state: loop id reuse detected — "
+                      "discarding stale state")
+                state = None
             if state is None:
                 state = {
+                    "loop": loop,
                     "semaphore": asyncio.Semaphore(MAX_CONCURRENT_REQUESTS),
                     "session": None,
                 }
@@ -301,7 +310,14 @@ class ESIClient(TypeNameMixin):
         requests then die with "Event loop is closed".
         """
         with self._per_loop_lock:
-            state = self._per_loop.pop(id(loop), None)
+            state = self._per_loop.get(id(loop))
+            # Only pop if the stored entry actually belongs to THIS loop — an
+            # id(loop) collision could otherwise let us close a live loop's
+            # session out from under it.
+            if state is not None and state.get("loop") is loop:
+                self._per_loop.pop(id(loop), None)
+            else:
+                state = None
         session = (state or {}).get("session")
         if session is not None and not session.closed:
             try:
@@ -685,7 +701,27 @@ class ESIClient(TypeNameMixin):
                 return self.jita_orders_cache
 
         fetch_lock = self.order_cache._get_region_fetch_lock(region_id)
-        fetch_lock.acquire()
+        # This is a threading.Lock (shared process-wide so it serializes
+        # across worker-thread loops too — an asyncio.Lock could not). Acquiring
+        # it directly would BLOCK the event-loop thread across every await in
+        # the locked section, so a second same-loop coroutine racing for the
+        # same region would wedge the whole loop. Acquire off-thread via the
+        # executor so only this coroutine parks. (threading.Lock may be released
+        # from a different thread than acquired it — an RLock could not.)
+        acquire_fut = asyncio.get_running_loop().run_in_executor(
+            None, fetch_lock.acquire)
+        try:
+            await acquire_fut
+        except asyncio.CancelledError:
+            # Cancelled while parked on the acquire (e.g. a wait_for timeout):
+            # the executor thread still completes the acquire eventually, and
+            # nobody below us would release it — the region would wedge
+            # forever. Release it the moment it lands.
+            def _release_orphaned_acquire(f):
+                if not f.cancelled() and f.exception() is None:
+                    fetch_lock.release()
+            acquire_fut.add_done_callback(_release_orphaned_acquire)
+            raise
         try:
             # Re-check after acquiring lock — another thread may have populated cache
             if not force_refresh:

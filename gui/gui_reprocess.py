@@ -13,7 +13,6 @@ Settings row mirrors the ESI-settings UX: auto-pulled values with write-in
 overrides and a refresh button. Diagnostics carry `[ReproDiag]`.
 """
 
-import asyncio
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -293,17 +292,16 @@ class ReprocessTabManager:
         self.set_status("Fetching market prices...")
 
         def work():
+            from gui.gui_async import run_coro_blocking
             prices = {}
             err = None
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    client = self.get_client()
-                    orders = loop.run_until_complete(
-                        client.get_orders_for_hub(hub, use_cache=True))
-                finally:
-                    loop.close()
+                client = self.get_client()
+                # Shared helper owns the throwaway loop + aiohttp session and
+                # closes both (via close_loop_state) so we don't leak a session
+                # per cold-cache Evaluate click.
+                orders = run_coro_blocking(
+                    client, lambda c: c.get_orders_for_hub(hub, use_cache=True))
                 for o in orders:
                     if o.get("is_buy_order"):
                         continue

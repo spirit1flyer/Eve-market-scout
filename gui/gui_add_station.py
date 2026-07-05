@@ -6,54 +6,16 @@ Bottom section: list of existing custom stations with per-station remove control
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import asyncio
-import threading
 from typing import Callable, Optional
 
-import aiohttp
-from core.tk_queue import submit
-from core.config import TRADE_HUBS, REQUEST_TIMEOUT, ESI_USER_AGENT
-from core.ssl_context import make_connector
+from core.config import TRADE_HUBS
 from core.custom_stations import (
     add_custom_station, get_custom_hub_key, is_custom_hub,
     load_custom_stations, remove_custom_station, update_station_in_stockmarket,
 )
 from core import station_data
+from gui.gui_async import run_async as _run_async
 from gui.gui_window_utils import fit_window
-
-
-def _run_async(get_client, coro_fn, callback):
-    """Run an async coroutine in a daemon thread; post result to the Tk main thread."""
-    def worker():
-        client = get_client() if get_client else None
-        if not client:
-            submit(lambda: callback(None, RuntimeError("No ESI client")))
-            return
-
-        result = err = None
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            async def _run():
-                client.reset_for_new_loop()
-                async with aiohttp.ClientSession(
-                    connector=make_connector(),
-                    headers={"User-Agent": ESI_USER_AGENT},
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                ) as session:
-                    client.session = session
-                    return await coro_fn(client)
-
-            result = loop.run_until_complete(_run())
-        except Exception as e:
-            err = e
-            print(f"[AddStation] async error: {e}")
-        finally:
-            loop.close()
-
-        submit(lambda r=result, e=err: callback(r, e))
-
-    threading.Thread(target=worker, daemon=True).start()
 
 
 class AddStationDialog(tk.Toplevel):
