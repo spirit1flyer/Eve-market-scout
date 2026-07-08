@@ -31,9 +31,16 @@ from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 @dataclass
 class Recipe:
-    """A manufacturing/reaction recipe at base (ME 0) quantities."""
+    """A manufacturing/reaction recipe at base (ME 0) quantities.
+
+    `activity` selects the cost mechanics (PLAN §1b, Stage 5.3): "manufacturing"
+    is ME-adjusted and uses the manufacturing facility/cost-index; "reaction"
+    has NO ME (formulas carry none) and uses the reaction facility/cost-index.
+    Defaulting to "manufacturing" preserves every pre-5.3 construction.
+    """
     output_per_run: int
     materials: List[Tuple[int, int]]  # (material_type_id, base_qty_per_run)
+    activity: str = "manufacturing"
 
 
 @dataclass
@@ -64,6 +71,33 @@ class FacilityParams:
 
 
 @dataclass
+class FacilitySet:
+    """Per-activity facility inputs (PLAN §1b, Stage 5.3).
+
+    A chain can mix manufacturing and reaction jobs, each with its own facility
+    (cost index / tax / bonuses). `manufacturing` is always present; `reaction`
+    falls back to `manufacturing` when unset. Public entry points also accept a
+    bare `FacilityParams` (the live GUI passes one today) — the engine wraps it
+    as `FacilitySet(manufacturing=fac)` via `_as_facility_set`.
+    """
+    manufacturing: FacilityParams
+    reaction: Optional[FacilityParams] = None
+
+    def for_activity(self, activity: str) -> FacilityParams:
+        if activity == "reaction" and self.reaction is not None:
+            return self.reaction
+        return self.manufacturing
+
+
+def _as_facility_set(fac) -> FacilitySet:
+    """Normalize a bare FacilityParams (legacy/GUI) or a FacilitySet to a
+    FacilitySet. isinstance keeps existing single-facility callers working."""
+    if isinstance(fac, FacilitySet):
+        return fac
+    return FacilitySet(manufacturing=fac)
+
+
+@dataclass
 class SellFees:
     """Output-side fees. Listing a sell order pays broker + tax on the sale;
     filling an existing buy order (immediate dump) pays sales tax only."""
@@ -89,8 +123,11 @@ class MarketDataProvider(Protocol):
         """CCP 'adjusted' price for EIV. Not a market price."""
         ...
 
-    def cost_index(self, system_id: int) -> float:
-        """Manufacturing system cost index for the facility system."""
+    def cost_index(self, system_id: int, activity: str = "manufacturing") -> float:
+        """System cost index for the facility system and industry activity
+        (PLAN §1b, Stage 5.3). Wave-2 providers implement the 2-arg form
+        natively; legacy single-arg implementations still satisfy the protocol
+        and are supported via the engine's TypeError fallback."""
         ...
 
     def sell_info(self, type_id: int) -> SellInfo:
@@ -113,6 +150,26 @@ def me_adjusted_qty(base_qty: int, me: float, material_bonus_pct: float = 0.0) -
         return base_qty
     factor = (100.0 - me) / 100.0 * (1.0 - material_bonus_pct / 100.0)
     return max(1, math.ceil(base_qty * factor))
+
+
+def job_material_qty(base_qty: int, runs: int, me: float,
+                     material_bonus_pct: float = 0.0) -> int:
+    """Job-level (whole-batch) material quantity — PLAN §1b.
+
+    EVE rounds materials once PER JOB, not per run:
+        max(runs, ceil(round₂(runs × base × (100-ME)/100 × (1 - bonus/100))))
+    The 2-decimal pre-round dodges float artifacts (matches eve-ref's
+    `ManufactureCalculator.materialQuantity`). This INTENTIONALLY differs from
+    `me_adjusted_qty(base, me) × runs`, which overstates multi-run batches; use
+    this wherever a batch total is computed. For `runs == 1` it equals
+    `me_adjusted_qty` (single-run/display path), so single-run results are
+    unchanged.
+    """
+    if base_qty <= 0:
+        return 0
+    runs = max(1, int(runs))
+    factor = (100.0 - me) / 100.0 * (1.0 - material_bonus_pct / 100.0)
+    return max(runs, math.ceil(round(runs * base_qty * factor, 2)))
 
 
 def estimated_item_value(recipe: Recipe, adjusted_fn: Callable[[int], float]) -> float:
@@ -280,6 +337,128 @@ def research_install_cost(eiv: float, research_cost_index: float,
 
 
 # ---------------------------------------------------------------------------
+# Invention (Stage 5.2) — pure, no network
+# ---------------------------------------------------------------------------
+#
+# T2/T3 blueprints are invented, not bought: an invention job consumes datacores
+# (+ optionally one decryptor) and succeeds with some probability, yielding a BPC
+# at ME 2 / TE 4 (base) modified by the decryptor, with a run count from the SDE
+# plus the decryptor's run modifier. The amortized blueprint cost per produced
+# unit folds into the T2 build (PLAN §1b). These functions are pure orchestration
+# inputs — datacore/decryptor PRICES are summed by the CALLER into
+# `attempt_materials_cost`; nothing here fetches.
+
+@dataclass
+class Decryptor:
+    """One invention decryptor (optional consumable that shifts probability and
+    the invented BPC's ME/TE/runs). Field order matches PLAN §1b:
+    probability_mult / me_mod / te_mod / run_mod."""
+    type_id: int
+    name: str
+    probability_mult: float
+    me_mod: int
+    te_mod: int
+    run_mod: int
+
+
+# The 8 decryptors, keyed (and insertion-ordered) by type_id. Data lifted from
+# eve-ref's decryptors.csv (MIT-0). Fields: probability_mult, me_mod, te_mod,
+# run_mod. Data verified against eve-ref (MIT-0) 2026-07-07 —
+# ⚠ re-verify in-game if CCP rebalances decryptors.
+DECRYPTORS: Dict[int, Decryptor] = {
+    34201: Decryptor(34201, "Accelerant",              1.2,  2, 10, 1),
+    34202: Decryptor(34202, "Attainment",              1.8, -1,  4, 4),
+    34203: Decryptor(34203, "Augmentation",            0.6, -2,  2, 9),
+    34204: Decryptor(34204, "Parity",                  1.5,  1, -2, 3),
+    34205: Decryptor(34205, "Process",                 1.1,  3,  6, 0),
+    34206: Decryptor(34206, "Symmetry",                1.0,  1,  8, 2),
+    34207: Decryptor(34207, "Optimized Attainment",    1.9,  1, -2, 2),
+    34208: Decryptor(34208, "Optimized Augmentation",  0.9,  2,  0, 7),
+}
+
+# Invented-BPC base research levels before any decryptor modifier (PLAN §1b).
+INVENTION_BASE_ME = 2
+INVENTION_BASE_TE = 4
+
+# Science-job cost base rate: invention AND copying job cost is 2% × EIV
+# (eve-ref JOB_COST_BASE_RATE, PLAN §1b). ⚠ CCP-tuned — threaded as an
+# overridable parameter (like SCC), never buried.
+SCIENCE_JOB_COST_RATE = 0.02
+
+
+def invention_probability(base_prob: float, sci1_level: int, sci2_level: int,
+                          encryption_level: int,
+                          decryptor_prob_mult: float = 1.0) -> float:
+    """Invention success probability (PLAN §1b, confirmed in eve-ref + EVE-IPH):
+
+        base × (1 + (sci1 + sci2)/30 + encryption/40) × decryptor_mult
+
+    where sci1/sci2 are the two datacore science skills and encryption is the
+    encryption-methods skill. Clamped to [0.0, 1.0].
+    """
+    p = base_prob * (1.0 + (sci1_level + sci2_level) / 30.0
+                     + encryption_level / 40.0) * decryptor_prob_mult
+    return max(0.0, min(1.0, p))
+
+
+def invention_outcome(base_runs: int,
+                      decryptor: Optional[Decryptor] = None) -> dict:
+    """Invented BPC attributes: {"me", "te", "runs"} (PLAN §1b).
+
+    ME 2 / TE 4 base plus the decryptor's modifiers (all 0 when no decryptor);
+    runs = SDE base runs + run modifier, floored at 1.
+    """
+    me_mod = te_mod = run_mod = 0
+    if decryptor is not None:
+        me_mod, te_mod, run_mod = (decryptor.me_mod, decryptor.te_mod,
+                                   decryptor.run_mod)
+    return {
+        "me": INVENTION_BASE_ME + me_mod,
+        "te": INVENTION_BASE_TE + te_mod,
+        "runs": max(1, base_runs + run_mod),
+    }
+
+
+def science_job_cost(eiv: float, cost_index: float, fac: FacilityParams,
+                     base_rate: float = SCIENCE_JOB_COST_RATE) -> float:
+    """Science-activity (invention or copying) job install cost (PLAN §1b).
+
+    The job-cost base is `eiv × base_rate` (2% of EIV, vs full EIV for
+    manufacturing/reactions); the same surcharge shape as `job_install_cost`
+    is then applied to that base. `cost_index` is the invention/copying system
+    cost index. `base_rate` is overridable (⚠ CCP-tuned).
+    """
+    jcb = eiv * base_rate
+    bonus = 1.0 - fac.cost_bonus_pct / 100.0
+    surcharges = (fac.facility_tax_pct + fac.scc_surcharge_pct
+                  + fac.alpha_clone_tax_pct) / 100.0
+    return jcb * cost_index * bonus + jcb * surcharges
+
+
+def invention_cost_per_run(attempt_materials_cost: float,
+                           attempt_job_cost: float,
+                           attempt_copy_cost: float,
+                           probability: float,
+                           runs_per_copy: int) -> float:
+    """Amortized invented-BPC cost charged per produced run (PLAN §1b):
+
+        (datacore+decryptor materials + invention job + copy job)
+        ÷ (probability × runs_per_copy)
+
+    i.e. the expected cost of one usable run given the success rate and the runs
+    a successful copy yields. `attempt_materials_cost` already includes datacore
+    and decryptor prices (summed by the caller). Returns 0.0 as a "not
+    computable / flag as unpriced" sentinel when probability ≤ 0 or
+    runs_per_copy ≤ 0 (a real amortized cost is always > 0, so callers detect
+    the guard by testing for 0.0).
+    """
+    if probability <= 0 or runs_per_copy <= 0:
+        return 0.0
+    total = attempt_materials_cost + attempt_job_cost + attempt_copy_cost
+    return total / (probability * runs_per_copy)
+
+
+# ---------------------------------------------------------------------------
 # Calculator
 # ---------------------------------------------------------------------------
 
@@ -309,57 +488,120 @@ class IndustryCalculator:
     def clear_overrides(self) -> None:
         self.overrides.clear()
 
+    # -- provider cost-index resolution (activity-aware, defensive) ----------
+
+    def _cost_index(self, system_id: int,
+                    activity: str = "manufacturing") -> float:
+        """Resolve a system's cost index for an industry activity via the
+        provider. Wave-2 providers implement the 2-arg form natively; legacy
+        single-arg providers are supported via the TypeError fallback.
+
+        Not on the current job-cost hot path — FacilityParams carries
+        `system_cost_index` pre-resolved by the caller (and FacilitySet keeps it
+        per-activity), so the engine reads that directly. Provided for
+        activity-aware callers/Wave-2 wiring (PLAN §1b, Stage 5.3)."""
+        try:
+            return self.data.cost_index(system_id, activity)
+        except TypeError:
+            return self.data.cost_index(system_id)
+
     # -- recursive cost node -------------------------------------------------
 
-    def cost_node(self, type_id: int, fac: FacilityParams,
-                  me: float, memo: dict) -> dict:
-        """Per-*unit* cost node for one item.
+    def cost_node(self, type_id: int, fac, me: float, memo: dict) -> dict:
+        """Per-*unit* cost node for one item. `fac` may be FacilityParams or
+        FacilitySet (Stage 5.3); a bare FacilityParams is wrapped.
 
         kind: "override" (manual price) | "produced" (sub-build, recursive)
               | "market" (terminal buy at input price).
         Produced nodes carry per-unit material/job breakdown and an `inputs`
         list of {node, qty_per_unit, cost}. Memoized per pass so shared
         sub-chains are computed once. For Tier-1 every material resolves to a
-        "market" node (provider.recipe returns None), so the tree stays flat.
-        """
-        if type_id in memo:
-            return memo[type_id]
+        "market" node (buildable=False), so the tree stays flat.
 
+        Cheapest-of(build, buy): when a material is buildable AND has a recipe
+        AND has a market price > 0, both costs are computed and the cheaper wins
+        (`source` = "build_cheaper"/"buy_cheaper"); the produced subtree is kept
+        on the node either way so the GUI can render the comparison. Without a
+        market price a buildable item is "only_build"; a non-buildable item is a
+        terminal "market" node (source "market" — current T1 behavior).
+        """
+        return self._cost_node(type_id, _as_facility_set(fac), me, memo)
+
+    def _cost_node(self, type_id: int, facset: FacilitySet,
+                   me: float, memo: dict) -> dict:
+        # Override short-circuits everything (activity-independent).
         if type_id in self.overrides:
+            key = (type_id, "override")
+            if key in memo:
+                return memo[key]
             node = {"type_id": type_id, "kind": "override",
                     "unit_cost": self.overrides[type_id], "inputs": []}
-        elif self.buildable is None or self.buildable(type_id):
-            recipe = self.data.recipe(type_id)
-            if recipe and recipe.output_per_run > 0:
-                node = self._produced_node(type_id, recipe, fac, me, memo)
+            memo[key] = node
+            return node
+
+        # Resolve a buildable recipe (if any) up front so the memo key can
+        # carry the node's activity (the same type could otherwise appear under
+        # different facilities). For T1 (buildable=False) the recipe lookup is
+        # skipped entirely, so the flat-chain path is unchanged.
+        recipe = None
+        if self.buildable is None or self.buildable(type_id):
+            r = self.data.recipe(type_id)
+            if r and r.output_per_run > 0:
+                recipe = r
+        activity = recipe.activity if recipe else "market"
+        key = (type_id, activity)
+        if key in memo:
+            return memo[key]
+
+        if recipe:
+            node = self._produced_node(type_id, recipe, facset, me, memo)
+            market_price = self.data.input_price(type_id)
+            if market_price and market_price > 0:
+                node["market_price"] = market_price
+                if market_price < node["unit_cost"]:
+                    # Buying is cheaper: keep the produced subtree for the GUI
+                    # comparison but bill at the market price.
+                    node["build_cost"] = node["unit_cost"]
+                    node["unit_cost"] = market_price
+                    node["kind"] = "market"
+                    node["source"] = "buy_cheaper"
+                else:
+                    node["source"] = "build_cheaper"
             else:
-                node = {"type_id": type_id, "kind": "market",
-                        "unit_cost": self.data.input_price(type_id),
-                        "inputs": []}
+                node["source"] = "only_build"
         else:
             node = {"type_id": type_id, "kind": "market",
                     "unit_cost": self.data.input_price(type_id),
-                    "inputs": []}
+                    "source": "market", "inputs": []}
 
-        memo[type_id] = node
+        memo[key] = node
         return node
 
     def _produced_node(self, type_id: int, recipe: Recipe,
-                       fac: FacilityParams, me: float, memo: dict) -> dict:
+                       facset: FacilitySet, me: float, memo: dict) -> dict:
+        # Reactions carry no ME and use the reaction facility/cost-index (its
+        # FacilityParams.system_cost_index); manufacturing uses ME + the mfg
+        # facility (PLAN §1b, Stage 5.3). The original `me` is threaded through
+        # recursion unchanged — each node decides its own effective ME by its
+        # own activity, so a manufacturing sub-node under a reaction still uses ME.
+        activity = getattr(recipe, "activity", "manufacturing")
+        node_fac = facset.for_activity(activity)
+        eff_me = 0.0 if activity == "reaction" else me
         out = recipe.output_per_run
         inputs = []
         mat_cost = 0.0
         for mat, base_qty in recipe.materials:
-            child = self.cost_node(mat, fac, me, memo)
-            adj_qty = me_adjusted_qty(base_qty, me, fac.material_bonus_pct)
+            child = self._cost_node(mat, facset, me, memo)
+            adj_qty = me_adjusted_qty(base_qty, eff_me, node_fac.material_bonus_pct)
             qty_per_unit = adj_qty / out
             cost = qty_per_unit * child["unit_cost"]
             inputs.append({"node": child, "qty_per_unit": qty_per_unit,
                            "cost": cost})
             mat_cost += cost
         eiv = estimated_item_value(recipe, self.data.adjusted_price)
-        job_per_unit = job_install_cost(eiv, fac) / out
+        job_per_unit = job_install_cost(eiv, node_fac) / out
         return {"type_id": type_id, "kind": "produced",
+                "activity": activity,
                 "unit_cost": mat_cost + job_per_unit,
                 "material_cost": mat_cost, "job_cost": job_per_unit,
                 "output_per_run": out, "inputs": inputs}
@@ -386,7 +628,15 @@ class IndustryCalculator:
             return None
         if memo is None:
             memo = {}
+        facset = _as_facility_set(fac)
         batch = max(1, int(batch))
+
+        # Product activity picks the facility + ME handling (Stage 5.3): a
+        # reaction product uses the reaction facility and NO ME (its formulas
+        # carry none); manufacturing is unchanged.
+        activity = getattr(recipe, "activity", "manufacturing")
+        pfac = facset.for_activity(activity)
+        eff_me = 0.0 if activity == "reaction" else me
 
         out = recipe.output_per_run
         units = out * batch
@@ -394,16 +644,21 @@ class IndustryCalculator:
         inputs = []
         material_cost = 0.0  # total over the whole batch
         for mat, base_qty in recipe.materials:
-            child = self.cost_node(mat, fac, me, memo)
-            run_qty = me_adjusted_qty(base_qty, me, fac.material_bonus_pct)
-            total_qty = run_qty * batch
+            child = self._cost_node(mat, facset, me, memo)
+            # Per-run qty is the ME-adjusted single-run figure (display); the
+            # batch total uses job-level rounding (PLAN §1b) — max(runs,
+            # ceil(round₂(...))) — which is NOT run_qty × batch for fractional
+            # per-run quantities. batch=1 collapses to run_qty (unchanged).
+            run_qty = me_adjusted_qty(base_qty, eff_me, pfac.material_bonus_pct)
+            total_qty = job_material_qty(base_qty, batch, eff_me,
+                                         pfac.material_bonus_pct)
             cost = total_qty * child["unit_cost"]
             inputs.append({"node": child, "run_qty": run_qty,
                            "total_qty": total_qty, "cost": cost})
             material_cost += cost
 
         eiv = estimated_item_value(recipe, self.data.adjusted_price)
-        job_cost = job_install_cost(eiv, fac) * batch
+        job_cost = job_install_cost(eiv, pfac) * batch
 
         bpc_cost = max(0.0, blueprint_cost_per_run) * batch
         total_build = material_cost + job_cost + bpc_cost
@@ -415,6 +670,7 @@ class IndustryCalculator:
         result = {
             "type_id": product_type_id,
             "me": me,
+            "activity": activity,
             "batch": batch,
             "output_per_run": out,
             "units": units,

@@ -8,6 +8,10 @@ Phase 4 build-time / research-time math, not the Phase 1 cost engine.
 Auth comes from `IndustryRoster.get_auth_headers(character_id)`; the roster's
 scope set already includes `esi-skills.read_skills.v1`. Parse math mirrors
 `esi_skills.ESISkills` but is keyed per character_id rather than seller/buyer.
+Also exposes full-sheet by-skill-id accessors (`get_skill_level`/
+`peek_skill_level`, Stage 5.4) — the cache already holds every skill on the
+sheet (`raw_skills`), so invention's arbitrary science/encryption skill_ids
+(not in `INDUSTRY_SKILL_IDS`) can be read without adding named entries.
 """
 
 import requests
@@ -100,6 +104,33 @@ class IndustrySkills:
     def get_level(self, character_id: int, skill_name: str) -> int:
         """Level of one named skill (0 if unknown/not trained)."""
         return self.get_levels(character_id).get(skill_name.lower(), 0)
+
+    def get_skill_level(self, character_id: int, skill_id: int) -> int:
+        """Level of ANY skill by its type_id (0 if unknown/not trained).
+
+        Fetches if not cached (like `get_levels`). Unlike `get_level`, this
+        isn't limited to `INDUSTRY_SKILL_IDS` — the ESI sheet already carries
+        every trained skill, so this reads it directly (Stage 5.4: invention's
+        two datacore-science skills + the encryption skill vary per blueprint
+        and aren't named entries).
+        """
+        cache = self._cache.get(character_id)
+        if not cache or cache.is_expired:
+            self.fetch(character_id)
+            cache = self._cache.get(character_id)
+        if not cache:
+            return 0
+        return cache.raw_skills.get(skill_id, 0)
+
+    def peek_skill_level(self, character_id: int, skill_id: int) -> Optional[int]:
+        """Level of ANY skill by its type_id, from cache ONLY — never triggers
+        a network fetch. Returns None if nothing is cached (or it expired), so
+        a UI-thread caller can fall back to an assumed level. Mirrors
+        `peek_levels`' naming."""
+        cache = self._cache.get(character_id)
+        if not cache or cache.is_expired:
+            return None
+        return cache.raw_skills.get(skill_id, 0)
 
     def peek_levels(self, character_id: int) -> Optional[Dict[str, int]]:
         """Named skill levels from cache ONLY — never triggers a network fetch.

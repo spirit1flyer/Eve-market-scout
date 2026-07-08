@@ -1,4 +1,4 @@
-# Industry Tab — Master Project Plan (Rev 7)
+# Industry Tab — Master Project Plan (Rev 8)
 
 Status: **PHASE 3 (3.1–3.4) IMPLEMENTED (2026-06-27).** Stage 3.4 added BPC
 pricing: engine `calc_full(blueprint_cost_per_run=...)` folds amortized BPC cost
@@ -61,6 +61,22 @@ Phases 2–7 (characters/blueprints/research/T2/T3/reactions) still TODO. Public
 feature (normal committed files, no `drug_` prefix). Research R1–R8 resolved
 2026-06-21; EVE mechanics verified against EVE University / EVE Ref 2026-06-21.
 
+Rev 8 (2026-07-07) — **Phases 5–7 scoped in detail** (the "industry upgrade";
+detailed stages in §8). Decisions (Caleb): T2 costing goes **full chain** in the
+first slice (components recurse into activity-11 reactions down to raw moon
+goo — not market-priced components); **decryptors** = hardcoded 8-decryptor
+table + per-item dropdown defaulting to None; **T3 is a fast-follow** reusing
+the same machinery; the Extra sub-tab (Phase 7) becomes a thin reuse layer.
+Mechanics correction: **activity 7 (reverse engineering) no longer exists** —
+T3 relics run through invention (activity 8), so Phase 6 needs no SDE work
+beyond Phase 5's import. Key insight driving the scope: T2/T3 *manufacturing*
+math already works (activity-1 rows for T2/T3 blueprints are already imported
+and priced — that's how the tech-level chips show them, just "understated");
+the missing pieces are the **invention layer** (datacores / decryptors /
+probability / copy cost, amortized into cost-per-run — rides the existing
+`blueprint_cost_per_run` path from Stage 3.4) and the **reaction layer**
+(activity 11) underneath T2 components.
+
 Rev 7 (post-review fixes): job-cost constants flagged for live-verify + made
 overridable (NPC facility tax 0.25% confirmed; **SCC surcharge is CCP-tuned —
 do not hardcode blind**, it was raised again and changed in the July 2025
@@ -122,6 +138,60 @@ Input and output axes are orthogonal; the top-bar toggle controls **input**.
   and reading owned **ME/TE/runs**.
 - **BPO cost** amortizes to ~0 (bought once, runs ~forever) → not pulled;
   optional write-in.
+
+### 1b. Invention / reaction mechanics — verified against open source (2026-07-07)
+
+Cross-checked two battle-tested open-source implementations: **EVE Ref's
+industry-cost API** (`autonomouslogic/eve-ref`, Java, MIT-0, "backed by
+evidence pulled from the game and tested thoroughly" — files
+`industry/InventionCalculator.java`, `IndustryMath.java`,
+`IndustryConstants.java`, `ManufactureCalculator.java`,
+`CopyingCalculator.java`, `resources/industry/decryptors.csv`, `skills.csv`)
+and **EVE-IPH** (`EVEIPH/EVE-IPH`, VB.NET, NO license — glean facts only,
+never port code; `Blueprint.vb:2350–2560`). Where both agree we treat the
+mechanic as confirmed; in-game spot-check remains a 5.4 verify step but the ⚠
+weight drops.
+
+- **Invention probability** = `base × (1 + (sci1+sci2)/30 + encryption/40) ×
+  decryptor_mult` — identical in both (eve-ref `InventionCalculator:218`, IPH
+  `Blueprint.vb:2550`). IPH's "typical" fallback assumes **all skills at 4** —
+  matches our assumed-level write-in default.
+- **Invention EIV** = Σ(base_qty × adjusted_price) over the **invented (T2/T3)
+  blueprint's MANUFACTURING materials** × runs — NOT the T1 BP's materials and
+  NOT the datacores. (Easy to get wrong.)
+- **Science-job cost base** (invention AND copying) = **2% × EIV**
+  (`JOB_COST_BASE_RATE = 0.02`); total job cost = jcb × activity_cost_index
+  + facility_tax × jcb + SCC 4% × jcb + alpha 0.25% × jcb. Manufacturing and
+  reactions apply the same shape to **full EIV** (no 2%) — confirms our
+  Phase 1 formula. SCC 4% / alpha 0.25% confirmed as current.
+- **Invented BPC** = ME 2 / TE 4 base + decryptor modifiers; **runs per copy**
+  = `industryActivityProducts.quantity` (activity 8) + decryptor run modifier.
+  Consumables per attempt = activity-8 datacores + 1 decryptor (consumed on
+  failure too). Expected cost/run = total ÷ (attempts × probability ×
+  runs_per_copy) — same amortization in both references.
+- **Decryptor table** (type_ids 34201–34208: prob× / +ME / +TE / +runs) lifted
+  from eve-ref's `decryptors.csv` (MIT-0): Accelerant 1.2/+2/+10/+1,
+  Attainment 1.8/−1/+4/+4, Augmentation 0.6/−2/+2/+9, Parity 1.5/+1/−2/+3,
+  Process 1.1/+3/+6/+0, Symmetry 1.0/+1/+8/+2, Optimized Attainment
+  1.9/+1/−2/+2, Optimized Augmentation 0.9/+2/0/+7.
+- **Skill classification**: of the 3 required invention skills
+  (`industryActivitySkills`), the encryption skill is identifiable by name
+  (`* Encryption Methods`, incl. Sleeper for T3); the other two are the
+  datacore sciences. (eve-ref curates the same split in `skills.csv`.)
+- **⚠ Job-level material rounding (affects existing T1 batch math too):** EVE
+  rounds materials per JOB, not per run: `max(runs, ceil(round₂(runs × base ×
+  me_mod × structure_mod × rig_mod)))` (eve-ref
+  `ManufactureCalculator.materialQuantity`, incl. the 2-decimal pre-round to
+  dodge float artifacts). Our engine's per-run `me_adjusted_qty × batch`
+  OVERSTATES multi-run batches — fix in 5.3.
+- **Reactions** = same calc as manufacturing with the reaction cost index,
+  me=0 (formulas have no ME), structure material modifier NOT applied (reaction
+  rigs only); reaction skill affects time only.
+- **Time modifiers**: invention time = base × AdvIndustry × structure × rig (TE
+  irrelevant); copy time additionally gets Science skill (5%/lvl).
+- eve-ref also ships the whole thing as a **local Docker HTTP API** — usable as
+  an oracle to cross-verify our engine's numbers in tests (verification tool
+  only, not a runtime dependency).
 
 ---
 
@@ -254,22 +324,41 @@ total job time ≤ 30 days (single run > 30 days → max 1); selectable max. Bui
 time = base time × TE × Industry/Advanced Industry (selected "Built by" char) ×
 write-in implant %.
 
-### Phase 5 — T2 manufacturing
-Deps: Phase 1, Phase 3, **SDE expand for activityID 8 (invention)**. T2 recipes
-present (activity 1); components recurse to moon materials; invention via
-datacores/decryptors. T2 sub-tab live.
+### Phase 5 — T2: invention + full input chain (incl. reactions)
+Deps: Phases 1–4 (all landed). **SDE expand for ALL activities** (8 invention +
+11 reactions in one import — see stage 5.1). T2 build cost = T1 base item +
+components **recursed full-chain** (component activity-1 recipes → advanced
+moon materials → activity-11 reactions → raw moon goo, per-node
+cheapest-of(build, buy) with a source label) + **invented-BPC cost/run**
+(datacores + decryptor + invention job cost + copy job cost, ÷ (probability ×
+runs/BPC)) — and the T2 item is manufactured at the invented **ME2/TE4
+(+decryptor mods)**, NOT the global ME write-in. Probability = base ×
+(1 + (sci1+sci2)/30 + encryption/40) × decryptor (⚠ verify formula constants);
+science/encryption skill levels come from a full-sheet per-character skill
+cache (required skills per blueprint from `industryActivitySkills`), with a
+write-in assumed level when no Built-by character is set. Reaction jobs: no ME,
+reaction cost index, own facility row (refineries, low/null only). T2 sub-tab
+live.
 
-### Phase 6 — T3 manufacturing
-Deps: Phase 1/3, **SDE expand for activityID 7 (reverse engineering)**.
+### Phase 6 — T3 manufacturing (fast-follow)
+Deps: Phase 5 (machinery reused wholesale — **no new SDE work**; relics are the
+activity-8 "blueprint" type_ids). T3 = invention from ancient relics (3 quality
+tiers with different base probability/runs) consuming datacores; relic priced
+at hub (thin market → history fallback). Relic-quality selector in the detail
+panel. T3 sub-tab live.
 
-### Phase 7 — Reactions
-Deps: Phase 5, **SDE expand for activityID 11 (reactions)**. Extra sub-tab live.
+### Phase 7 — Extra sub-tab (reactions & components as products)
+Deps: Phase 5 (reaction/component costing already built for the T2 chain).
+Rank activity-11 formulas + T2 components as sellable products in their own
+right (moon goo → advanced materials → components margins). Mostly UI reuse.
 
 ---
 
 ## 6. Deferred / future
 
-- **Ignore option on list items (session + always).** Right-click an item in the
+- **Ignore option on list items — DONE 2026-06-28** (`industry/industry_ignore.py`,
+  persistent-only variant + "Expired …" auto-hide; session-only mode not built).
+  Original note: Right-click an item in the
   Top Profit lists to ignore it. Two modes: **this session only** (in-memory set,
   cleared on restart) and **always** (persisted, mirrors the `ignored_items.json`
   pattern used elsewhere — own file e.g. `industry_ignored.json`). Ignored items
@@ -296,9 +385,9 @@ Deps: Phase 5, **SDE expand for activityID 11 (reactions)**. Extra sub-tab live.
 | 2    | Characters tab: ESI roster (skills+standings) + write-in implants | esi_auth PKCE helpers (import) |
 | 3    | Owned BPO/BPC master list + blueprint DB + R8 harvest | Phase 2 |
 | 4    | Research popup + time-based batch cap | Phase 2, Phase 3 |
-| 5    | T2 | Phase 1+3, SDE activity 8 |
-| 6    | T3 | Phase 1+3, SDE activity 7 |
-| 7    | Reactions | Phase 5, SDE activity 11 |
+| 5    | T2: invention + full chain (incl. reactions) | Phases 1–4, SDE all-activities import (8 + 11) |
+| 6    | T3 (relic invention, fast-follow) | Phase 5 (no new SDE work) |
+| 7    | Extra sub-tab (reactions/components as products) | Phase 5 |
 
 ---
 
@@ -384,12 +473,71 @@ before the next. Pure-calc stages get a `test_*.py` (pattern:
   skills+implants, cost from indices, totals; on owned + planned. **Verify: ME10
   cost/time reconcile with in-game. Ship + bump.**
 
-### Phases 5–7 — T2 / T3 / Reactions (each, same 3-stage shape)
-- x.1 Expand `sde/sde_industry.py` importer + schema for the activity (8 invention /
-  7 reverse-eng / 11 reactions); re-download SDE. **Verify: recipes present.**
-- x.2 Recursive chain costing in `industry_engine` for the new tier (components →
-  terminal market buys; invention/RE/reaction job cost). → engine tests.
-- x.3 Light up the TBA sub-tab + Top Profit ranking. **Ship + bump (ask: major?).**
+### Phase 5 — T2: invention + full input chain (scoped Rev 8)
+- 5.1 SDE expand (`sde/sde_industry.py`): add `activity_id` to
+  `industry_materials` / `industry_products` (PK gains the column) and import
+  **ALL activities**; import `industryActivityProbabilities.csv` →
+  `industry_probabilities` (invention base probability per T1-BP → T2-BP pair;
+  the products-row `quantity` for activity 8 = base invented runs — verify at
+  import) and `industryActivitySkills.csv` → `industry_skills_req` (which
+  science/encryption skills gate each invention). Existing activity-1 readers
+  unchanged (default `activity_id=1`); new readers `get_invention(t1_bp_id)`
+  (→ output BP, probability, base runs, datacores), `get_formula_for_product
+  (type_id)` (activity-11 reverse lookup) and `get_required_skills(bp,
+  activity)`. Guard `has_invention_data()` (mirrors `has_activity_time_data`);
+  **existing installs need an SDE re-download**. **Verify: DCII invention row
+  (prob/runs/datacores) + a composite reaction formula print correctly.**
+- 5.2 Engine invention math (pure + tests): hardcoded 8-decryptor table (from
+  eve-ref's MIT-0 `decryptors.csv`, §1b — verified data, keep overridable),
+  `invention_probability(base, sci1, sci2, enc, decryptor_mult)` (formula
+  confirmed in BOTH references, §1b), `invention_attempt_cost` (datacores +
+  decryptor + invention job cost + copy job cost; science-job cost base =
+  **2% × EIV** where EIV is over the INVENTED blueprint's manufacturing
+  materials — confirmed, §1b; keep the 2% overridable like SCC),
+  `invention_cost_per_run` = attempt ÷ (probability × runs_per_bpc); invented
+  BPC = ME2/TE4 + decryptor mods, and T2 manufacture MUST use that ME, not the
+  global write-in. → extend `tests/test_industry_engine.py`; optionally
+  cross-verify vectors against eve-ref's local Docker API.
+- 5.3 Engine chain expansion (pure + tests): activity-aware produced nodes —
+  manufacturing (ME-adjusted, mfg cost index) vs **reaction** (no ME, reaction
+  cost index, its own `FacilityParams`, no structure material mod); per-node
+  **cheapest-of(build, buy)** with a `source` label on the node (mirrors
+  drug_engine's cost rule; per-node price override stays a future hook). Memo
+  key gains activity/facility. **Also fix material rounding to job-level**
+  (§1b: `max(runs, ceil(round₂(runs × base × mods)))` — the current per-run
+  ceil × batch overstates T1 batches too). → tests: nested component →
+  reaction → moon-goo chain locks the contract + a batch-rounding case.
+- 5.4 Provider/data (`industry/industry_market_data.py` +
+  `industry/industry_skills.py`): keep **per-activity cost indices** (invention
+  + reaction — `/industry/systems/` already returns them); price datacores /
+  decryptors / relics through the existing peek + history-fallback path; skill
+  cache becomes **full-sheet** (`get_level(char_id, skill_id)` — ESI returns
+  all skills anyway, just stop filtering to the 4 IDs); write-in "assumed
+  invention skill level" (default 4) when no Built-by char. **Verify headless:
+  Hammerhead II / Damage Control II / a T2 frigate land within ~5% of
+  Adam4EVE / in-game numbers.**
+- 5.5 UI (`gui/industry/gui_industry.py` + a T2 list reusing the Phase 1
+  factories): "Top Profit — T2" sub-tab (same columns/filters/ignore); detail
+  panel gains an **Invention section** (datacores, decryptor dropdown [None
+  default], probability at Built-by skills, expected attempts, invented BPC
+  ME/TE/runs, amortized cost/run) + copy-cost line + a **Reaction facility
+  row** (system / tax / bonuses, persisted to `industry_settings.json`); chain
+  tree nests components → reactions → goo with source labels. Also fold in the
+  deferred review stray: replace the hardcoded `SellFees(broker=3.0, tax=4.5)`
+  in `gui_industry.py` `_fees()` with `calculate.load_cached_skills(sell_hub)`
+  + `get_broker_fee_rate`/`get_sales_tax_rate` (current constants as fallback)
+  — REVIEW_handoff_2026-07-05.md stray item, explicitly deferred to Phase 5.
+  **Ship + bump (ask: major?).**
+
+### Phase 6 — T3 (fast-follow)
+- 6.1 Relic-based invention wiring (reuse 5.2 helpers; relic = consumed input
+  priced at hub; quality selector Intact/Malfunctioning/Wrecked in the detail
+  panel — ranked list uses the cheapest viable relic). T3 sub-tab live.
+  **Verify: a subsystem + a T3 hull reconcile with known values. Ship.**
+
+### Phase 7 — Extra sub-tab
+- 7.1 Rank activity-11 formulas + T2 components as products (build cost via
+  the 5.3 chain, sell side via existing margins/history). **Ship + bump.**
 
 ### Cross-cutting (apply throughout)
 - Map maintenance: update `CLAUDE.md` GUI/SDE/ESI sections as each `.py` lands.

@@ -26,8 +26,14 @@ from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 from core.sound_manager import get_data_dir
+from sde.sde_industry import ACTIVITY_REACTION, ACTIVITY_INVENTION
 
-from industry.industry_engine import Recipe, SellInfo, FacilityParams, SellFees
+from industry.industry_engine import (
+    Recipe, SellInfo, FacilityParams, SellFees,
+    Decryptor,
+    invention_probability, invention_outcome, science_job_cost,
+    invention_cost_per_run, estimated_item_value,
+)
 
 CACHE_FILE = str(get_data_dir() / "industry_market_cache.json")
 SETTINGS_FILE = str(get_data_dir() / "industry_settings.json")
@@ -47,10 +53,14 @@ OUTLIER_MIN_FRACTION = 0.5
 
 # Industry activities we pull cost indices for. T1 only needs manufacturing;
 # the rest are pulled now so later phases (research/invention/reactions) need
-# no refetch.
+# no refetch. ⚠ Exact ESI spelling (verified live 2026-07-08 against
+# /industry/systems/): "researching_material_efficiency" /
+# "researching_time_efficiency" — NOT "research_material_efficiency" /
+# "research_time_efficiency". Getting this wrong silently drops both indices
+# at fetch time (the Stage 5.4 bug this comment guards against).
 INDUSTRY_ACTIVITIES = (
-    "manufacturing", "research_material_efficiency",
-    "research_time_efficiency", "copying", "invention",
+    "manufacturing", "researching_material_efficiency",
+    "researching_time_efficiency", "copying", "invention",
     "reaction",
 )
 
@@ -191,6 +201,232 @@ class BpcPricing:
 
         return {"per_run": 0.0, "source": "unset", "price": 0.0,
                 "runs": 0, "offer_count": 0}
+
+
+# ---------------------------------------------------------------------------
+# Invention pricing (Stage 5.4): amortized invented-BPC cost/run for T2
+# ---------------------------------------------------------------------------
+
+class InventionPricing:
+    """Resolves a T2 product's amortized invented-BPC cost/run + display facts.
+
+    Combines the Stage 5.1 SDE readers (get_invention / get_invention_sources /
+    get_required_skills), the Stage 5.2 engine math (invention_probability /
+    invention_outcome / science_job_cost / invention_cost_per_run), and this
+    module's prices (adjusted_price for EIV; the caller's input_price_fn for
+    datacores/decryptor — the GUI passes IndustryProvider.input_price so those
+    materials get the same peek + history-fallback path as every other
+    material). Mirrors BpcPricing's style: swallow-and-log, "[IndustryDiag]"
+    prefix, persisted settings.
+
+    `assumed_invention_skill_level` (default 4) is used whenever a real
+    character skill level isn't supplied (no Built-by character, or the caller
+    can't resolve that particular skill) — persisted to
+    industry_settings.json key "assumed_invention_skill" (mirrors
+    JobCostConstants/BpcPricing's settings-file discipline).
+    """
+
+    DEFAULT_ASSUMED_LEVEL = 4
+
+    def __init__(self, market: "IndustryMarketData", sde_industry):
+        self.market = market
+        self.sde = sde_industry
+        self.assumed_level = self.DEFAULT_ASSUMED_LEVEL
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+            level = data.get("assumed_invention_skill")
+            if level is not None:
+                self.assumed_level = int(level)
+        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
+            print(f"[IndustryDiag] assumed_invention_skill load error: {e}")
+
+    def set_assumed_level(self, level: int) -> None:
+        self.assumed_level = max(0, int(level))
+        try:
+            data = {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "r") as f:
+                    data = json.load(f)
+            data["assumed_invention_skill"] = self.assumed_level
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"[IndustryDiag] assumed_invention_skill save error: {e}")
+
+    def _skill_level(self, skill_id: Optional[int], skill_level_fn) -> int:
+        """Real level via skill_level_fn(skill_id) if available, else the
+        write-in assumed level."""
+        if skill_id is not None and skill_level_fn is not None:
+            lvl = skill_level_fn(skill_id)
+            if lvl is not None:
+                return int(lvl)
+        return self.assumed_level
+
+    def resolve(self, product_type_id: int, *, input_price_fn,
+                skill_level_fn=None,
+                decryptor: Optional[Decryptor] = None,
+                invention_fac: Optional[FacilityParams] = None,
+                invention_system: Optional[int] = None) -> Optional[dict]:
+        """Amortized invented-BPC cost/run + display facts for a T2 product.
+
+        `input_price_fn(tid) -> float` prices datacores/decryptor (caller's
+        material-pricing callable). `skill_level_fn(skill_type_id) ->
+        Optional[int]` returns a real character's level for a skill, or None
+        to fall back to the assumed level (also used when skill_level_fn
+        itself is None). `invention_fac` supplies cost-bonus/tax/SCC/alpha for
+        both the invention and copying jobs — its `system_cost_index` field is
+        IGNORED here; the per-activity indices come from
+        `self.market.cost_index(invention_system, "invention"/"copying")`
+        instead (science jobs use activity-specific indices, not the
+        manufacturing one a bare FacilityParams might carry).
+
+        Returns None if there's no invention path for this product (no
+        blueprint, no invention sources, no invention data for the source, no
+        matching invented-product row, or no T2 manufacturing recipe to value
+        EIV against) — never raises.
+        """
+        try:
+            t2_bp = self.sde.get_blueprint_for_item(product_type_id)
+            if t2_bp is None:
+                return None
+            sources = self.sde.get_invention_sources(t2_bp)
+            if not sources:
+                return None
+            # T2 has exactly one source; a future T3 path picks among the
+            # (Intact/Malfunctioning/Wrecked) relics in `sources`.
+            source_bp = sources[0]
+
+            inv = self.sde.get_invention(source_bp)
+            if not inv:
+                return None
+            product_entry = next(
+                (p for p in inv["products"] if p["blueprint_id"] == t2_bp), None)
+            if product_entry is None:
+                return None
+            base_prob = product_entry["probability"]
+            base_runs = product_entry["base_runs"]
+
+            # Skill classification: the encryption skill is identifiable by
+            # name ("* Encryption Methods"); the other two are datacore
+            # sciences. If skills are missing (old SDE / skills CSV not
+            # imported) or name resolution fails (main SDE absent), fall back
+            # to the assumed level for all three — classification only
+            # matters when real per-skill levels differ.
+            reqs = self.sde.get_required_skills(source_bp, ACTIVITY_INVENTION)
+            enc_id = sci1_id = sci2_id = None
+            if reqs:
+                try:
+                    from sde.sde_manager import get_sde_manager
+                    mgr = get_sde_manager()
+                    sci_ids = []
+                    for sid, _lvl in reqs:
+                        name = mgr.get_type_name(sid) or ""
+                        if "encryption methods" in name.lower():
+                            enc_id = sid
+                        else:
+                            sci_ids.append(sid)
+                    if len(sci_ids) >= 1:
+                        sci1_id = sci_ids[0]
+                    if len(sci_ids) >= 2:
+                        sci2_id = sci_ids[1]
+                except Exception as e:
+                    print(f"[IndustryDiag] invention skill-name resolve "
+                         f"failed (using assumed level): {e}")
+                    enc_id = sci1_id = sci2_id = None
+
+            sci1 = self._skill_level(sci1_id, skill_level_fn)
+            sci2 = self._skill_level(sci2_id, skill_level_fn)
+            enc = self._skill_level(enc_id, skill_level_fn)
+
+            decryptor_mult = decryptor.probability_mult if decryptor else 1.0
+            probability = invention_probability(base_prob, sci1, sci2, enc,
+                                                decryptor_mult)
+            outcome = invention_outcome(base_runs, decryptor)
+
+            unpriced: List[int] = []
+            attempt_materials_cost = 0.0
+            datacores = []
+            for tid, qty in inv["datacores"]:
+                unit_px = input_price_fn(tid)
+                if not unit_px or unit_px <= 0:
+                    unpriced.append(tid)
+                    unit_px = 0.0
+                attempt_materials_cost += qty * unit_px
+                datacores.append((tid, qty, unit_px))
+
+            decryptor_type_id = None
+            if decryptor is not None:
+                decryptor_type_id = decryptor.type_id
+                dec_px = input_price_fn(decryptor.type_id)
+                if not dec_px or dec_px <= 0:
+                    unpriced.append(decryptor.type_id)
+                    dec_px = 0.0
+                attempt_materials_cost += dec_px
+
+            # EIV for the science jobs = the INVENTED (T2) blueprint's
+            # MANUFACTURING recipe base quantities (PLAN §1b) — NOT the T1
+            # BP's materials and NOT the datacores.
+            t2_recipe = self.sde.get_recipe(product_type_id)
+            if not t2_recipe:
+                return None
+            t2_recipe_obj = Recipe(output_per_run=t2_recipe["output_per_run"],
+                                   materials=t2_recipe["materials"])
+            eiv = estimated_item_value(t2_recipe_obj, self.market.adjusted_price)
+
+            fac = invention_fac if invention_fac is not None else FacilityParams()
+            inv_index = (self.market.cost_index(invention_system, "invention")
+                        if invention_system is not None else 0.0)
+            invention_job_cost = science_job_cost(eiv, inv_index, fac)
+
+            # Copy job cost: per-attempt = one 1-run T1 copy of the SOURCE
+            # blueprint's product (best-effort match of eve-ref's
+            # CopyingCalculator — ⚠ verify in-game). EIV here is the T1 BP's
+            # own manufacturing materials, not the T2's.
+            copy_cost_estimated = False
+            t1_product = self.sde.get_product_for_blueprint(source_bp)
+            t1_recipe = self.sde.get_recipe(t1_product) if t1_product else None
+            if t1_recipe:
+                t1_recipe_obj = Recipe(output_per_run=t1_recipe["output_per_run"],
+                                       materials=t1_recipe["materials"])
+                eiv_t1 = estimated_item_value(t1_recipe_obj, self.market.adjusted_price)
+            else:
+                eiv_t1 = 0.0
+                copy_cost_estimated = True
+            copy_index = (self.market.cost_index(invention_system, "copying")
+                         if invention_system is not None else 0.0)
+            copy_job_cost = science_job_cost(eiv_t1, copy_index, fac)
+
+            cost_per_run = invention_cost_per_run(
+                attempt_materials_cost, invention_job_cost, copy_job_cost,
+                probability, outcome["runs"])
+
+            return {
+                "cost_per_run": cost_per_run,
+                "probability": probability,
+                "me": outcome["me"],
+                "te": outcome["te"],
+                "runs_per_copy": outcome["runs"],
+                "expected_attempts_per_copy": (
+                    1.0 / probability if probability > 0 else 0.0),
+                "datacores": datacores,
+                "decryptor_type_id": decryptor_type_id,
+                "attempt_materials_cost": attempt_materials_cost,
+                "invention_job_cost": invention_job_cost,
+                "copy_job_cost": copy_job_cost,
+                "unpriced": unpriced,
+                "source_blueprint_ids": sources,
+                "copy_cost_estimated": copy_cost_estimated,
+            }
+        except Exception as e:
+            print(f"[IndustryDiag] InventionPricing.resolve failed for "
+                 f"{product_type_id}: {e}")
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -523,10 +759,20 @@ class IndustryProvider:
 
     def recipe(self, type_id: int) -> Optional[Recipe]:
         r = self.sde.get_recipe(type_id)
-        if not r:
-            return None
-        return Recipe(output_per_run=r["output_per_run"],
-                      materials=r["materials"])
+        if r:
+            # Manufacturing path unchanged byte-for-byte (activity left at its
+            # dataclass default "manufacturing") — pre-5.4 T1 behavior is
+            # untouched.
+            return Recipe(output_per_run=r["output_per_run"],
+                          materials=r["materials"])
+        # No manufacturing recipe — try a reaction formula (Stage 5.4). Old
+        # (pre-5.1) SDEs return None from get_recipe_for_activity, so this
+        # degrades to None exactly like before for every existing install.
+        r = self.sde.get_recipe_for_activity(type_id, ACTIVITY_REACTION)
+        if r:
+            return Recipe(output_per_run=r["output_per_run"],
+                          materials=r["materials"], activity="reaction")
+        return None
 
     def input_price(self, type_id: int) -> float:
         px = self.market.station_price(self.buy_station, type_id,
@@ -544,8 +790,8 @@ class IndustryProvider:
     def adjusted_price(self, type_id: int) -> float:
         return self.market.adjusted_price(type_id)
 
-    def cost_index(self, system_id: int) -> float:
-        return self.market.cost_index(system_id, "manufacturing")
+    def cost_index(self, system_id: int, activity: str = "manufacturing") -> float:
+        return self.market.cost_index(system_id, activity)
 
     def sell_info(self, type_id: int) -> SellInfo:
         h = self.market.product_history(self.sell_region, type_id)
