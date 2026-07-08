@@ -7,9 +7,15 @@ recursive build-breakdown detail panel on the right — but is a committed,
 public feature (no drug_ prefix). All math is industry_engine; all data is
 read from Scout's existing caches via industry_market_data.
 
-Phase 1 (T1) only: materials are terminal market buys (flat chain). The
-engine's recursion contract is intact for later T2/reaction phases. Character
-data (skills/standings/blueprints) is Phase 2+; nothing here needs it.
+Phase 1 (T1): materials are terminal market buys (flat chain). Stage 5.5 adds
+the T2 lens on top: items with an invention path are re-costed with the FULL
+input chain (components → reactions → moon goo, per-node cheapest-of build/buy)
+plus the amortized invented-BPC cost per run, manufactured at the invented
+ME (2 + decryptor mods) — surfaced in a "T2 (invention)" list page, an
+Invention detail section (decryptor dropdown, probability, attempts, BPC
+ME/TE/runs), and a persisted Reaction-facility row for the chain's reaction
+jobs. Character data is optional throughout (assumed invention skill level
+write-in when no "Built by" character is set).
 """
 
 import threading
@@ -25,12 +31,15 @@ from sde.sde_industry import get_sde_industry_db
 from sde.sde_manager import get_sde_manager
 
 from industry.industry_engine import (IndustryCalculator, SellFees, FacilityParams,
+                             FacilitySet, DECRYPTORS,
                              BuildTimeParams, manufacturing_time,
                              max_runs_for_time, DEFAULT_MAX_JOB_SECONDS,
                              ResearchParams, research_time, research_install_cost)
-from sde.sde_industry import ACTIVITY_RESEARCH_ME, ACTIVITY_RESEARCH_TE
+from sde.sde_industry import (ACTIVITY_RESEARCH_ME, ACTIVITY_RESEARCH_TE,
+                              ACTIVITY_REACTION)
 from industry.industry_market_data import (IndustryMarketData, IndustryProvider,
-                                   JobCostConstants, BpcPricing)
+                                   JobCostConstants, BpcPricing, InventionPricing,
+                                   SETTINGS_FILE)
 from industry.industry_characters import IndustryRoster
 from industry.industry_skills import IndustrySkills
 from industry.industry_standings import IndustryStandings
@@ -91,7 +100,8 @@ CATEGORIES = [
 # 4=Faction; everything else (1, None, 3, 5, 6, 17, 19, …) is T1. Needs the
 # SDE meta_group_id column (re-download); without it everything reads as T1.
 TECH_ORDER = ["T1", "Faction", "T2", "T3"]
-DEFAULT_TECH = {"T1", "Faction"}  # T2/T3 cost modeling not built yet
+# T2 has its own invention-costed list page (5.5); T3 modeling is Phase 6.
+DEFAULT_TECH = {"T1", "Faction"}
 
 
 def tech_label(meta_group_id: Optional[int]) -> str:
@@ -161,6 +171,10 @@ class IndustryTabManager:
         self.bp_db = IndustryBlueprintsDB.singleton()
         self.bp_puller = BlueprintPuller(self.roster, self.bp_db)
         self.bpc_pricing = BpcPricing()
+        # Stage 5.5: invented-BPC cost resolver (T2). Assumed skill level is
+        # persisted inside it; per-item decryptor choice is session-only.
+        self.inv_pricing = InventionPricing(self.market, self.sde)
+        self._decryptor_choice: Dict[int, int] = {}  # tid -> decryptor type_id
         try:
             from contracts.contracts_db import ContractsDB
             self.contracts_db = ContractsDB.singleton()
@@ -211,12 +225,13 @@ class IndustryTabManager:
         self.notebook.add(outer, text="Industry")
         self.frame = outer
 
-        # Industry-level sub-notebook: Top Profit T1 (here) + Characters
-        # (Phase 2). Phases 5-7 add T2/T3/Extra; Phase 3 adds Owned BPO/BPC.
+        # Industry-level sub-notebook: Top Profit (T1 + the Stage 5.5 T2 list
+        # page share this tab's filters/detail panel) + Owned BPO/BPC (Phase 3)
+        # + Characters (Phase 2). Phase 6/7 add T3/Extra.
         self.sub_nb = ttk.Notebook(outer)
         self.sub_nb.pack(fill=tk.BOTH, expand=True)
         t1 = ttk.Frame(self.sub_nb)
-        self.sub_nb.add(t1, text="Top Profit — T1")
+        self.sub_nb.add(t1, text="Top Profit")
 
         hub_names = [name for _key, name in get_enabled_hubs()]
         self._hub_key_by_name = {name: key for key, name in get_enabled_hubs()}
@@ -272,6 +287,32 @@ class IndustryTabManager:
         self.scc_var = self._mini_field(fac, "SCC %:",
                                         f"{self.constants.scc_surcharge_pct}")
         ttk.Label(fac, text="(SCC/tax are CCP-tuned — verify in-game)",
+                  foreground=CLR_MUTED).pack(side=tk.LEFT, padx=8)
+
+        # ---- reaction facility row (Stage 5.5, persisted) ----
+        # Reaction jobs in a T2 input chain use their OWN facility: reactions
+        # run in refineries (low/null sec) with their own cost index, tax and
+        # reaction-rig material bonus. Without this row the engine would fall
+        # back to the manufacturing facility above — including its material
+        # bonus, which per PLAN §1b must NOT apply to reactions.
+        rx_saved = self._load_rx_settings()
+        rx = ttk.LabelFrame(t1, text="Reaction facility (T2 input chains)",
+                            padding=(8, 4))
+        rx.pack(fill=tk.X, padx=8)
+        ttk.Label(rx, text="System (reaction cost index):").pack(side=tk.LEFT)
+        rx_sys = rx_saved.get("system")
+        self.rx_system_var = tk.StringVar(
+            value=rx_sys if rx_sys in hub_names else self.facility_var.get())
+        self.rx_system_combo = self._combo(rx, self.rx_system_var, hub_names,
+                                           self._on_input_change)
+        self.rx_tax_var = self._mini_field(
+            rx, "Facility tax %:",
+            f"{rx_saved.get('tax', self.constants.facility_tax_pct)}")
+        self.rx_cost_bonus_var = self._mini_field(
+            rx, "Cost bonus %:", f"{rx_saved.get('cost_bonus', 0)}")
+        self.rx_mat_bonus_var = self._mini_field(
+            rx, "Material bonus %:", f"{rx_saved.get('mat_bonus', 0)}")
+        ttk.Label(rx, text="(material bonus = reaction rigs only)",
                   foreground=CLR_MUTED).pack(side=tk.LEFT, padx=8)
 
         # ---- filter row: chips + search + min profit + ME/batch ----
@@ -363,6 +404,14 @@ class IndustryTabManager:
                     ["All", "BPO only", "BPC-only"],
                     self._rebuild_list, width=10)
 
+        # Assumed invention skill level (Stage 5.5): used for probability when
+        # an item has no "Built by" character. Persisted via InventionPricing.
+        ttk.Label(tech_row, text="Inv. skills:").pack(side=tk.LEFT, padx=(12, 2))
+        self.inv_skill_var = tk.StringVar(value=str(self.inv_pricing.assumed_level))
+        inv_e = ttk.Entry(tech_row, textvariable=self.inv_skill_var, width=3)
+        inv_e.pack(side=tk.LEFT)
+        inv_e.bind("<Return>", lambda e: self._on_assumed_skill())
+
         # Persistent note, re-evaluated after an SDE update (no restart needed).
         self.tech_note_label = ttk.Label(tech_row, foreground=CLR_MUTED)
         self.tech_note_label.pack(side=tk.LEFT, padx=8)
@@ -385,13 +434,16 @@ class IndustryTabManager:
         self._list_menu.add_separator()
         self._list_menu.add_command(label="Ignore this item",
                                     command=self._ignore_selected)
-        # Two list views sharing the detail panel: full ranked list (incl.
-        # negatives) and a profit>0 view. Both render from the same results.
+        # Three list views sharing the detail panel: full ranked list (incl.
+        # negatives), a profit>0 view, and the Stage 5.5 T2 page (every item
+        # with an invention path, full-chain + invention cost, ignoring the
+        # tech chips). All render from the same results dict.
         self.list_nb = ttk.Notebook(left)
         self.list_nb.pack(fill=tk.BOTH, expand=True)
         self.tree = self._make_list_tree(self.list_nb, "All")
         self.tree_pos = self._make_list_tree(self.list_nb, "Positive only")
-        self._trees = (self.tree, self.tree_pos)
+        self.tree_t2 = self._make_list_tree(self.list_nb, "T2 (invention)")
+        self._trees = (self.tree, self.tree_pos, self.tree_t2)
         self._update_headings()
 
         right = ttk.Frame(main)
@@ -455,7 +507,8 @@ class IndustryTabManager:
         hubs = get_enabled_hubs()
         hub_names = [name for _k, name in hubs]
         self._hub_key_by_name = {name: key for key, name in hubs}
-        for combo in (self.buy_combo, self.sell_combo, self.facility_combo):
+        for combo in (self.buy_combo, self.sell_combo, self.facility_combo,
+                      self.rx_system_combo):
             try:
                 combo.configure(values=hub_names)
             except tk.TclError:
@@ -527,6 +580,10 @@ class IndustryTabManager:
             "time_bonus": _f(self.time_bonus_var, 0.0),
             "fac_tax": _f(self.fac_tax_var, self.constants.facility_tax_pct),
             "scc": _f(self.scc_var, self.constants.scc_surcharge_pct),
+            "rx_system": self._hub_cfg(self.rx_system_var)["system_id"],
+            "rx_tax": _f(self.rx_tax_var, self.constants.facility_tax_pct),
+            "rx_cost_bonus": _f(self.rx_cost_bonus_var, 0.0),
+            "rx_mat_bonus": _f(self.rx_mat_bonus_var, 0.0),
         }
 
     def _facility_from(self, p: dict) -> FacilityParams:
@@ -537,6 +594,53 @@ class IndustryTabManager:
             facility_tax_pct=p["fac_tax"], scc_surcharge_pct=p["scc"],
             alpha_clone_tax_pct=self.constants.alpha_clone_tax_pct)
 
+    def _facility_set_from(self, p: dict) -> FacilitySet:
+        """Per-activity facilities for chain costing (Stage 5.5): manufacturing
+        from the Facility row, reactions from the Reaction-facility row (own
+        cost index / tax / rig material bonus — never the mfg material bonus,
+        per PLAN §1b). SCC + alpha tax are global."""
+        rx = FacilityParams(
+            system_cost_index=self.market.cost_index(p["rx_system"], "reaction"),
+            cost_bonus_pct=p["rx_cost_bonus"],
+            material_bonus_pct=p["rx_mat_bonus"],
+            facility_tax_pct=p["rx_tax"], scc_surcharge_pct=p["scc"],
+            alpha_clone_tax_pct=self.constants.alpha_clone_tax_pct)
+        return FacilitySet(manufacturing=self._facility_from(p), reaction=rx)
+
+    def _load_rx_settings(self) -> dict:
+        import json, os
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE) as f:
+                    return json.load(f).get("reaction_facility") or {}
+        except Exception as e:
+            _print(f"reaction_facility load failed: {e}")
+        return {}
+
+    def _save_rx_settings(self):
+        import json, os
+        try:
+            data = {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE) as f:
+                    data = json.load(f)
+            data["reaction_facility"] = {
+                "system": self.rx_system_var.get(),
+                "tax": _f(self.rx_tax_var, self.constants.facility_tax_pct),
+                "cost_bonus": _f(self.rx_cost_bonus_var, 0.0),
+                "mat_bonus": _f(self.rx_mat_bonus_var, 0.0),
+            }
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            _print(f"reaction_facility save failed: {e}")
+
+    def _on_assumed_skill(self):
+        lvl = int(_f(self.inv_skill_var, float(self.inv_pricing.assumed_level)))
+        self.inv_pricing.set_assumed_level(max(0, min(5, lvl)))
+        self.inv_skill_var.set(str(self.inv_pricing.assumed_level))
+        self._compute(refetch=False)
+
     def _provider_from(self, p: dict) -> IndustryProvider:
         return IndustryProvider(
             self.market, self.sde,
@@ -545,9 +649,19 @@ class IndustryTabManager:
             input_side=p["input_side"], buy_region=p["buy_region"])
 
     def _fees(self) -> SellFees:
-        # Fees are skill-dependent in EVE; Phase 1 uses sensible defaults.
-        # (Wire to calculate.TradingSkills later if needed.)
-        return SellFees(broker_fee_pct=3.0, sales_tax_pct=4.5)
+        """Sell-side fees from the cached trading skills/standings at the sell
+        hub (the REVIEW_handoff stray, deferred to Stage 5.5). Falls back to
+        the old Phase 1 flat defaults if the skills cache is unavailable."""
+        try:
+            from core.calculate import (load_cached_skills, get_broker_fee_rate,
+                                        get_sales_tax_rate)
+            hub_key = self._hub_key_by_name.get(self.sell_var.get(), "jita")
+            skills = load_cached_skills(hub_key)
+            return SellFees(broker_fee_pct=get_broker_fee_rate(skills),
+                            sales_tax_pct=get_sales_tax_rate(skills))
+        except Exception as e:
+            _print(f"fee lookup failed (defaults 3/4.5): {e}")
+            return SellFees(broker_fee_pct=3.0, sales_tax_pct=4.5)
 
     # ===================================================================== compute
 
@@ -565,6 +679,7 @@ class IndustryTabManager:
         p = self._params()
         fees = self._fees()
         need_meta = not self.name_map
+        self._save_rx_settings()   # persist the reaction-facility row (5.5)
 
         def _work():
             err = None
@@ -583,6 +698,23 @@ class IndustryTabManager:
                         dummies.add(tid)
                 products = [t for t in products if t not in dummies]
 
+                # Stage 5.5: T2 needs the FULL chain priced (components →
+                # reactions → moon goo) plus invention consumables (datacores
+                # per invention path, all 8 decryptors). Skipped entirely on a
+                # pre-5.1 SDE (has_invention_data False → no T2 modeling).
+                has_inv = self.sde.has_invention_data()
+                invention_tids = set()
+                if has_inv:
+                    tids = self._expand_chain_tids(tids)
+                    for tid in products:
+                        bp = self.sde.get_blueprint_for_item(tid)
+                        sources = self.sde.get_invention_sources(bp) if bp else []
+                        info = self.sde.get_invention(sources[0]) if sources else None
+                        if info:
+                            invention_tids.add(tid)
+                            tids.update(t for t, _q in info["datacores"])
+                    tids.update(DECRYPTORS)
+
                 if refetch:
                     systems = [get_hub_config(k)["system_id"]
                                for k, _ in get_enabled_hubs()]
@@ -599,6 +731,7 @@ class IndustryTabManager:
 
                 # Build facility/provider AFTER any refetch so cost index is fresh.
                 fac = self._facility_from(p)
+                facset = self._facility_set_from(p)
                 provider = self._provider_from(p)
                 calc = IndustryCalculator(provider, buildable=lambda t: False)
                 results = {}
@@ -607,6 +740,23 @@ class IndustryTabManager:
                                          me=p["me"], batch=p["batch"])
                     if res:
                         results[tid] = res
+
+                # Stage 5.5 T2 pass: every T2 item with an invention path is
+                # RE-costed full-chain (buildable=None → cheapest-of per node)
+                # at its invented ME, with the amortized invented-BPC cost/run
+                # folded in — replacing the understated flat calc above. The
+                # memo is shared across items so common components/reactions
+                # cost once. T3 (meta 14) invents from relics — Phase 6.
+                if has_inv and invention_tids:
+                    calc_t2 = IndustryCalculator(provider, buildable=None)
+                    memo = {}
+                    for tid in invention_tids:
+                        if self.meta_map.get(tid) != 2:
+                            continue
+                        res = self._calc_t2(tid, calc_t2, facset, fac,
+                                            provider, fees, p, memo=memo)
+                        if res:
+                            results[tid] = res
             except Exception as e:
                 err = str(e)
                 _print(f"compute failed: {e}")
@@ -650,6 +800,82 @@ class IndustryTabManager:
         self.capital_map = is_cap
         self.upwell_map = is_upwell
         self.pos_map = is_pos
+
+    # ------------------------------------------------------------ T2 (5.5)
+
+    def _expand_chain_tids(self, tids: set) -> set:
+        """Transitive closure of `tids` through manufacturing + reaction
+        recipes, so every node of a T2 chain (components → advanced moon
+        materials → raw goo) gets a price/adjusted price. EVE chains are DAGs;
+        the seen-set guards re-walks."""
+        seen = set()
+        frontier = list(tids)
+        while frontier:
+            tid = frontier.pop()
+            if tid in seen:
+                continue
+            seen.add(tid)
+            r = (self.sde.get_recipe(tid)
+                 or self.sde.get_recipe_for_activity(tid, ACTIVITY_REACTION))
+            if r:
+                frontier.extend(m for m, _q in r["materials"]
+                                if m not in seen)
+        return seen
+
+    def _calc_t2(self, tid: int, calc: IndustryCalculator,
+                 facset: FacilitySet, inv_fac: FacilityParams,
+                 provider: IndustryProvider, fees: SellFees, p: dict,
+                 *, memo: Optional[dict] = None,
+                 decryptor=None, skill_fn=None) -> Optional[dict]:
+        """Full-chain + invention costing for one T2 item. `calc` must be
+        buildable=None (cheapest-of chain). The item is manufactured at the
+        INVENTED ME (2 + decryptor mods), never the global ME write-in; note
+        the engine threads that one ME through the chain, so component
+        sub-builds also use it (slightly conservative vs researched component
+        BPOs). Returns the calc_full result with the invention facts attached
+        under "invention", or None if there's no invention path."""
+        inv = self.inv_pricing.resolve(
+            tid, input_price_fn=provider.input_price, skill_level_fn=skill_fn,
+            decryptor=decryptor, invention_fac=inv_fac,
+            invention_system=p["facility_system"])
+        if not inv:
+            return None
+        res = calc.calc_full(tid, facset, fees, me=inv["me"], batch=p["batch"],
+                             blueprint_cost_per_run=inv["cost_per_run"],
+                             memo=memo)
+        if res:
+            res["invention"] = inv
+        return res
+
+    def _recompute_item_t2(self, tid: int):
+        """Recompute ONE T2 item on the UI thread (decryptor / Built-by
+        change). Pure cache reads + SQLite — fast enough inline. Uses the
+        Built-by character's cached skills for probability when set (peek
+        only; falls back per-skill to the assumed level)."""
+        p = self._params()
+        fac = self._facility_from(p)
+        facset = self._facility_set_from(p)
+        provider = self._provider_from(p)
+        dec = DECRYPTORS.get(self._decryptor_choice.get(tid))
+        char_id = self._built_by.get(tid)
+        skill_fn = ((lambda sid: self.char_skills.peek_skill_level(char_id, sid))
+                    if char_id else None)
+        calc = IndustryCalculator(provider, buildable=None)
+        res = self._calc_t2(tid, calc, facset, fac, provider, self._fees(), p,
+                            decryptor=dec, skill_fn=skill_fn)
+        if res:
+            self.results[tid] = res
+            self._rebuild_list()
+            self._show_detail(tid)
+
+    def _on_decryptor(self, tid: int, name: str):
+        dec_id = next((d.type_id for d in DECRYPTORS.values()
+                       if d.name == name), None)
+        if dec_id:
+            self._decryptor_choice[tid] = dec_id
+        else:
+            self._decryptor_choice.pop(tid, None)
+        self._recompute_item_t2(tid)
 
     def _ancestry_names(self, mg_id: Optional[int]) -> str:
         """Lowercased ' | '-joined market-group ancestry name string (leaf
@@ -719,10 +945,15 @@ class IndustryTabManager:
                 text="⚠ SDE has no tech data — click Update SDE; all items read "
                      "as T1 until then",
                 foreground=CLR_BAD)
+        elif not self.sde.has_invention_data():
+            self.tech_note_label.configure(
+                text="⚠ industry SDE predates invention data — click Update SDE "
+                     "to light up the T2 list (T2/T3 costs understated)",
+                foreground=CLR_BAD)
         else:
             self.tech_note_label.configure(
-                text="(T2/T3 cost modeling not built yet — their build cost is "
-                     "understated)",
+                text="(T2 = full chain + invention; T3 not modeled yet — its "
+                     "build cost is understated)",
                 foreground=CLR_MUTED)
 
     def _on_update_sde(self):
@@ -740,7 +971,34 @@ class IndustryTabManager:
     def _after_sde_download(self, success: bool):
         if not success:
             return
-        # Force names/categories/meta to rebuild from the fresh SDE.
+        # Names/meta SDE is fresh; now rebuild the INDUSTRY SDE too (Stage
+        # 5.5). The all-activities schema + invention probability/skill tables
+        # (Stage 5.1) only exist after a rebuild, and the only other trigger
+        # is buried in the Stock Market settings page — without this the T2
+        # list can never light up on an existing install.
+        self.progress_label.configure(text="Updating industry SDE…")
+        self.sde_btn.configure(state="disabled")
+
+        def work():
+            try:
+                ok = self.sde.refresh(progress_callback=lambda m, _p: submit(
+                    lambda mm=m: self.progress_label.configure(
+                        text=f"Industry SDE: {mm}")))
+            except Exception as e:
+                _print(f"industry SDE refresh failed: {e}")
+                ok = False
+            submit(lambda: self._after_industry_sde(ok))
+
+        threading.Thread(target=work, daemon=True,
+                         name="IndustrySDERefresh").start()
+
+    def _after_industry_sde(self, ok: bool):
+        self.sde_btn.configure(state="normal")
+        if not ok:
+            self.progress_label.configure(
+                text="Industry SDE update failed — see eve_scout.log.")
+        # Force names/categories/meta to rebuild from the fresh SDE and
+        # recompute either way (the names SDE did change).
         self.name_map = {}
         self.category_map = {}
         self.meta_map = {}
@@ -814,37 +1072,46 @@ class IndustryTabManager:
         for label, b in self.tech_buttons.items():
             b.state(["!disabled"] if label in avail_tech else ["disabled"])
 
+        def passes(tid, r, name):
+            """Shared row filter (everything except the tech chips)."""
+            # Auto-hide junk products ("Expired …" filaments) + user-ignored.
+            if is_auto_hidden(name) or self.ignore.contains(tid):
+                return False
+            if subcap_only and self.capital_map.get(tid):
+                return False
+            if hide_upwell and self.upwell_map.get(tid):
+                return False
+            if hide_pos and self.pos_map.get(tid):
+                return False
+            has_bpo = self.bpo_map.get(tid, True)
+            if bp_mode == "BPO only" and not has_bpo:
+                return False
+            if bp_mode == "BPC-only" and has_bpo:
+                return False
+            if search and search not in name.lower():
+                return False
+            priced = r["has_7d"] and r["patient_profit"] is not None
+            if not priced and not show_unpriced:
+                return False
+            if priced and min_profit is not None and r["patient_profit"] < min_profit:
+                return False
+            return True
+
         rows = []
+        t2_rows = []   # Stage 5.5: invention-costed items, tech chips ignored
         for tid in cat_items:
             r = self.results[tid]
             name = self.name_map.get(tid, str(tid))
-            # Auto-hide junk products ("Expired …" filaments) + user-ignored items.
-            if is_auto_hidden(name) or self.ignore.contains(tid):
+            if not passes(tid, r, name):
                 continue
-            if tech_label(self.meta_map.get(tid)) not in self.tech_selected:
-                continue
-            if subcap_only and self.capital_map.get(tid):
-                continue
-            if hide_upwell and self.upwell_map.get(tid):
-                continue
-            if hide_pos and self.pos_map.get(tid):
-                continue
-            has_bpo = self.bpo_map.get(tid, True)
-            if bp_mode == "BPO only" and not has_bpo:
-                continue
-            if bp_mode == "BPC-only" and has_bpo:
-                continue
-            if search and search not in name.lower():
-                continue
-            priced = r["has_7d"] and r["patient_profit"] is not None
-            if not priced and not show_unpriced:
-                continue
-            if priced and min_profit is not None and r["patient_profit"] < min_profit:
-                continue
-            rows.append(tid)
+            if tech_label(self.meta_map.get(tid)) in self.tech_selected:
+                rows.append(tid)
+            if r.get("invention"):
+                t2_rows.append(tid)
 
-        rows.sort(key=lambda t: self._sort_value(t, self.sort_col),
-                  reverse=self.sort_reverse)
+        sort_key = lambda t: self._sort_value(t, self.sort_col)
+        rows.sort(key=sort_key, reverse=self.sort_reverse)
+        t2_rows.sort(key=sort_key, reverse=self.sort_reverse)
         self.display_order = rows
         # "Positive only" sub-tab: same base filter, profit strictly > 0.
         pos_rows = [t for t in rows
@@ -852,6 +1119,7 @@ class IndustryTabManager:
                     and self.results[t]["patient_profit"] > 0]
         self._fill_tree(self.tree, rows)
         self._fill_tree(self.tree_pos, pos_rows)
+        self._fill_tree(self.tree_t2, t2_rows)
 
     def _fill_tree(self, tree, rows):
         tree.delete(*tree.get_children())
@@ -905,6 +1173,7 @@ class IndustryTabManager:
 
         self._build_built_by(tid)
         self._build_margins(r)
+        self._build_invention_section(r, tid)
         self._build_chain(r, tid)
         self._build_totals(r)
         self._build_time_section(r, tid)
@@ -945,6 +1214,74 @@ class IndustryTabManager:
                        f"({sell.history_days}d history)",
                   foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
 
+    def _build_invention_section(self, r, tid):
+        """Stage 5.5 Invention section: decryptor dropdown (None default),
+        probability / expected attempts at the effective skills, invented BPC
+        ME/TE/runs, consumables, job + copy costs, amortized cost/run."""
+        inv = r.get("invention")
+        if not inv:
+            return
+        frame = ttk.LabelFrame(self.detail, text="Invention (T2)", padding=4)
+        frame.pack(fill=tk.X, pady=(0, 6))
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        ttk.Label(row, text="Decryptor:", foreground=CLR_MUTED).pack(side=tk.LEFT)
+        dec_names = ["None"] + [d.name for d in DECRYPTORS.values()]
+        cur = DECRYPTORS.get(self._decryptor_choice.get(tid))
+        dec_var = tk.StringVar(value=cur.name if cur else "None")
+        combo = ttk.Combobox(row, values=dec_names, textvariable=dec_var,
+                             width=24, state="readonly")
+        combo.pack(side=tk.LEFT, padx=4)
+        combo.bind("<<ComboboxSelected>>",
+                   lambda e, t=tid, v=dec_var: self._on_decryptor(t, v.get()))
+
+        self._kv(frame, "Success probability:", f"{inv['probability'] * 100:.1f}%")
+        att = inv["expected_attempts_per_copy"]
+        self._kv(frame, "Expected attempts / copy:",
+                 f"{att:.2f}" if att > 0 else "—")
+        self._kv(frame, "Invented BPC:",
+                 f"ME {inv['me']} / TE {inv['te']} / {inv['runs_per_copy']} runs",
+                 bold=True)
+
+        datacore_cost = 0.0
+        for dtid, qty, px in inv["datacores"]:
+            dname = (self.name_map.get(dtid)
+                     or self.names.get_type_name(dtid) or str(dtid))
+            datacore_cost += qty * px
+            self._kv(frame, f"  {qty}× {dname}:",
+                     "no price" if px <= 0 else f"{isk(qty * px)} ISK",
+                     color=CLR_BAD if px <= 0 else None)
+        if cur is not None:
+            dec_cost = inv["attempt_materials_cost"] - datacore_cost
+            self._kv(frame, f"  1× {cur.name} Decryptor:",
+                     "no price" if dec_cost <= 0 else f"{isk(dec_cost)} ISK",
+                     color=CLR_BAD if dec_cost <= 0 else None)
+        self._kv(frame, "Attempt materials:",
+                 f"{isk(inv['attempt_materials_cost'])} ISK")
+        self._kv(frame, "Invention job cost:",
+                 f"{isk(inv['invention_job_cost'])} ISK")
+        copy_txt = f"{isk(inv['copy_job_cost'])} ISK"
+        if inv.get("copy_cost_estimated"):
+            copy_txt += " (est.)"
+        self._kv(frame, "Copy job cost (per attempt):", copy_txt)
+        self._kv(frame, "Amortized BPC cost / run:",
+                 f"{isk(inv['cost_per_run'])} ISK", bold=True)
+
+        char_id = self._built_by.get(tid)
+        rc = self.roster.get(char_id) if char_id else None
+        who = (f"skills from {rc.character_name}" if rc else
+               f"assumed skill level {self.inv_pricing.assumed_level} "
+               f"(set a 'Built by' char for real skills)")
+        ttk.Label(frame, text=f"    {who} — ⚠ verified vs eve-ref, "
+                              "spot-check one item in-game",
+                  foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
+        if inv.get("unpriced"):
+            ttk.Label(frame,
+                      text=f"    ⚠ {len(inv['unpriced'])} consumable(s) "
+                           "unpriced — invention cost understated",
+                      foreground=CLR_BAD).pack(anchor="w", padx=8)
+
     def _build_chain(self, r, tid):
         frame = ttk.LabelFrame(self.detail, text="Materials (whole batch)",
                                padding=4)
@@ -953,7 +1290,7 @@ class IndustryTabManager:
         tree = ttk.Treeview(frame, columns=cols, height=12)
         tree.heading("#0", text="Item")
         for c, t, w in (("qty", "Qty", 80), ("unit", "Unit cost", 110),
-                        ("total", "Total", 120), ("src", "Source", 80)):
+                        ("total", "Total", 120), ("src", "Source", 130)):
             tree.heading(c, text=t)
             tree.column(c, width=w, anchor="e" if c != "src" else "center")
         tree.column("#0", width=240)
@@ -974,26 +1311,55 @@ class IndustryTabManager:
         for entry in r["inputs"]:
             self._add_chain_row(tree, "", entry)
 
-    def _add_chain_row(self, tree, parent, entry):
+    def _add_chain_row(self, tree, parent, entry, units=None):
+        """One material row. Top-level entries (from calc_full) carry
+        whole-batch figures (total_qty/cost); nested produced-node entries
+        (from cost_node) are per parent UNIT, so they're scaled by `units` —
+        the parent row's total quantity — to keep the whole tree in batch
+        terms. Nested quantities can be fractional (per-job rounding isn't
+        modeled per sub-job)."""
         node = entry["node"]
         tid = node["type_id"]
         name = self.name_map.get(tid) or self.names.get_type_name(tid) or str(tid)
         self._iid_seq += 1
         iid = f"row{self._iid_seq}"
         self._chain_rows[iid] = tid
-        src = {"market": "buy", "override": "OVERRIDE",
-               "produced": "build"}[node["kind"]]
-        missing = node["kind"] == "market" and node["unit_cost"] <= 0
+        if units is None:
+            qty = entry["total_qty"]
+            cost = entry["cost"]
+        else:
+            qty = entry["qty_per_unit"] * units
+            cost = entry["cost"] * units
+        src = self._node_source(node)
+        missing = (node["kind"] == "market" and node["unit_cost"] <= 0
+                   and node.get("source") != "buy_cheaper")
         tags = (("produced",) if node["kind"] == "produced"
                 else ("missing",) if missing else ())
         unit_txt = "no price" if missing else isk(node["unit_cost"])
+        qty_txt = (f"{qty:,.0f}" if float(qty).is_integer() or qty >= 100
+                   else f"{qty:,.1f}")
         tree.insert(parent, "end", iid=iid, text=name, open=True,
-                    values=(f"{entry['total_qty']:,}",
-                            unit_txt,
-                            isk(entry["cost"]), src), tags=tags)
+                    values=(qty_txt, unit_txt, isk(cost), src), tags=tags)
+        # Only produced nodes expand; a buy_cheaper node keeps its build
+        # subtree on the node but is billed as a buy, so its children would
+        # not sum to the row — the forgone build cost shows in Source instead.
         if node["kind"] == "produced":
             for child in node["inputs"]:
-                self._add_chain_row(tree, iid, child)
+                self._add_chain_row(tree, iid, child, units=qty)
+
+    @staticmethod
+    def _node_source(node) -> str:
+        """Source label for a chain node (Stage 5.3/5.5 cheapest-of labels)."""
+        src = node.get("source")
+        if src == "buy_cheaper":
+            return f"buy (build {isk_m(node.get('build_cost'))})"
+        if src == "build_cheaper":
+            return "build ✓"
+        if node["kind"] == "override":
+            return "OVERRIDE"
+        if node["kind"] == "produced":
+            return "react" if node.get("activity") == "reaction" else "build"
+        return "buy"
 
     # -- chain material interactions ----------------------------------------
 
@@ -1054,6 +1420,10 @@ class IndustryTabManager:
         self._kv(frame, "Materials:", f"{isk(r['material_cost'])} ISK")
         self._kv(frame, f"Job install cost (EIV {isk(r['eiv'])}):",
                  f"{isk(r['job_cost'])} ISK")
+        if r.get("blueprint_cost"):
+            label = ("Invented BPC (amortized):" if r.get("invention")
+                     else "BPC cost (amortized):")
+            self._kv(frame, label, f"{isk(r['blueprint_cost'])} ISK")
         self._kv(frame, f"Total build ({r['units']} units):",
                  f"{isk(r['total_build'])} ISK", bold=True)
         self._kv(frame, "Build cost / unit:", f"{isk(r['unit_cost'])} ISK", bold=True)
@@ -1250,7 +1620,12 @@ class IndustryTabManager:
             if cid is not None:
                 self._built_by[tid] = cid
         self._save_built_by()
-        self._refresh_detail_if_selected()  # build/research time depends on it
+        # Build/research time depend on it; for a T2 item the invention
+        # probability does too (real skills vs assumed level).
+        if self.results.get(tid, {}).get("invention"):
+            self._recompute_item_t2(tid)
+        else:
+            self._refresh_detail_if_selected()
 
     def _built_by_path(self):
         from core.sound_manager import get_data_dir
