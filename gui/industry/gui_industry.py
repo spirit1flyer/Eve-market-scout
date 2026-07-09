@@ -11,11 +11,15 @@ Phase 1 (T1): materials are terminal market buys (flat chain). Stage 5.5 adds
 the T2 lens on top: items with an invention path are re-costed with the FULL
 input chain (components → reactions → moon goo, per-node cheapest-of build/buy)
 plus the amortized invented-BPC cost per run, manufactured at the invented
-ME (2 + decryptor mods) — surfaced in a "T2 (invention)" list page, an
+ME (2 + decryptor mods) — surfaced in a "T2/T3 (invention)" list page, an
 Invention detail section (decryptor dropdown, probability, attempts, BPC
 ME/TE/runs), and a persisted Reaction-facility row for the chain's reaction
-jobs. Character data is optional throughout (assumed invention skill level
-write-in when no "Built by" character is set).
+jobs. Phase 6 extends the same pass to T3 (meta 14): invention from ancient
+relics — the relic is a consumed, priced input; no copy job; 3 quality tiers
+(Intact/Malfunctioning/Wrecked) with the ranked list on the cheapest viable
+relic and a per-item quality selector in the detail panel. Character data is
+optional throughout (assumed invention skill level write-in when no "Built by"
+character is set).
 """
 
 import threading
@@ -100,7 +104,7 @@ CATEGORIES = [
 # 4=Faction; everything else (1, None, 3, 5, 6, 17, 19, …) is T1. Needs the
 # SDE meta_group_id column (re-download); without it everything reads as T1.
 TECH_ORDER = ["T1", "Faction", "T2", "T3"]
-# T2 has its own invention-costed list page (5.5); T3 modeling is Phase 6.
+# T2 + T3 share the invention-costed list page (5.5 T2, 6.1 T3 relics).
 DEFAULT_TECH = {"T1", "Faction"}
 
 
@@ -171,10 +175,12 @@ class IndustryTabManager:
         self.bp_db = IndustryBlueprintsDB.singleton()
         self.bp_puller = BlueprintPuller(self.roster, self.bp_db)
         self.bpc_pricing = BpcPricing()
-        # Stage 5.5: invented-BPC cost resolver (T2). Assumed skill level is
-        # persisted inside it; per-item decryptor choice is session-only.
+        # Stage 5.5/6.1: invented-BPC cost resolver (T2 + T3 relics). Assumed
+        # skill level is persisted inside it; per-item decryptor and relic
+        # choices are session-only.
         self.inv_pricing = InventionPricing(self.market, self.sde)
         self._decryptor_choice: Dict[int, int] = {}  # tid -> decryptor type_id
+        self._relic_choice: Dict[int, int] = {}  # tid -> relic type_id (T3, session-only)
         try:
             from contracts.contracts_db import ContractsDB
             self.contracts_db = ContractsDB.singleton()
@@ -435,14 +441,14 @@ class IndustryTabManager:
         self._list_menu.add_command(label="Ignore this item",
                                     command=self._ignore_selected)
         # Three list views sharing the detail panel: full ranked list (incl.
-        # negatives), a profit>0 view, and the Stage 5.5 T2 page (every item
-        # with an invention path, full-chain + invention cost, ignoring the
-        # tech chips). All render from the same results dict.
+        # negatives), a profit>0 view, and the invention page (every T2/T3
+        # item with an invention path, full-chain + invention cost, ignoring
+        # the tech chips). All render from the same results dict.
         self.list_nb = ttk.Notebook(left)
         self.list_nb.pack(fill=tk.BOTH, expand=True)
         self.tree = self._make_list_tree(self.list_nb, "All")
         self.tree_pos = self._make_list_tree(self.list_nb, "Positive only")
-        self.tree_t2 = self._make_list_tree(self.list_nb, "T2 (invention)")
+        self.tree_t2 = self._make_list_tree(self.list_nb, "T2/T3 (invention)")
         self._trees = (self.tree, self.tree_pos, self.tree_t2)
         self._update_headings()
 
@@ -698,10 +704,12 @@ class IndustryTabManager:
                         dummies.add(tid)
                 products = [t for t in products if t not in dummies]
 
-                # Stage 5.5: T2 needs the FULL chain priced (components →
-                # reactions → moon goo) plus invention consumables (datacores
-                # per invention path, all 8 decryptors). Skipped entirely on a
-                # pre-5.1 SDE (has_invention_data False → no T2 modeling).
+                # Stage 5.5/6.1: T2+T3 need the FULL chain priced (components
+                # → reactions → moon goo) plus invention consumables
+                # (datacores per invention path, all 8 decryptors, and — for
+                # T3 — the relics themselves, consumed per attempt). Skipped
+                # entirely on a pre-5.1 SDE (has_invention_data False → no
+                # T2/T3 modeling).
                 has_inv = self.sde.has_invention_data()
                 invention_tids = set()
                 if has_inv:
@@ -709,10 +717,16 @@ class IndustryTabManager:
                     for tid in products:
                         bp = self.sde.get_blueprint_for_item(tid)
                         sources = self.sde.get_invention_sources(bp) if bp else []
-                        info = self.sde.get_invention(sources[0]) if sources else None
-                        if info:
+                        for src in sources:
+                            info = self.sde.get_invention(src)
+                            if not info:
+                                continue
                             invention_tids.add(tid)
                             tids.update(t for t, _q in info["datacores"])
+                            # A source with no manufacturing product is a T3
+                            # relic — a consumed input that needs a price.
+                            if self.sde.get_product_for_blueprint(src) is None:
+                                tids.add(src)
                     tids.update(DECRYPTORS)
 
                 if refetch:
@@ -741,17 +755,19 @@ class IndustryTabManager:
                     if res:
                         results[tid] = res
 
-                # Stage 5.5 T2 pass: every T2 item with an invention path is
-                # RE-costed full-chain (buildable=None → cheapest-of per node)
-                # at its invented ME, with the amortized invented-BPC cost/run
-                # folded in — replacing the understated flat calc above. The
-                # memo is shared across items so common components/reactions
-                # cost once. T3 (meta 14) invents from relics — Phase 6.
+                # Stage 5.5/6.1 invention pass: every T2 (meta 2) or T3 (meta
+                # 14) item with an invention path is RE-costed full-chain
+                # (buildable=None → cheapest-of per node) at its invented ME,
+                # with the amortized invented-BPC cost/run folded in —
+                # replacing the understated flat calc above. T3 amortizes over
+                # the cheapest viable relic (the detail panel's quality
+                # selector overrides per item). The memo is shared across
+                # items so common components/reactions cost once.
                 if has_inv and invention_tids:
                     calc_t2 = IndustryCalculator(provider, buildable=None)
                     memo = {}
                     for tid in invention_tids:
-                        if self.meta_map.get(tid) != 2:
+                        if self.meta_map.get(tid) not in (2, 14):
                             continue
                         res = self._calc_t2(tid, calc_t2, facset, fac,
                                             provider, fees, p, memo=memo)
@@ -801,7 +817,7 @@ class IndustryTabManager:
         self.upwell_map = is_upwell
         self.pos_map = is_pos
 
-    # ------------------------------------------------------------ T2 (5.5)
+    # ---------------------------------------------------- T2/T3 (5.5 + 6.1)
 
     def _expand_chain_tids(self, tids: set) -> set:
         """Transitive closure of `tids` through manufacturing + reaction
@@ -826,18 +842,20 @@ class IndustryTabManager:
                  facset: FacilitySet, inv_fac: FacilityParams,
                  provider: IndustryProvider, fees: SellFees, p: dict,
                  *, memo: Optional[dict] = None,
-                 decryptor=None, skill_fn=None) -> Optional[dict]:
-        """Full-chain + invention costing for one T2 item. `calc` must be
+                 decryptor=None, skill_fn=None,
+                 source_bp=None) -> Optional[dict]:
+        """Full-chain + invention costing for one T2/T3 item. `calc` must be
         buildable=None (cheapest-of chain). The item is manufactured at the
         INVENTED ME (2 + decryptor mods), never the global ME write-in; note
         the engine threads that one ME through the chain, so component
         sub-builds also use it (slightly conservative vs researched component
-        BPOs). Returns the calc_full result with the invention facts attached
+        BPOs). `source_bp` pins a specific relic quality (T3); None = cheapest
+        viable. Returns the calc_full result with the invention facts attached
         under "invention", or None if there's no invention path."""
         inv = self.inv_pricing.resolve(
             tid, input_price_fn=provider.input_price, skill_level_fn=skill_fn,
             decryptor=decryptor, invention_fac=inv_fac,
-            invention_system=p["facility_system"])
+            invention_system=p["facility_system"], source_bp=source_bp)
         if not inv:
             return None
         res = calc.calc_full(tid, facset, fees, me=inv["me"], batch=p["batch"],
@@ -848,9 +866,9 @@ class IndustryTabManager:
         return res
 
     def _recompute_item_t2(self, tid: int):
-        """Recompute ONE T2 item on the UI thread (decryptor / Built-by
-        change). Pure cache reads + SQLite — fast enough inline. Uses the
-        Built-by character's cached skills for probability when set (peek
+        """Recompute ONE T2/T3 item on the UI thread (decryptor / relic /
+        Built-by change). Pure cache reads + SQLite — fast enough inline. Uses
+        the Built-by character's cached skills for probability when set (peek
         only; falls back per-skill to the assumed level)."""
         p = self._params()
         fac = self._facility_from(p)
@@ -862,7 +880,8 @@ class IndustryTabManager:
                     if char_id else None)
         calc = IndustryCalculator(provider, buildable=None)
         res = self._calc_t2(tid, calc, facset, fac, provider, self._fees(), p,
-                            decryptor=dec, skill_fn=skill_fn)
+                            decryptor=dec, skill_fn=skill_fn,
+                            source_bp=self._relic_choice.get(tid))
         if res:
             self.results[tid] = res
             self._rebuild_list()
@@ -875,6 +894,24 @@ class IndustryTabManager:
             self._decryptor_choice[tid] = dec_id
         else:
             self._decryptor_choice.pop(tid, None)
+        self._recompute_item_t2(tid)
+
+    def _relic_label(self, relic_tid: int) -> str:
+        return (self.name_map.get(relic_tid)
+                or self.names.get_type_name(relic_tid) or str(relic_tid))
+
+    def _on_relic(self, tid: int, label: str):
+        """Relic-quality selector change (T3). `label` is a relic name from
+        the current result's source_options, or the 'Cheapest (auto)' entry
+        (→ choice cleared)."""
+        inv = self.results.get(tid, {}).get("invention") or {}
+        chosen = next((o["blueprint_id"]
+                       for o in inv.get("source_options", [])
+                       if self._relic_label(o["blueprint_id"]) == label), None)
+        if chosen is not None:
+            self._relic_choice[tid] = chosen
+        else:
+            self._relic_choice.pop(tid, None)
         self._recompute_item_t2(tid)
 
     def _ancestry_names(self, mg_id: Optional[int]) -> str:
@@ -948,12 +985,12 @@ class IndustryTabManager:
         elif not self.sde.has_invention_data():
             self.tech_note_label.configure(
                 text="⚠ industry SDE predates invention data — click Update SDE "
-                     "to light up the T2 list (T2/T3 costs understated)",
+                     "to light up the T2/T3 list (their costs understated)",
                 foreground=CLR_BAD)
         else:
             self.tech_note_label.configure(
-                text="(T2 = full chain + invention; T3 not modeled yet — its "
-                     "build cost is understated)",
+                text="(T2/T3 = full chain + invention; T3 costs the cheapest "
+                     "relic — pick quality in the detail panel)",
                 foreground=CLR_MUTED)
 
     def _on_update_sde(self):
@@ -1215,13 +1252,18 @@ class IndustryTabManager:
                   foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
 
     def _build_invention_section(self, r, tid):
-        """Stage 5.5 Invention section: decryptor dropdown (None default),
-        probability / expected attempts at the effective skills, invented BPC
-        ME/TE/runs, consumables, job + copy costs, amortized cost/run."""
+        """Stage 5.5/6.1 Invention section: decryptor dropdown (None default),
+        relic-quality selector (T3 only), probability / expected attempts at
+        the effective skills, invented BPC ME/TE/runs, consumables (incl. the
+        consumed relic), job + copy costs, amortized cost/run."""
         inv = r.get("invention")
         if not inv:
             return
-        frame = ttk.LabelFrame(self.detail, text="Invention (T2)", padding=4)
+        relic = inv.get("relic")
+        frame = ttk.LabelFrame(
+            self.detail,
+            text="Invention (T3 relic)" if relic else "Invention (T2)",
+            padding=4)
         frame.pack(fill=tk.X, pady=(0, 6))
 
         row = ttk.Frame(frame)
@@ -1235,6 +1277,26 @@ class IndustryTabManager:
         combo.pack(side=tk.LEFT, padx=4)
         combo.bind("<<ComboboxSelected>>",
                    lambda e, t=tid, v=dec_var: self._on_decryptor(t, v.get()))
+
+        # Relic-quality selector (Phase 6): T3 items have 3 relic sources
+        # (Intact/Malfunctioning/Wrecked), each its own probability/runs.
+        # Default = cheapest viable (the ranked list's basis); session-only.
+        opts = inv.get("source_options", [])
+        if len(opts) > 1:
+            rrow = ttk.Frame(frame)
+            rrow.pack(fill=tk.X, padx=8, pady=(0, 2))
+            ttk.Label(rrow, text="Relic:", foreground=CLR_MUTED).pack(side=tk.LEFT)
+            auto = "Cheapest (auto)"
+            rel_names = [auto] + [self._relic_label(o["blueprint_id"])
+                                  for o in opts]
+            cur_rel = self._relic_choice.get(tid)
+            rel_var = tk.StringVar(
+                value=self._relic_label(cur_rel) if cur_rel else auto)
+            rcombo = ttk.Combobox(rrow, values=rel_names, textvariable=rel_var,
+                                  width=32, state="readonly")
+            rcombo.pack(side=tk.LEFT, padx=4)
+            rcombo.bind("<<ComboboxSelected>>",
+                        lambda e, t=tid, v=rel_var: self._on_relic(t, v.get()))
 
         self._kv(frame, "Success probability:", f"{inv['probability'] * 100:.1f}%")
         att = inv["expected_attempts_per_copy"]
@@ -1252,8 +1314,15 @@ class IndustryTabManager:
             self._kv(frame, f"  {qty}× {dname}:",
                      "no price" if px <= 0 else f"{isk(qty * px)} ISK",
                      color=CLR_BAD if px <= 0 else None)
+        if relic:
+            self._kv(frame, f"  1× {self._relic_label(relic['type_id'])} "
+                            "(consumed):",
+                     "no price" if relic["price"] <= 0
+                     else f"{isk(relic['price'])} ISK",
+                     color=CLR_BAD if relic["price"] <= 0 else None)
         if cur is not None:
-            dec_cost = inv["attempt_materials_cost"] - datacore_cost
+            dec_cost = (inv["attempt_materials_cost"] - datacore_cost
+                        - (relic["price"] if relic else 0.0))
             self._kv(frame, f"  1× {cur.name} Decryptor:",
                      "no price" if dec_cost <= 0 else f"{isk(dec_cost)} ISK",
                      color=CLR_BAD if dec_cost <= 0 else None)
@@ -1261,10 +1330,12 @@ class IndustryTabManager:
                  f"{isk(inv['attempt_materials_cost'])} ISK")
         self._kv(frame, "Invention job cost:",
                  f"{isk(inv['invention_job_cost'])} ISK")
-        copy_txt = f"{isk(inv['copy_job_cost'])} ISK"
-        if inv.get("copy_cost_estimated"):
-            copy_txt += " (est.)"
-        self._kv(frame, "Copy job cost (per attempt):", copy_txt)
+        if not relic:
+            # Relic attempts consume the relic itself — no copy step.
+            copy_txt = f"{isk(inv['copy_job_cost'])} ISK"
+            if inv.get("copy_cost_estimated"):
+                copy_txt += " (est.)"
+            self._kv(frame, "Copy job cost (per attempt):", copy_txt)
         self._kv(frame, "Amortized BPC cost / run:",
                  f"{isk(inv['cost_per_run'])} ISK", bold=True)
 
@@ -1620,7 +1691,7 @@ class IndustryTabManager:
             if cid is not None:
                 self._built_by[tid] = cid
         self._save_built_by()
-        # Build/research time depend on it; for a T2 item the invention
+        # Build/research time depend on it; for a T2/T3 item the invention
         # probability does too (real skills vs assumed level).
         if self.results.get(tid, {}).get("invention"):
             self._recompute_item_t2(tid)

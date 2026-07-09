@@ -208,7 +208,7 @@ class BpcPricing:
 # ---------------------------------------------------------------------------
 
 class InventionPricing:
-    """Resolves a T2 product's amortized invented-BPC cost/run + display facts.
+    """Resolves a T2/T3 product's amortized invented-BPC cost/run + facts.
 
     Combines the Stage 5.1 SDE readers (get_invention / get_invention_sources /
     get_required_skills), the Stage 5.2 engine math (invention_probability /
@@ -272,11 +272,12 @@ class InventionPricing:
                 skill_level_fn=None,
                 decryptor: Optional[Decryptor] = None,
                 invention_fac: Optional[FacilityParams] = None,
-                invention_system: Optional[int] = None) -> Optional[dict]:
-        """Amortized invented-BPC cost/run + display facts for a T2 product.
+                invention_system: Optional[int] = None,
+                source_bp: Optional[int] = None) -> Optional[dict]:
+        """Amortized invented-BPC cost/run + display facts for a T2/T3 product.
 
-        `input_price_fn(tid) -> float` prices datacores/decryptor (caller's
-        material-pricing callable). `skill_level_fn(skill_type_id) ->
+        `input_price_fn(tid) -> float` prices datacores/decryptor/relics
+        (caller's material-pricing callable). `skill_level_fn(skill_type_id) ->
         Optional[int]` returns a real character's level for a skill, or None
         to fall back to the assumed level (also used when skill_level_fn
         itself is None). `invention_fac` supplies cost-bonus/tax/SCC/alpha for
@@ -286,10 +287,22 @@ class InventionPricing:
         instead (science jobs use activity-specific indices, not the
         manufacturing one a bare FacilityParams might carry).
 
+        A T2 blueprint has ONE source (its T1 blueprint); a T3 blueprint has
+        THREE relic sources (Intact/Malfunctioning/Wrecked), each with its own
+        base probability and base_runs (Phase 6). Every source is costed;
+        `source_bp` picks one explicitly (the detail panel's relic-quality
+        selector), otherwise the CHEAPEST VIABLE source wins (all consumables
+        priced; degrades to computable-then-anything so the GUI always gets
+        facts + its unpriced warning instead of a blank section). A relic is a
+        CONSUMED input — priced into attempt_materials_cost — and has no copy
+        step (copy_job_cost 0); a T1 source instead pays the per-attempt 1-run
+        copy job. The result carries `relic` ({"type_id", "price"} or None)
+        and `source_options` (per-source facts for the selector).
+
         Returns None if there's no invention path for this product (no
-        blueprint, no invention sources, no invention data for the source, no
-        matching invented-product row, or no T2 manufacturing recipe to value
-        EIV against) — never raises.
+        blueprint, no invention sources, no invention data for any source, no
+        matching invented-product row, or no T2/T3 manufacturing recipe to
+        value EIV against) — never raises.
         """
         try:
             t2_bp = self.sde.get_blueprint_for_item(product_type_id)
@@ -298,80 +311,11 @@ class InventionPricing:
             sources = self.sde.get_invention_sources(t2_bp)
             if not sources:
                 return None
-            # T2 has exactly one source; a future T3 path picks among the
-            # (Intact/Malfunctioning/Wrecked) relics in `sources`.
-            source_bp = sources[0]
 
-            inv = self.sde.get_invention(source_bp)
-            if not inv:
-                return None
-            product_entry = next(
-                (p for p in inv["products"] if p["blueprint_id"] == t2_bp), None)
-            if product_entry is None:
-                return None
-            base_prob = product_entry["probability"]
-            base_runs = product_entry["base_runs"]
-
-            # Skill classification: the encryption skill is identifiable by
-            # name ("* Encryption Methods"); the other two are datacore
-            # sciences. If skills are missing (old SDE / skills CSV not
-            # imported) or name resolution fails (main SDE absent), fall back
-            # to the assumed level for all three — classification only
-            # matters when real per-skill levels differ.
-            reqs = self.sde.get_required_skills(source_bp, ACTIVITY_INVENTION)
-            enc_id = sci1_id = sci2_id = None
-            if reqs:
-                try:
-                    from sde.sde_manager import get_sde_manager
-                    mgr = get_sde_manager()
-                    sci_ids = []
-                    for sid, _lvl in reqs:
-                        name = mgr.get_type_name(sid) or ""
-                        if "encryption methods" in name.lower():
-                            enc_id = sid
-                        else:
-                            sci_ids.append(sid)
-                    if len(sci_ids) >= 1:
-                        sci1_id = sci_ids[0]
-                    if len(sci_ids) >= 2:
-                        sci2_id = sci_ids[1]
-                except Exception as e:
-                    print(f"[IndustryDiag] invention skill-name resolve "
-                         f"failed (using assumed level): {e}")
-                    enc_id = sci1_id = sci2_id = None
-
-            sci1 = self._skill_level(sci1_id, skill_level_fn)
-            sci2 = self._skill_level(sci2_id, skill_level_fn)
-            enc = self._skill_level(enc_id, skill_level_fn)
-
-            decryptor_mult = decryptor.probability_mult if decryptor else 1.0
-            probability = invention_probability(base_prob, sci1, sci2, enc,
-                                                decryptor_mult)
-            outcome = invention_outcome(base_runs, decryptor)
-
-            unpriced: List[int] = []
-            attempt_materials_cost = 0.0
-            datacores = []
-            for tid, qty in inv["datacores"]:
-                unit_px = input_price_fn(tid)
-                if not unit_px or unit_px <= 0:
-                    unpriced.append(tid)
-                    unit_px = 0.0
-                attempt_materials_cost += qty * unit_px
-                datacores.append((tid, qty, unit_px))
-
-            decryptor_type_id = None
-            if decryptor is not None:
-                decryptor_type_id = decryptor.type_id
-                dec_px = input_price_fn(decryptor.type_id)
-                if not dec_px or dec_px <= 0:
-                    unpriced.append(decryptor.type_id)
-                    dec_px = 0.0
-                attempt_materials_cost += dec_px
-
-            # EIV for the science jobs = the INVENTED (T2) blueprint's
-            # MANUFACTURING recipe base quantities (PLAN §1b) — NOT the T1
-            # BP's materials and NOT the datacores.
+            # EIV for the science jobs = the INVENTED (T2/T3) blueprint's
+            # MANUFACTURING recipe base quantities (PLAN §1b) — NOT the
+            # source's materials and NOT the datacores. Shared by every
+            # source, so valued once.
             t2_recipe = self.sde.get_recipe(product_type_id)
             if not t2_recipe:
                 return None
@@ -382,51 +326,175 @@ class InventionPricing:
             fac = invention_fac if invention_fac is not None else FacilityParams()
             inv_index = (self.market.cost_index(invention_system, "invention")
                         if invention_system is not None else 0.0)
-            invention_job_cost = science_job_cost(eiv, inv_index, fac)
-
-            # Copy job cost: per-attempt = one 1-run T1 copy of the SOURCE
-            # blueprint's product (best-effort match of eve-ref's
-            # CopyingCalculator — ⚠ verify in-game). EIV here is the T1 BP's
-            # own manufacturing materials, not the T2's.
-            copy_cost_estimated = False
-            t1_product = self.sde.get_product_for_blueprint(source_bp)
-            t1_recipe = self.sde.get_recipe(t1_product) if t1_product else None
-            if t1_recipe:
-                t1_recipe_obj = Recipe(output_per_run=t1_recipe["output_per_run"],
-                                       materials=t1_recipe["materials"])
-                eiv_t1 = estimated_item_value(t1_recipe_obj, self.market.adjusted_price)
-            else:
-                eiv_t1 = 0.0
-                copy_cost_estimated = True
             copy_index = (self.market.cost_index(invention_system, "copying")
                          if invention_system is not None else 0.0)
-            copy_job_cost = science_job_cost(eiv_t1, copy_index, fac)
 
-            cost_per_run = invention_cost_per_run(
-                attempt_materials_cost, invention_job_cost, copy_job_cost,
-                probability, outcome["runs"])
+            candidates = []
+            for src in sources:
+                c = self._resolve_source(t2_bp, src, eiv, fac, inv_index,
+                                         copy_index, input_price_fn,
+                                         skill_level_fn, decryptor)
+                if c is not None:
+                    candidates.append(c)
+            if not candidates:
+                return None
 
-            return {
-                "cost_per_run": cost_per_run,
-                "probability": probability,
-                "me": outcome["me"],
-                "te": outcome["te"],
-                "runs_per_copy": outcome["runs"],
-                "expected_attempts_per_copy": (
-                    1.0 / probability if probability > 0 else 0.0),
-                "datacores": datacores,
-                "decryptor_type_id": decryptor_type_id,
-                "attempt_materials_cost": attempt_materials_cost,
-                "invention_job_cost": invention_job_cost,
-                "copy_job_cost": copy_job_cost,
-                "unpriced": unpriced,
-                "source_blueprint_ids": sources,
-                "copy_cost_estimated": copy_cost_estimated,
-            }
+            chosen = None
+            if source_bp is not None:
+                chosen = next((c for c in candidates
+                               if c["source_bp"] == source_bp), None)
+            if chosen is None:
+                pool = ([c for c in candidates
+                         if c["cost_per_run"] > 0 and not c["unpriced"]]
+                        or [c for c in candidates if c["cost_per_run"] > 0]
+                        or candidates)
+                chosen = min(pool, key=lambda c: c["cost_per_run"])
+
+            chosen["source_blueprint_ids"] = sources
+            chosen["source_options"] = [
+                {"blueprint_id": c["source_bp"],
+                 "cost_per_run": c["cost_per_run"],
+                 "probability": c["probability"],
+                 "runs_per_copy": c["runs_per_copy"],
+                 "relic_price": c["relic"]["price"] if c["relic"] else None}
+                for c in candidates]
+            return chosen
         except Exception as e:
             print(f"[IndustryDiag] InventionPricing.resolve failed for "
                  f"{product_type_id}: {e}")
             return None
+
+    def _resolve_source(self, invented_bp: int, source_bp: int, eiv: float,
+                        fac: FacilityParams, inv_index: float,
+                        copy_index: float, input_price_fn, skill_level_fn,
+                        decryptor: Optional[Decryptor]) -> Optional[dict]:
+        """Full invention costing for ONE source (a T1 blueprint or a T3
+        relic). Returns the resolve() result dict minus the multi-source keys
+        (`source_blueprint_ids`/`source_options`), or None if this source has
+        no activity-8 row producing `invented_bp`."""
+        inv = self.sde.get_invention(source_bp)
+        if not inv:
+            return None
+        product_entry = next(
+            (p for p in inv["products"] if p["blueprint_id"] == invented_bp),
+            None)
+        if product_entry is None:
+            return None
+        base_prob = product_entry["probability"]
+        base_runs = product_entry["base_runs"]
+
+        # Skill classification: the encryption skill is identifiable by
+        # name ("* Encryption Methods" — incl. "Sleeper Encryption Methods"
+        # on T3 relics); the other two are datacore sciences. If skills are
+        # missing (old SDE / skills CSV not imported) or name resolution
+        # fails (main SDE absent), fall back to the assumed level for all
+        # three — classification only matters when real per-skill levels
+        # differ.
+        reqs = self.sde.get_required_skills(source_bp, ACTIVITY_INVENTION)
+        enc_id = sci1_id = sci2_id = None
+        if reqs:
+            try:
+                from sde.sde_manager import get_sde_manager
+                mgr = get_sde_manager()
+                sci_ids = []
+                for sid, _lvl in reqs:
+                    name = mgr.get_type_name(sid) or ""
+                    if "encryption methods" in name.lower():
+                        enc_id = sid
+                    else:
+                        sci_ids.append(sid)
+                if len(sci_ids) >= 1:
+                    sci1_id = sci_ids[0]
+                if len(sci_ids) >= 2:
+                    sci2_id = sci_ids[1]
+            except Exception as e:
+                print(f"[IndustryDiag] invention skill-name resolve "
+                     f"failed (using assumed level): {e}")
+                enc_id = sci1_id = sci2_id = None
+
+        sci1 = self._skill_level(sci1_id, skill_level_fn)
+        sci2 = self._skill_level(sci2_id, skill_level_fn)
+        enc = self._skill_level(enc_id, skill_level_fn)
+
+        decryptor_mult = decryptor.probability_mult if decryptor else 1.0
+        probability = invention_probability(base_prob, sci1, sci2, enc,
+                                            decryptor_mult)
+        outcome = invention_outcome(base_runs, decryptor)
+
+        unpriced: List[int] = []
+        attempt_materials_cost = 0.0
+        datacores = []
+        for tid, qty in inv["datacores"]:
+            unit_px = input_price_fn(tid)
+            if not unit_px or unit_px <= 0:
+                unpriced.append(tid)
+                unit_px = 0.0
+            attempt_materials_cost += qty * unit_px
+            datacores.append((tid, qty, unit_px))
+
+        decryptor_type_id = None
+        if decryptor is not None:
+            decryptor_type_id = decryptor.type_id
+            dec_px = input_price_fn(decryptor.type_id)
+            if not dec_px or dec_px <= 0:
+                unpriced.append(decryptor.type_id)
+                dec_px = 0.0
+            attempt_materials_cost += dec_px
+
+        # Relic vs T1-copy source: a T3 relic manufactures nothing of its
+        # own, so get_product_for_blueprint is None. The relic itself is
+        # CONSUMED per attempt (priced like any material — thin-market
+        # history fallback comes with input_price_fn) and there is no copy
+        # step. A T1 source instead pays a per-attempt 1-run copy job
+        # (best-effort match of eve-ref's CopyingCalculator — ⚠ verify
+        # in-game) whose EIV is the T1 BP's own manufacturing materials.
+        relic = None
+        copy_cost_estimated = False
+        t1_product = self.sde.get_product_for_blueprint(source_bp)
+        if t1_product is None:
+            relic_px = input_price_fn(source_bp)
+            if not relic_px or relic_px <= 0:
+                unpriced.append(source_bp)
+                relic_px = 0.0
+            attempt_materials_cost += relic_px
+            relic = {"type_id": source_bp, "price": relic_px}
+            copy_job_cost = 0.0
+        else:
+            t1_recipe = self.sde.get_recipe(t1_product)
+            if t1_recipe:
+                t1_recipe_obj = Recipe(output_per_run=t1_recipe["output_per_run"],
+                                       materials=t1_recipe["materials"])
+                eiv_t1 = estimated_item_value(t1_recipe_obj,
+                                              self.market.adjusted_price)
+            else:
+                eiv_t1 = 0.0
+                copy_cost_estimated = True
+            copy_job_cost = science_job_cost(eiv_t1, copy_index, fac)
+
+        invention_job_cost = science_job_cost(eiv, inv_index, fac)
+
+        cost_per_run = invention_cost_per_run(
+            attempt_materials_cost, invention_job_cost, copy_job_cost,
+            probability, outcome["runs"])
+
+        return {
+            "cost_per_run": cost_per_run,
+            "probability": probability,
+            "me": outcome["me"],
+            "te": outcome["te"],
+            "runs_per_copy": outcome["runs"],
+            "expected_attempts_per_copy": (
+                1.0 / probability if probability > 0 else 0.0),
+            "datacores": datacores,
+            "decryptor_type_id": decryptor_type_id,
+            "attempt_materials_cost": attempt_materials_cost,
+            "invention_job_cost": invention_job_cost,
+            "copy_job_cost": copy_job_cost,
+            "unpriced": unpriced,
+            "copy_cost_estimated": copy_cost_estimated,
+            "source_bp": source_bp,
+            "relic": relic,
+        }
 
 
 # ---------------------------------------------------------------------------
