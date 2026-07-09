@@ -462,6 +462,34 @@ class SDEIndustryDB:
     # Lookup methods (Stage 5.1 — all activities: invention/reaction/etc.)
     # =========================================================================
 
+    def get_all_products_for_activity(self, activity_id: int) -> List[int]:
+        """All product type_ids producible via the given activity — e.g.
+        ACTIVITY_REACTION enumerates every reaction-formula output (moon goo
+        intermediates, advanced materials, gas/booster intermediates) for the
+        Phase 7 Extra list.
+
+        Pre-5.1 DBs (no activity_id column) only ever held manufacturing rows:
+        ACTIVITY_MANUFACTURING delegates to get_all_manufacturable_items, any
+        other activity returns [] (degrade, never raise).
+        """
+        if not self._schema_has_activity_id():
+            return (self.get_all_manufacturable_items()
+                    if activity_id == ACTIVITY_MANUFACTURING else [])
+        try:
+            conn = self._get_conn()
+            cursor = conn.execute(
+                "SELECT DISTINCT product_type_id FROM industry_products "
+                "WHERE activity_id = ?",
+                (int(activity_id),)
+            )
+            result = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return result
+        except Exception as e:
+            print(f"[SDEIndustry] Error listing products for activity "
+                  f"{activity_id}: {e}")
+            return []
+
     def get_producer(self, product_type_id: int, activity_id: int) -> Optional[int]:
         """Blueprint/formula type_id that produces this product via the given
         activity. Generalized get_blueprint_for_item — e.g. pass

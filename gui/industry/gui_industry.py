@@ -19,7 +19,11 @@ relics — the relic is a consumed, priced input; no copy job; 3 quality tiers
 (Intact/Malfunctioning/Wrecked) with the ranked list on the cheapest viable
 relic and a per-item quality selector in the detail panel. Character data is
 optional throughout (assumed invention skill level write-in when no "Built by"
-character is set).
+character is set). Phase 7 adds the "Extra (react/comp)" list page: reaction
+(activity-11) products and Components-category items ranked as sellable
+products in their own right (moon goo → advanced materials → components),
+costed via the same cheapest-of chain; reaction-only products stay off the
+All/Positive pages.
 """
 
 import threading
@@ -198,6 +202,8 @@ class IndustryTabManager:
         self.upwell_map: Dict[int, bool] = {}    # tid -> is Upwell structure hull (excl. by Hide Upwell)
         self.pos_map: Dict[int, bool] = {}       # tid -> is POS/starbase gear (excl. by Hide POS)
         self.tech_selected = set(DEFAULT_TECH)   # active tech-level buckets
+        self.extra_tids: set = set()             # Phase 7 Extra page rows (reactions + components)
+        self.reaction_tids: set = set()          # reaction-ONLY products (kept off the All/Positive pages)
         self.display_order: List[int] = []       # filtered+sorted tids
         self.selected: Optional[int] = None
         # Phase 2.5: per-item "Built by" roster selection. Persists but is
@@ -231,9 +237,9 @@ class IndustryTabManager:
         self.notebook.add(outer, text="Industry")
         self.frame = outer
 
-        # Industry-level sub-notebook: Top Profit (T1 + the Stage 5.5 T2 list
-        # page share this tab's filters/detail panel) + Owned BPO/BPC (Phase 3)
-        # + Characters (Phase 2). Phase 6/7 add T3/Extra.
+        # Industry-level sub-notebook: Top Profit (the T1/T2/T3/Extra list
+        # pages all share this tab's filters/detail panel) + Owned BPO/BPC
+        # (Phase 3) + Characters (Phase 2).
         self.sub_nb = ttk.Notebook(outer)
         self.sub_nb.pack(fill=tk.BOTH, expand=True)
         t1 = ttk.Frame(self.sub_nb)
@@ -440,16 +446,19 @@ class IndustryTabManager:
         self._list_menu.add_separator()
         self._list_menu.add_command(label="Ignore this item",
                                     command=self._ignore_selected)
-        # Three list views sharing the detail panel: full ranked list (incl.
-        # negatives), a profit>0 view, and the invention page (every T2/T3
-        # item with an invention path, full-chain + invention cost, ignoring
-        # the tech chips). All render from the same results dict.
+        # Four list views sharing the detail panel: full ranked list (incl.
+        # negatives), a profit>0 view, the invention page (every T2/T3 item
+        # with an invention path, full-chain + invention cost, ignoring the
+        # tech chips), and the Phase 7 Extra page (reaction products +
+        # components as products, also tech-chip-agnostic). All render from
+        # the same results dict.
         self.list_nb = ttk.Notebook(left)
         self.list_nb.pack(fill=tk.BOTH, expand=True)
         self.tree = self._make_list_tree(self.list_nb, "All")
         self.tree_pos = self._make_list_tree(self.list_nb, "Positive only")
         self.tree_t2 = self._make_list_tree(self.list_nb, "T2/T3 (invention)")
-        self._trees = (self.tree, self.tree_pos, self.tree_t2)
+        self.tree_extra = self._make_list_tree(self.list_nb, "Extra (react/comp)")
+        self._trees = (self.tree, self.tree_pos, self.tree_t2, self.tree_extra)
         self._update_headings()
 
         right = ttk.Frame(main)
@@ -690,6 +699,8 @@ class IndustryTabManager:
         def _work():
             err = None
             note = ""
+            extra_tids = set()
+            reaction_only = set()
             try:
                 products = self.sde.get_all_manufacturable_items()
                 # gather all type_ids needing prices; drop CCP placeholder
@@ -704,16 +715,26 @@ class IndustryTabManager:
                         dummies.add(tid)
                 products = [t for t in products if t not in dummies]
 
+                # Phase 7: reaction (activity-11) products, ranked as products
+                # in their own right on the Extra page. Empty on a pre-5.1 SDE.
+                # An item both manufacturable AND reaction-made stays a normal
+                # list row; reaction-ONLY products are Extra-page exclusive.
+                reaction_only = set(self.sde.get_all_products_for_activity(
+                    ACTIVITY_REACTION)) - set(products)
+
                 # Stage 5.5/6.1: T2+T3 need the FULL chain priced (components
                 # → reactions → moon goo) plus invention consumables
                 # (datacores per invention path, all 8 decryptors, and — for
                 # T3 — the relics themselves, consumed per attempt). Skipped
                 # entirely on a pre-5.1 SDE (has_invention_data False → no
-                # T2/T3 modeling).
+                # T2/T3 modeling). Reaction products (Phase 7) also need their
+                # chains (goo inputs) priced.
                 has_inv = self.sde.has_invention_data()
                 invention_tids = set()
-                if has_inv:
+                if has_inv or reaction_only:
+                    tids.update(reaction_only)
                     tids = self._expand_chain_tids(tids)
+                if has_inv:
                     for tid in products:
                         bp = self.sde.get_blueprint_for_item(tid)
                         sources = self.sde.get_invention_sources(bp) if bp else []
@@ -741,7 +762,7 @@ class IndustryTabManager:
                             lambda mm=m: self.progress_label.configure(text=mm)))
 
                 if need_meta:
-                    self._build_metadata(products)
+                    self._build_metadata(products + sorted(reaction_only))
 
                 # Build facility/provider AFTER any refetch so cost index is fresh.
                 fac = self._facility_from(p)
@@ -755,6 +776,11 @@ class IndustryTabManager:
                     if res:
                         results[tid] = res
 
+                # Shared cheapest-of calculator + memo for the invention (5.5)
+                # and Extra (Phase 7) passes — common sub-chains cost once.
+                calc_chain = IndustryCalculator(provider, buildable=None)
+                chain_memo = {}
+
                 # Stage 5.5/6.1 invention pass: every T2 (meta 2) or T3 (meta
                 # 14) item with an invention path is RE-costed full-chain
                 # (buildable=None → cheapest-of per node) at its invented ME,
@@ -764,22 +790,39 @@ class IndustryTabManager:
                 # selector overrides per item). The memo is shared across
                 # items so common components/reactions cost once.
                 if has_inv and invention_tids:
-                    calc_t2 = IndustryCalculator(provider, buildable=None)
-                    memo = {}
                     for tid in invention_tids:
                         if self.meta_map.get(tid) not in (2, 14):
                             continue
-                        res = self._calc_t2(tid, calc_t2, facset, fac,
-                                            provider, fees, p, memo=memo)
+                        res = self._calc_t2(tid, calc_chain, facset, fac,
+                                            provider, fees, p, memo=chain_memo)
                         if res:
                             results[tid] = res
+
+                # Phase 7 Extra pass: reaction products + Components-category
+                # items (advanced/capital/structure components, R.A.M., …)
+                # costed full-chain (cheapest-of per node) — the Extra page's
+                # row set. Components costed flat above are REPLACED (the
+                # chain calc only ever finds a cheaper input path); items the
+                # invention pass already costed keep that result.
+                extra_tids = set(reaction_only)
+                extra_tids.update(t for t in products
+                                  if self.category_map.get(t) == "Components")
+                for tid in sorted(extra_tids):
+                    if results.get(tid, {}).get("invention"):
+                        continue
+                    res = calc_chain.calc_full(tid, facset, fees,
+                                               me=p["me"], batch=p["batch"],
+                                               memo=chain_memo)
+                    if res:
+                        results[tid] = res
             except Exception as e:
                 err = str(e)
                 _print(f"compute failed: {e}")
                 import traceback
                 traceback.print_exc()
                 results = {}
-            submit(lambda: self._compute_done(results, err, note, refetch))
+            submit(lambda: self._compute_done(results, err, note, refetch,
+                                              extra_tids, reaction_only))
 
         threading.Thread(target=_work, daemon=True, name="IndustryCompute").start()
 
@@ -790,7 +833,11 @@ class IndustryTabManager:
         # Classify buyable-BPO vs BPC-only: an item has a buyable BPO iff its
         # blueprint type sits on the market (market_group_id not None). BPC-only
         # = faction/Triglavian drops + T2/T3 invented (blueprint never seeded).
-        bp_of = {tid: self.sde.get_blueprint_for_item(tid) for tid in products}
+        # A reaction-only product (Phase 7) has no manufacturing blueprint —
+        # its formula (market-seeded, so "BPO") stands in.
+        bp_of = {tid: (self.sde.get_blueprint_for_item(tid)
+                       or self.sde.get_producer(tid, ACTIVITY_REACTION))
+                 for tid in products}
         bp_infos = self.names.get_type_info_bulk([b for b in bp_of.values() if b])
         self.name_map = names
         cat = {}
@@ -934,13 +981,16 @@ class IndustryTabManager:
                 return label
         return "Other"
 
-    def _compute_done(self, results, err, note, refetch):
+    def _compute_done(self, results, err, note, refetch,
+                      extra_tids=None, reaction_tids=None):
         self._computing = False
         self.refresh_btn.configure(state="normal")
         if refetch:
             self._last_refresh = time.time()
             self.status_label.configure(text=f"Data: {self.market.get_last_update()}")
         self.results = results
+        self.extra_tids = extra_tids or set()
+        self.reaction_tids = reaction_tids or set()
         if err:
             self.progress_label.configure(text=f"Failed: {err}")
         else:
@@ -1135,20 +1185,27 @@ class IndustryTabManager:
             return True
 
         rows = []
-        t2_rows = []   # Stage 5.5: invention-costed items, tech chips ignored
+        t2_rows = []      # Stage 5.5: invention-costed items, tech chips ignored
+        extra_rows = []   # Phase 7: reactions + components, tech chips ignored
         for tid in cat_items:
             r = self.results[tid]
             name = self.name_map.get(tid, str(tid))
             if not passes(tid, r, name):
                 continue
-            if tech_label(self.meta_map.get(tid)) in self.tech_selected:
+            # Reaction-only products never join All/Positive — those pages
+            # stay "every manufacturable item" (the Extra page is theirs).
+            if (tid not in self.reaction_tids
+                    and tech_label(self.meta_map.get(tid)) in self.tech_selected):
                 rows.append(tid)
             if r.get("invention"):
                 t2_rows.append(tid)
+            if tid in self.extra_tids:
+                extra_rows.append(tid)
 
         sort_key = lambda t: self._sort_value(t, self.sort_col)
         rows.sort(key=sort_key, reverse=self.sort_reverse)
         t2_rows.sort(key=sort_key, reverse=self.sort_reverse)
+        extra_rows.sort(key=sort_key, reverse=self.sort_reverse)
         self.display_order = rows
         # "Positive only" sub-tab: same base filter, profit strictly > 0.
         pos_rows = [t for t in rows
@@ -1157,6 +1214,7 @@ class IndustryTabManager:
         self._fill_tree(self.tree, rows)
         self._fill_tree(self.tree_pos, pos_rows)
         self._fill_tree(self.tree_t2, t2_rows)
+        self._fill_tree(self.tree_extra, extra_rows)
 
     def _fill_tree(self, tree, rows):
         tree.delete(*tree.get_children())
@@ -1557,6 +1615,13 @@ class IndustryTabManager:
     def _build_time_section(self, r, tid: int):
         frame = ttk.LabelFrame(self.detail, text="Build time (Phase 4)", padding=4)
         frame.pack(fill=tk.X, pady=(6, 0))
+        if r.get("activity") == "reaction":
+            # Reaction job time runs off the Reactions skill, not the
+            # Industry/Adv-Industry math below — not modelled (Phase 7 scope).
+            ttk.Label(frame, text="Reaction time not modelled (uses the "
+                                  "Reactions skill, not Industry).",
+                      foreground=CLR_MUTED).pack(anchor="w", padx=8)
+            return
         if not self.sde.has_activity_time_data():
             ttk.Label(frame, text="Re-download the SDE (Update SDE) to enable "
                                   "build-time estimates.",
