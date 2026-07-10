@@ -21,8 +21,9 @@ BASE_URL = "https://esi.evetech.net/latest"
 
 
 class _StandingsCache:
-    def __init__(self, standings: dict):
-        self.standings = standings
+    def __init__(self, standings: dict, base: dict = None):
+        self.standings = standings   # Connections/Diplomacy-modified (display)
+        self.base = base or standings  # raw ESI values (fee math needs BASE)
         self.fetched_at = datetime.now()
         self.expires_at = self.fetched_at + timedelta(hours=1)
 
@@ -80,19 +81,23 @@ class IndustryStandings:
             print(f"[IndustryStandings] request error for {character_id}: {e}")
             return None
 
+        # Both flavors are cached: the Connections/Diplomacy-modified values
+        # for display, and the BASE values for fee math (the in-game broker
+        # fee ignores social skills — verified 2026-07-03).
         standings = {"agents": {}, "npc_corps": {}, "factions": {}}
+        base = {"agents": {}, "npc_corps": {}, "factions": {}}
         for entry in data:
             from_id = entry.get("from_id")
             from_type = entry.get("from_type")
-            eff = self._modifier(entry.get("standing", 0.0), connections, diplomacy)
-            if from_type == "agent":
-                standings["agents"][from_id] = eff
-            elif from_type == "npc_corp":
-                standings["npc_corps"][from_id] = eff
-            elif from_type == "faction":
-                standings["factions"][from_id] = eff
+            raw = entry.get("standing", 0.0)
+            eff = self._modifier(raw, connections, diplomacy)
+            key = {"agent": "agents", "npc_corp": "npc_corps",
+                   "faction": "factions"}.get(from_type)
+            if key:
+                standings[key][from_id] = eff
+                base[key][from_id] = raw
 
-        self._cache[character_id] = _StandingsCache(standings)
+        self._cache[character_id] = _StandingsCache(standings, base)
         print(f"[IndustryStandings] Fetched {len(standings['factions'])} factions / "
               f"{len(standings['npc_corps'])} corps for character {character_id}")
         return standings
@@ -106,6 +111,18 @@ class IndustryStandings:
         if not cache:
             return {"agents": {}, "npc_corps": {}, "factions": {}}
         return cache.standings
+
+    def get_base(self, character_id: int, allow_fetch: bool = True) -> Optional[dict]:
+        """BASE (unmodified) standings for fee math. Returns None when nothing
+        is cached and fetching is disallowed (UI thread) or fails, so the
+        caller can fall back instead of silently reading zeros."""
+        cache = self._cache.get(character_id)
+        if not cache or cache.is_expired:
+            if not allow_fetch:
+                return None
+            self.fetch(character_id)
+            cache = self._cache.get(character_id)
+        return cache.base if cache else None
 
     def resolve_names(self, ids) -> Dict[int, str]:
         """Resolve faction/corp/agent ids to names via public POST

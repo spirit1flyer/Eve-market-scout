@@ -184,6 +184,16 @@ class IndustryTabManager:
         # skill level is persisted inside it; per-item decryptor and relic
         # choices are session-only.
         self.inv_pricing = InventionPricing(self.market, self.sde)
+        # Stage 2 (settings window): persisted fee-source choice —
+        # {"char_id": int|None, "broker_override": ..., "tax_override": ...}.
+        # Empty dict = the trading-seller default (pre-Stage-2 behavior).
+        self.fees_choice: dict = self._load_setting("fees")
+        self._fee_source_label = ""
+        # Stage 3: persisted invention-skill source —
+        # {"char_id": int|None, "level_override": int|None}. The hierarchy
+        # (see _invention_skill_fn) still ends at the assumed level, which
+        # stays persisted inside InventionPricing.
+        self.inv_choice: dict = self._load_setting("invention_skills")
         self._decryptor_choice: Dict[int, int] = {}  # tid -> decryptor type_id
         self._relic_choice: Dict[int, int] = {}  # tid -> relic type_id (T3, session-only)
         try:
@@ -267,6 +277,9 @@ class IndustryTabManager:
         self.sde_btn = ttk.Button(top, text="Update SDE",
                                   command=self._on_update_sde)
         self.sde_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.settings_btn = ttk.Button(top, text="Settings…",
+                                       command=self._open_settings)
+        self.settings_btn.pack(side=tk.LEFT, padx=(4, 0))
         self.progress_label = ttk.Label(top, text="", foreground=CLR_MUTED)
         self.progress_label.pack(side=tk.LEFT, padx=10)
 
@@ -291,50 +304,48 @@ class IndustryTabManager:
             foreground=CLR_MUTED)
         self.status_label.pack(side=tk.RIGHT)
 
-        # ---- facility row (SCI source + write-in structure bonuses) ----
-        fac = ttk.LabelFrame(t1, text="Facility", padding=(8, 4))
-        fac.pack(fill=tk.X, padx=8)
-        ttk.Label(fac, text="System (cost index):").pack(side=tk.LEFT)
-        self.facility_var = tk.StringVar(value="Jita")
-        self.facility_combo = self._combo(fac, self.facility_var, hub_names,
-                                          self._on_input_change)
-        self.fac_tax_var = self._mini_field(fac, "Facility tax %:",
-                                            f"{self.constants.facility_tax_pct}")
-        self.cost_bonus_var = self._mini_field(fac, "Cost bonus %:", "0")
-        self.mat_bonus_var = self._mini_field(fac, "Material bonus %:", "0")
-        # Structure/rig TIME reduction — feeds Phase 4 build + research time only
-        # (never cost). Default 0 (generic NPC station, no time bonus).
-        self.time_bonus_var = self._mini_field(fac, "Time bonus %:", "0")
-        self.scc_var = self._mini_field(fac, "SCC %:",
-                                        f"{self.constants.scc_surcharge_pct}")
-        ttk.Label(fac, text="(SCC/tax are CCP-tuned — verify in-game)",
-                  foreground=CLR_MUTED).pack(side=tk.LEFT, padx=8)
+        # ---- facility settings (widgets live in the Settings window) ----
+        # The manufacturing + reaction facility rows moved into the openable
+        # Settings window (2026-07-10 declutter, PLAN_industry_settings.md).
+        # The tk variables stay HERE so _params() and the compute path read
+        # identical state whether the window was ever opened or not; the
+        # window binds its widgets to these same vars. The manufacturing
+        # facility now persists (key "facility") like the reaction row
+        # (key "reaction_facility", Stage 5.5) always did.
+        fac_saved = self._load_facility_settings()
+        fac_sys = fac_saved.get("system")
+        self.facility_var = tk.StringVar(
+            value=fac_sys if fac_sys in hub_names else "Jita")
+        self.facility_combo = None      # created by the Settings window
+        self.fac_tax_var = tk.StringVar(value=str(
+            fac_saved.get("tax", self.constants.facility_tax_pct)))
+        self.cost_bonus_var = tk.StringVar(
+            value=str(fac_saved.get("cost_bonus", 0)))
+        self.mat_bonus_var = tk.StringVar(
+            value=str(fac_saved.get("mat_bonus", 0)))
+        # Structure/rig TIME reduction — feeds Phase 4 build + research time
+        # only (never cost). Default 0 (generic NPC station, no time bonus).
+        self.time_bonus_var = tk.StringVar(
+            value=str(fac_saved.get("time_bonus", 0)))
+        self.scc_var = tk.StringVar(value=str(
+            fac_saved.get("scc", self.constants.scc_surcharge_pct)))
 
-        # ---- reaction facility row (Stage 5.5, persisted) ----
         # Reaction jobs in a T2 input chain use their OWN facility: reactions
         # run in refineries (low/null sec) with their own cost index, tax and
-        # reaction-rig material bonus. Without this row the engine would fall
+        # reaction-rig material bonus. Without these the engine would fall
         # back to the manufacturing facility above — including its material
         # bonus, which per PLAN §1b must NOT apply to reactions.
         rx_saved = self._load_rx_settings()
-        rx = ttk.LabelFrame(t1, text="Reaction facility (T2 input chains)",
-                            padding=(8, 4))
-        rx.pack(fill=tk.X, padx=8)
-        ttk.Label(rx, text="System (reaction cost index):").pack(side=tk.LEFT)
         rx_sys = rx_saved.get("system")
         self.rx_system_var = tk.StringVar(
             value=rx_sys if rx_sys in hub_names else self.facility_var.get())
-        self.rx_system_combo = self._combo(rx, self.rx_system_var, hub_names,
-                                           self._on_input_change)
-        self.rx_tax_var = self._mini_field(
-            rx, "Facility tax %:",
-            f"{rx_saved.get('tax', self.constants.facility_tax_pct)}")
-        self.rx_cost_bonus_var = self._mini_field(
-            rx, "Cost bonus %:", f"{rx_saved.get('cost_bonus', 0)}")
-        self.rx_mat_bonus_var = self._mini_field(
-            rx, "Material bonus %:", f"{rx_saved.get('mat_bonus', 0)}")
-        ttk.Label(rx, text="(material bonus = reaction rigs only)",
-                  foreground=CLR_MUTED).pack(side=tk.LEFT, padx=8)
+        self.rx_system_combo = None     # created by the Settings window
+        self.rx_tax_var = tk.StringVar(value=str(
+            rx_saved.get("tax", self.constants.facility_tax_pct)))
+        self.rx_cost_bonus_var = tk.StringVar(
+            value=str(rx_saved.get("cost_bonus", 0)))
+        self.rx_mat_bonus_var = tk.StringVar(
+            value=str(rx_saved.get("mat_bonus", 0)))
 
         # ---- filter row: chips + search + min profit + ME/batch ----
         filt = ttk.Frame(t1, padding=(8, 4))
@@ -361,49 +372,28 @@ class IndustryTabManager:
         mp.pack(side=tk.LEFT)
         mp.bind("<KeyRelease>", lambda e: self._rebuild_list())
 
+        # "Positive only" is a FILTER, not a page (2026-07-10, Caleb): it must
+        # compose with any page (e.g. Extra + positive = profitable reactions),
+        # which a mutually-exclusive notebook tab can't do.
+        self.positive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filt, text="Positive profit only",
+                        variable=self.positive_var,
+                        command=self._rebuild_list).pack(side=tk.LEFT,
+                                                         padx=(12, 0))
+
+        # View-extras filters + ME/TE/Batch defaults live in the Settings
+        # window (2026-07-10 declutter) — vars here, widgets there. Defaults:
+        # sub-cap only ON (capitals are hugely expensive and need months of
+        # BPO ME research), Upwell/POS visible (reasonable builds), ME 10 /
+        # TE 20 (researched BPO), batch 1.
         self.show_unpriced_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Show unpriced", variable=self.show_unpriced_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(12, 0))
-
-        # Capitals are hidden by default — hugely expensive and need months of
-        # BPO ME research to be worth building. Upwell + POS structures are
-        # reasonable builds, so they stay visible unless the user opts out.
         self.subcap_only_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filt, text="Sub-cap only", variable=self.subcap_only_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(12, 0))
         self.hide_upwell_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Hide Upwell", variable=self.hide_upwell_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(8, 0))
         self.hide_pos_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Hide POS", variable=self.hide_pos_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(8, 0))
-        self.ignored_btn = ttk.Button(filt, text="Ignored…",
-                                      command=self._manage_ignored)
-        self.ignored_btn.pack(side=tk.LEFT, padx=(12, 0))
-        self._update_ignored_btn()
-
-        ttk.Label(filt, text="ME:").pack(side=tk.LEFT, padx=(12, 2))
+        self.ignored_btn = None         # created by the Settings window
         self.me_var = tk.StringVar(value="10")
-        me = ttk.Entry(filt, textvariable=self.me_var, width=4)
-        me.pack(side=tk.LEFT)
-        me.bind("<Return>", lambda e: self._compute(refetch=False))
-
-        # TE only affects build TIME (Phase 4), not cost, so it doesn't trigger a
-        # recompute — the detail panel reads it live. Default 20 (researched BPO).
-        ttk.Label(filt, text="TE:").pack(side=tk.LEFT, padx=(8, 2))
         self.te_var = tk.StringVar(value="20")
-        te = ttk.Entry(filt, textvariable=self.te_var, width=4)
-        te.pack(side=tk.LEFT)
-        te.bind("<Return>", lambda e: self._refresh_detail_if_selected())
-
-        ttk.Label(filt, text="Batch:").pack(side=tk.LEFT, padx=(8, 2))
         self.batch_var = tk.StringVar(value="1")
-        ba = ttk.Entry(filt, textvariable=self.batch_var, width=5)
-        ba.pack(side=tk.LEFT)
-        ba.bind("<Return>", lambda e: self._compute(refetch=False))
-        ttk.Button(filt, text="Apply ME/Batch",
-                   command=lambda: self._compute(refetch=False)).pack(
-                       side=tk.LEFT, padx=(4, 0))
 
         # ---- tech-level chips (multi-select; grey out where a category has none) ----
         tech_row = ttk.Frame(t1, padding=(8, 0))
@@ -417,33 +407,28 @@ class IndustryTabManager:
             self.tech_buttons[label] = b
         self._refresh_tech_chip_styles()
 
-        # Blueprint-source filter: buyable BPO vs BPC-only (no BPO — drops/
-        # invented; build cost ignores blueprint cost until Stage C pricing).
-        ttk.Label(tech_row, text="Blueprint:").pack(side=tk.LEFT, padx=(12, 2))
+        # Blueprint-source filter (buyable BPO vs BPC-only): var here, its
+        # combobox lives in the Settings window's View-filters section.
         self.bp_filter_var = tk.StringVar(value="All")
-        self._combo(tech_row, self.bp_filter_var,
-                    ["All", "BPO only", "BPC-only"],
-                    self._rebuild_list, width=10)
 
-        # Assumed invention skill level (Stage 5.5): used for probability when
-        # an item has no "Built by" character. Persisted via InventionPricing.
-        ttk.Label(tech_row, text="Inv. skills:").pack(side=tk.LEFT, padx=(12, 2))
+        # Assumed invention skill level (fallback of the Stage 3 hierarchy):
+        # its write-in lives in the Settings window's Invention section.
+        # Persisted via InventionPricing.
         self.inv_skill_var = tk.StringVar(value=str(self.inv_pricing.assumed_level))
-        inv_e = ttk.Entry(tech_row, textvariable=self.inv_skill_var, width=3)
-        inv_e.pack(side=tk.LEFT)
-        inv_e.bind("<Return>", lambda e: self._on_assumed_skill())
 
         # Persistent note, re-evaluated after an SDE update (no restart needed).
         self.tech_note_label = ttk.Label(tech_row, foreground=CLR_MUTED)
         self.tech_note_label.pack(side=tk.LEFT, padx=8)
         self._update_tech_note()
 
-        # ---- main split: list | detail ----
-        main = ttk.Frame(t1, padding=8)
-        main.pack(fill=tk.BOTH, expand=True)
+        # ---- main split: list | detail (draggable sash) ----
+        # A PanedWindow instead of the old fixed pack so Caleb can drag the
+        # list/detail split on his 1366x768 screen (2026-07-10 declutter).
+        main = ttk.PanedWindow(t1, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         left = ttk.Frame(main)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        main.add(left, weight=0)
         self._headings = {"#0": "Item", "cost": "Build cost", "profit": "Profit",
                           "margin": "Margin%", "vol": "Vol/day"}
         # Shared right-click menu (acts on self.selected, tree-agnostic).
@@ -455,13 +440,6 @@ class IndustryTabManager:
         self._list_menu.add_separator()
         self._list_menu.add_command(label="Ignore this item",
                                     command=self._ignore_selected)
-        # "Positive only" is a FILTER, not a page (2026-07-10, Caleb): it must
-        # compose with any page (e.g. Extra + positive = profitable reactions),
-        # which a mutually-exclusive notebook tab can't do.
-        self.positive_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Positive profit only",
-                        variable=self.positive_var,
-                        command=self._rebuild_list).pack(anchor="w")
         # Three list views sharing the detail panel: full ranked list (incl.
         # negatives), the invention page (every T2/T3 item with an invention
         # path, full-chain + invention cost, ignoring the tech chips), and the
@@ -482,7 +460,7 @@ class IndustryTabManager:
         self._update_headings()
 
         right = ttk.Frame(main)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        main.add(right, weight=1)
         self.legend_label = ttk.Label(right, foreground=CLR_MUTED)
         self.legend_label.pack(anchor="w")
         self._update_legend()
@@ -542,8 +520,11 @@ class IndustryTabManager:
         hubs = get_enabled_hubs()
         hub_names = [name for _k, name in hubs]
         self._hub_key_by_name = {name: key for key, name in hubs}
+        # facility/rx combos only exist while the Settings window is open.
         for combo in (self.buy_combo, self.sell_combo, self.facility_combo,
                       self.rx_system_combo):
+            if combo is None:
+                continue
             try:
                 combo.configure(values=hub_names)
             except tk.TclError:
@@ -557,13 +538,11 @@ class IndustryTabManager:
         c.bind("<<ComboboxSelected>>", lambda e: cb())
         return c
 
-    def _mini_field(self, parent, label, default):
-        ttk.Label(parent, text=label).pack(side=tk.LEFT, padx=(10, 2))
-        var = tk.StringVar(value=default)
-        e = ttk.Entry(parent, textvariable=var, width=6)
-        e.pack(side=tk.LEFT)
-        e.bind("<Return>", lambda ev: self._compute(refetch=False))
-        return var
+    def _open_settings(self):
+        # Lazy import (same pattern as OwnedBlueprintsPanel) — the settings
+        # module is only needed once the button is clicked.
+        from gui.industry.gui_industry_settings import open_settings
+        open_settings(self)
 
     def _make_list_tree(self, notebook, title):
         """One ranked-list Treeview as a sub-tab. All trees share sort state,
@@ -571,7 +550,8 @@ class IndustryTabManager:
         frame = ttk.Frame(notebook)
         notebook.add(frame, text=title)
         cols = ("cost", "profit", "margin", "vol")
-        tree = ttk.Treeview(frame, columns=cols, height=24)
+        # height 24 -> 30 with the two facility rows gone (2026-07-10).
+        tree = ttk.Treeview(frame, columns=cols, height=30)
         tree.heading("#0", text="Item", command=lambda: self._on_sort("name"))
         tree.column("#0", width=230)
         for c, w in (("cost", 95), ("profit", 110), ("margin", 75), ("vol", 75)):
@@ -642,39 +622,96 @@ class IndustryTabManager:
             alpha_clone_tax_pct=self.constants.alpha_clone_tax_pct)
         return FacilitySet(manufacturing=self._facility_from(p), reaction=rx)
 
-    def _load_rx_settings(self) -> dict:
+    def _load_setting(self, key: str) -> dict:
+        """One top-level dict out of industry_settings.json ({} on any miss)."""
         import json, os
         try:
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE) as f:
-                    return json.load(f).get("reaction_facility") or {}
+                    return json.load(f).get(key) or {}
         except Exception as e:
-            _print(f"reaction_facility load failed: {e}")
+            _print(f"{key} load failed: {e}")
         return {}
 
-    def _save_rx_settings(self):
+    def _save_setting(self, key: str, value: dict):
         import json, os
         try:
             data = {}
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE) as f:
                     data = json.load(f)
-            data["reaction_facility"] = {
-                "system": self.rx_system_var.get(),
-                "tax": _f(self.rx_tax_var, self.constants.facility_tax_pct),
-                "cost_bonus": _f(self.rx_cost_bonus_var, 0.0),
-                "mat_bonus": _f(self.rx_mat_bonus_var, 0.0),
-            }
+            data[key] = value
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            _print(f"reaction_facility save failed: {e}")
+            _print(f"{key} save failed: {e}")
+
+    def _load_rx_settings(self) -> dict:
+        return self._load_setting("reaction_facility")
+
+    def _load_facility_settings(self) -> dict:
+        """Persisted manufacturing-facility values (key "facility"). Added
+        with the Settings window (2026-07-10) — before that the mfg row
+        reset every launch while the reaction row persisted."""
+        return self._load_setting("facility")
+
+    def _save_facility_settings(self):
+        self._save_setting("facility", {
+            "system": self.facility_var.get(),
+            "tax": _f(self.fac_tax_var, self.constants.facility_tax_pct),
+            "cost_bonus": _f(self.cost_bonus_var, 0.0),
+            "mat_bonus": _f(self.mat_bonus_var, 0.0),
+            "time_bonus": _f(self.time_bonus_var, 0.0),
+            "scc": _f(self.scc_var, self.constants.scc_surcharge_pct),
+        })
+
+    def _save_rx_settings(self):
+        self._save_setting("reaction_facility", {
+            "system": self.rx_system_var.get(),
+            "tax": _f(self.rx_tax_var, self.constants.facility_tax_pct),
+            "cost_bonus": _f(self.rx_cost_bonus_var, 0.0),
+            "mat_bonus": _f(self.rx_mat_bonus_var, 0.0),
+        })
 
     def _on_assumed_skill(self):
         lvl = int(_f(self.inv_skill_var, float(self.inv_pricing.assumed_level)))
         self.inv_pricing.set_assumed_level(max(0, min(5, lvl)))
         self.inv_skill_var.set(str(self.inv_pricing.assumed_level))
         self._compute(refetch=False)
+
+    def _char_name(self, char_id) -> str:
+        rc = self.roster.get(char_id)
+        return rc.character_name if rc else f"#{char_id}"
+
+    def _invention_skill_fn(self, tid: int):
+        """skill_level_fn for InventionPricing.resolve, per the Stage 3
+        hierarchy (PLAN_industry_settings.md): fill-in level override >
+        per-item 'Built by' char > global selected char > None (assumed
+        level, resolved inside InventionPricing). Character reads are
+        peek-only — the compute worker pre-warms the needed sheets, and a
+        cold peek falls back per-skill to the assumed level."""
+        ov = self.inv_choice.get("level_override")
+        if ov is not None:
+            lvl = max(0, min(5, int(ov)))
+            return lambda sid: lvl
+        char_id = self._built_by.get(tid) or self.inv_choice.get("char_id")
+        if char_id:
+            return lambda sid, c=char_id: self.char_skills.peek_skill_level(c, sid)
+        return None
+
+    def _invention_skill_source(self, tid: Optional[int] = None) -> str:
+        """Human-readable effective invention-skill source. The detail panel
+        passes its tid (a per-item Built-by shows); the legend passes None
+        (global view)."""
+        ov = self.inv_choice.get("level_override")
+        if ov is not None:
+            return f"fill-in level {max(0, min(5, int(ov)))}"
+        if tid is not None and self._built_by.get(tid):
+            return f"{self._char_name(self._built_by[tid])} (Built by)"
+        gcid = self.inv_choice.get("char_id")
+        if gcid:
+            return f"{self._char_name(gcid)} (global)"
+        return f"assumed level {self.inv_pricing.assumed_level}"
 
     def _provider_from(self, p: dict) -> IndustryProvider:
         return IndustryProvider(
@@ -683,20 +720,42 @@ class IndustryTabManager:
             sell_region=p["sell_region"], facility_system=p["facility_system"],
             input_side=p["input_side"], buy_region=p["buy_region"])
 
-    def _fees(self) -> SellFees:
-        """Sell-side fees from the cached trading skills/standings at the sell
-        hub (the REVIEW_handoff stray, deferred to Stage 5.5). Falls back to
-        the old Phase 1 flat defaults if the skills cache is unavailable."""
+    def _fee_args(self) -> dict:
+        """Plain-value args for industry_fees.resolve_fees, snapshotted on the
+        UI thread (reads Tk vars) so the compute worker can resolve without
+        touching Tk. char_name resolved here — the fees module stays
+        roster-agnostic."""
+        hub_key = self._hub_key_by_name.get(self.sell_var.get(), "jita")
+        cfg = get_hub_config(hub_key)
+        char_name = None
+        cid = self.fees_choice.get("char_id")
+        if cid:
+            c = self.roster.get(cid)
+            char_name = c.character_name if c else None
+        return {"hub_key": hub_key, "station_id": cfg.get("station_id"),
+                "choice": dict(self.fees_choice), "char_name": char_name}
+
+    def _resolve_fees(self, allow_fetch: bool, fee_args: dict = None):
+        """→ (SellFees, source_label); also records the label for the legend.
+        allow_fetch=True may hit ESI (worker thread only)."""
+        from industry.industry_fees import resolve_fees
         try:
-            from core.calculate import (load_cached_skills, get_broker_fee_rate,
-                                        get_sales_tax_rate)
-            hub_key = self._hub_key_by_name.get(self.sell_var.get(), "jita")
-            skills = load_cached_skills(hub_key)
-            return SellFees(broker_fee_pct=get_broker_fee_rate(skills),
-                            sales_tax_pct=get_sales_tax_rate(skills))
+            fees, label = resolve_fees(
+                skills=self.char_skills, standings=self.char_standings,
+                allow_fetch=allow_fetch, **(fee_args or self._fee_args()))
         except Exception as e:
             _print(f"fee lookup failed (defaults 3/4.5): {e}")
-            return SellFees(broker_fee_pct=3.0, sales_tax_pct=4.5)
+            fees, label = (SellFees(broker_fee_pct=3.0, sales_tax_pct=4.5),
+                           "defaults (fee lookup failed)")
+        self._fee_source_label = (
+            f"{label} {fees.broker_fee_pct:.2f}%+{fees.sales_tax_pct:.2f}%")
+        return fees, label
+
+    def _fees(self) -> SellFees:
+        """Sell-side fees per the Stage 2 hierarchy (write-in > roster char >
+        trading seller — see industry_fees). UI-thread callers get cache
+        peeks only; the compute worker re-resolves with fetching allowed."""
+        return self._resolve_fees(allow_fetch=False)[0]
 
     # ===================================================================== compute
 
@@ -712,9 +771,10 @@ class IndustryTabManager:
             text="Refreshing…" if refetch else "Computing…")
 
         p = self._params()
-        fees = self._fees()
+        fee_args = self._fee_args()   # Tk-var snapshot; resolved in the worker
         need_meta = not self.name_map
-        self._save_rx_settings()   # persist the reaction-facility row (5.5)
+        self._save_rx_settings()        # persist both facility sections —
+        self._save_facility_settings()  # any change that recomputes is saved
 
         def _work():
             err = None
@@ -724,6 +784,14 @@ class IndustryTabManager:
             t0 = time.time()
             _print(f"compute start (refetch={refetch}, me={p['me']}, "
                    f"batch={p['batch']})")
+            # Fee resolution happens HERE (not on the UI thread) because a
+            # roster-character source may need an ESI fetch for a cold
+            # skills/standings cache (1h TTL).
+            fees, fee_label = self._resolve_fees(allow_fetch=True,
+                                                 fee_args=fee_args)
+            _print(f"fees: {fee_label} -> broker "
+                   f"{fees.broker_fee_pct:.2f}% + tax "
+                   f"{fees.sales_tax_pct:.2f}% @ {fee_args['hub_key']}")
             try:
                 # Bulk-load the SDE memo caches (a few table scans) so the
                 # ~15k per-item lookups below are dict hits instead of one
@@ -834,13 +902,27 @@ class IndustryTabManager:
                 # items so common components/reactions cost once.
                 if has_inv and invention_tids:
                     t_inv = time.time()
+                    # Stage 3: pre-warm the skill sheets the per-item
+                    # skill_fn will peek (global selected char + any
+                    # per-item Built-by picks) — one cached ESI call each
+                    # (1h TTL), so the peeks below always hit.
+                    if self.inv_choice.get("level_override") is None:
+                        warm = {c for t, c in self._built_by.items()
+                                if t in invention_tids}
+                        if self.inv_choice.get("char_id"):
+                            warm.add(self.inv_choice["char_id"])
+                        for cid in warm:
+                            self.char_skills.fetch(cid)
+                    _print(f"invention skills: "
+                           f"{self._invention_skill_source(None)}")
                     n_inv = n_skip = 0
                     for tid in invention_tids:
                         if self.meta_map.get(tid) not in (2, 14):
                             n_skip += 1
                             continue
                         res = self._calc_t2(tid, calc_chain, facset, fac,
-                                            provider, fees, p, memo=chain_memo)
+                                            provider, fees, p, memo=chain_memo,
+                                            skill_fn=self._invention_skill_fn(tid))
                         if res:
                             results[tid] = res
                             n_inv += 1
@@ -975,17 +1057,16 @@ class IndustryTabManager:
 
     def _recompute_item_t2(self, tid: int):
         """Recompute ONE T2/T3 item on the UI thread (decryptor / relic /
-        Built-by change). Pure cache reads + SQLite — fast enough inline. Uses
-        the Built-by character's cached skills for probability when set (peek
-        only; falls back per-skill to the assumed level)."""
+        Built-by change). Pure cache reads + SQLite — fast enough inline.
+        Probability skills follow the Stage 3 hierarchy (_invention_skill_fn:
+        fill-in override > Built-by > global char > assumed level)."""
         p = self._params()
         fac = self._facility_from(p)
         facset = self._facility_set_from(p)
         provider = self._provider_from(p)
         dec = DECRYPTORS.get(self._decryptor_choice.get(tid))
         char_id = self._built_by.get(tid)
-        skill_fn = ((lambda sid: self.char_skills.peek_skill_level(char_id, sid))
-                    if char_id else None)
+        skill_fn = self._invention_skill_fn(tid)   # Stage 3 hierarchy
         calc = IndustryCalculator(provider, buildable=None)
         res = self._calc_t2(tid, calc, facset, fac, provider, self._fees(), p,
                             decryptor=dec, skill_fn=skill_fn,
@@ -1062,6 +1143,7 @@ class IndustryTabManager:
             self.progress_label.configure(
                 text=note or f"{len(results)} items computed")
         self._update_tech_note()
+        self._update_legend()   # the worker resolved the fee source label
         self._rebuild_list()
         if self.selected in self.results:
             self._show_detail(self.selected)
@@ -1191,9 +1273,21 @@ class IndustryTabManager:
         self._compute(refetch=False)
 
     def _update_legend(self):
+        """Two-line assumptions label (Stage 2): the profit definition plus
+        WHERE the fee + invention-skill numbers come from — the invisible-
+        sources complaint from the 2026-07-10 live session."""
+        fee_src = self._fee_source_label or "not resolved yet"
+        line2 = (f"Fees: {fee_src} @ {self.sell_var.get()}   ·   "
+                 f"Inv. skills: {self._invention_source_label()}")
         self.legend_label.configure(
             text=f"Profit = patient-sell (7d) at {self.sell_var.get()} net of "
-                 f"fees − build cost.   Input = {self.input_var.get()}.")
+                 f"fees − build cost.   Input = {self.input_var.get()}.\n"
+                 f"{line2}")
+
+    def _invention_source_label(self) -> str:
+        """Global invention-skill source for the legend (per-item Built-by
+        overrides are shown in the detail panel, not here)."""
+        return self._invention_skill_source(None)
 
     def _sort_value(self, tid, col):
         r = self.results[tid]
@@ -1486,12 +1580,10 @@ class IndustryTabManager:
         self._kv(frame, "Amortized BPC cost / run:",
                  f"{isk(inv['cost_per_run'])} ISK", bold=True)
 
-        char_id = self._built_by.get(tid)
-        rc = self.roster.get(char_id) if char_id else None
-        who = (f"skills from {rc.character_name}" if rc else
-               f"assumed skill level {self.inv_pricing.assumed_level} "
-               f"(set a 'Built by' char for real skills)")
-        ttk.Label(frame, text=f"    {who} — ⚠ verified vs eve-ref, "
+        # Explicit source line (Stage 3) — replaces the old buried footnote so
+        # WHOSE skills drove the probability is always visible.
+        self._kv(frame, "Skills:", self._invention_skill_source(tid))
+        ttk.Label(frame, text="    ⚠ invention math verified vs eve-ref — "
                               "spot-check one item in-game",
                   foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
         if inv.get("unpriced"):
@@ -1658,14 +1750,16 @@ class IndustryTabManager:
     def _time_bonus(self) -> float:
         return _f(self.time_bonus_var, 0.0)
 
-    def _build_time_params(self, tid: int, te: float):
+    def _build_time_params(self, tid: int, te: float, default_char_id=None):
         """(BuildTimeParams, char_id, skills_state) for an item's build time.
 
         Skills come from the 'Built by' character's cached pull (peek only — no
         UI-thread ESI). If a char is selected but skills aren't cached, kicks a
         background warm and reports 'warming' so the panel shows a placeholder.
+        default_char_id: used when no per-item Built-by is set — the Owned
+        panel passes each blueprint's owning character (Stage 3).
         """
-        char_id = self._built_by.get(tid)
+        char_id = self._built_by.get(tid) or default_char_id
         ind = adv = 0
         implant = 0.0
         state = "none"
@@ -1757,18 +1851,20 @@ class IndustryTabManager:
         self.batch_var.set(str(int(cap)))
         self._compute(refetch=False)
 
-    def build_time_for(self, tid: int, batch: int, te=None) -> dict:
+    def build_time_for(self, tid: int, batch: int, te=None,
+                       default_char_id=None) -> dict:
         """Build-time summary for the Owned panel (which passes the blueprint's
-        real TE). Reuses the same skills/implant/facility path as Top Profit.
-        Returns {state, per_run, total, cap, ...}; state in
-        {ok, no_sde, no_base}."""
+        real TE and its owning character as the default 'who'). Reuses the
+        same skills/implant/facility path as Top Profit. Returns
+        {state, per_run, total, cap, ...}; state in {ok, no_sde, no_base}."""
         if not self.sde.has_activity_time_data():
             return {"state": "no_sde"}
         base = self.sde.get_base_build_time(tid)
         if not base:
             return {"state": "no_base"}
         te_val = self._te_value() if te is None else max(0.0, min(20.0, float(te)))
-        params, char_id, state = self._build_time_params(tid, te_val)
+        params, char_id, state = self._build_time_params(
+            tid, te_val, default_char_id=default_char_id)
         t = manufacturing_time(float(base), batch, params)
         rc = self.roster.get(char_id) if char_id else None
         return {"state": "ok", "per_run": t["per_run_seconds"],
@@ -1779,20 +1875,24 @@ class IndustryTabManager:
 
     # ----------------------------------------------------------- research (4.3)
 
-    def open_research(self, tid: int, eiv: float, cur_me: int, cur_te: int):
+    def open_research(self, tid: int, eiv: float, cur_me: int, cur_te: int,
+                      default_char_id=None):
         """Open the ME/TE research popup for an item. Shared by Top Profit and
-        the Owned panel (which passes the blueprint's real current ME/TE)."""
-        ctx = self._research_context(tid, eiv, cur_me, cur_te)
+        the Owned panel (which passes the blueprint's real current ME/TE and
+        its owning character as the default 'who')."""
+        ctx = self._research_context(tid, eiv, cur_me, cur_te,
+                                     default_char_id=default_char_id)
         show_research_popup(self.frame, ctx, self.set_status)
 
     def _research_context(self, tid: int, eiv: float,
-                          cur_me: int, cur_te: int) -> dict:
+                          cur_me: int, cur_te: int,
+                          default_char_id=None) -> dict:
         bp = self.sde.get_blueprint_for_item(tid)
         base_me = self.sde.get_activity_time(bp, ACTIVITY_RESEARCH_ME) if bp else None
         base_te = self.sde.get_activity_time(bp, ACTIVITY_RESEARCH_TE) if bp else None
         p = self._params()
         sys = p["facility_system"]
-        char_id = self._built_by.get(tid)
+        char_id = self._built_by.get(tid) or default_char_id
         levels = self.char_skills.peek_levels(char_id) if char_id else None
         rc = self.roster.get(char_id) if char_id else None
         rparams = ResearchParams(

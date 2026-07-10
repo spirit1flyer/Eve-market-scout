@@ -194,6 +194,10 @@ class OwnedBlueprintsPanel:
                 "runs": bp["runs"],
                 "char": (char.character_name if char else
                          str(bp["character_id"])),
+                # owning character — the default "who" for build/research
+                # time + invention skills when no per-item Built-by is set
+                # (Stage 3 of PLAN_industry_settings.md)
+                "char_id": bp["character_id"],
             })
         self.rows = rows
         self.count_label.configure(
@@ -705,7 +709,9 @@ class OwnedBlueprintsPanel:
         frame.pack(fill=tk.X, pady=(6, 0))
 
         info = (self.build_time_for(row["product_tid"], res.get("batch", 1),
-                                    te=row["te"]) if self.build_time_for else None)
+                                    te=row["te"],
+                                    default_char_id=row.get("char_id"))
+                if self.build_time_for else None)
         if info and info.get("state") == "ok":
             self._kv(frame, "Per run:", fmt_duration(info["per_run"]))
             note = f"Max runs in 30 days: {info['cap']:,}"
@@ -727,7 +733,8 @@ class OwnedBlueprintsPanel:
         if self.on_research:
             ttk.Button(frame, text="Research…",
                        command=lambda: self.on_research(
-                           row["product_tid"], res["eiv"], row["me"], row["te"])
+                           row["product_tid"], res["eiv"], row["me"], row["te"],
+                           default_char_id=row.get("char_id"))
                        ).pack(anchor="w", padx=8, pady=(4, 0))
 
     def _build_totals(self, r):
