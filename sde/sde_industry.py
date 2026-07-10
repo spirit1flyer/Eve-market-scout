@@ -104,6 +104,13 @@ class SDEIndustryDB:
         self._skills_req_cache: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
         self._invention_cache: Dict[int, Optional[Dict[str, Any]]] = {}
         self._invention_sources_cache: Dict[int, List[int]] = {}
+        # warm_cache() bulk-loads the COMPLETE tables into the memo dicts
+        # above. Once True, a memo miss is authoritative (the row genuinely
+        # doesn't exist) — readers return their None/[]/0 without opening a
+        # connection. The per-call readers open+close a connection per miss
+        # (~4ms each), which cost the Industry tab ~60s across its ~15k
+        # first-compute lookups before this existed (2026-07-10).
+        self._fully_warmed: bool = False
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get database connection."""
@@ -213,6 +220,9 @@ class SDEIndustryDB:
         # Check cache
         if type_id in self._product_to_blueprint:
             return self._product_to_blueprint[type_id]
+        if self._fully_warmed:  # complete map loaded — miss = no blueprint
+            self._product_to_blueprint[type_id] = None
+            return None
 
         try:
             conn = self._get_conn()
@@ -254,6 +264,9 @@ class SDEIndustryDB:
         """
         if blueprint_id in self._blueprint_to_product:
             return self._blueprint_to_product[blueprint_id]
+        if self._fully_warmed:  # complete map loaded — miss = no product
+            self._blueprint_to_product[blueprint_id] = None
+            return None
         try:
             conn = self._get_conn()
             if self._schema_has_activity_id():
@@ -288,6 +301,9 @@ class SDEIndustryDB:
         # Check cache
         if blueprint_id in self._blueprint_materials:
             return self._blueprint_materials[blueprint_id]
+        if self._fully_warmed:  # complete map loaded — miss = no materials
+            self._blueprint_materials[blueprint_id] = []
+            return []
 
         try:
             conn = self._get_conn()
@@ -341,6 +357,9 @@ class SDEIndustryDB:
         """
         if product_type_id in self._product_output:
             return self._product_output[product_type_id]
+        if self._fully_warmed:  # complete map loaded — miss = no blueprint
+            self._product_output[product_type_id] = 0
+            return 0
         try:
             conn = self._get_conn()
             if self._schema_has_activity_id():
@@ -413,6 +432,9 @@ class SDEIndustryDB:
         if key in self._activity_time:
             return self._activity_time[key]
         if not self.has_activity_time_data():
+            return None
+        if self._fully_warmed:  # complete table loaded — miss = no row
+            self._activity_time[key] = None
             return None
         try:
             conn = self._get_conn()
@@ -508,6 +530,9 @@ class SDEIndustryDB:
                       if activity_id == ACTIVITY_MANUFACTURING else None)
             self._producer_cache[key] = result
             return result
+        if self._fully_warmed:  # complete map loaded — miss = no producer
+            self._producer_cache[key] = None
+            return None
         try:
             conn = self._get_conn()
             row = conn.execute(
@@ -536,6 +561,9 @@ class SDEIndustryDB:
         key = (int(product_type_id), int(activity_id))
         if key in self._recipe_activity_cache:
             return self._recipe_activity_cache[key]
+        if self._fully_warmed:  # complete map loaded — miss = not producible
+            self._recipe_activity_cache[key] = None
+            return None
         blueprint_id = self.get_producer(product_type_id, activity_id)
         if blueprint_id is None:
             self._recipe_activity_cache[key] = None
@@ -577,6 +605,9 @@ class SDEIndustryDB:
         key = (int(blueprint_id), int(activity_id))
         if key in self._skills_req_cache:
             return self._skills_req_cache[key]
+        if self._fully_warmed:  # complete table loaded — miss = no skills
+            self._skills_req_cache[key] = []
+            return []
         try:
             conn = self._get_conn()
             rows = conn.execute(
@@ -610,6 +641,9 @@ class SDEIndustryDB:
         if source_blueprint_id in self._invention_cache:
             return self._invention_cache[source_blueprint_id]
         if not self.has_invention_data():
+            self._invention_cache[source_blueprint_id] = None
+            return None
+        if self._fully_warmed:  # complete map loaded — miss = not inventable
             self._invention_cache[source_blueprint_id] = None
             return None
         try:
@@ -666,6 +700,9 @@ class SDEIndustryDB:
         if not self.has_invention_data():
             self._invention_sources_cache[invented_blueprint_id] = []
             return []
+        if self._fully_warmed:  # complete map loaded — miss = no sources
+            self._invention_sources_cache[invented_blueprint_id] = []
+            return []
         try:
             conn = self._get_conn()
             rows = conn.execute(
@@ -680,6 +717,168 @@ class SDEIndustryDB:
         except Exception as e:
             print(f"[SDEIndustry] Error looking up invention sources for {invented_blueprint_id}: {e}")
             return []
+
+    # =========================================================================
+    # Bulk cache warm (2026-07-10)
+    # =========================================================================
+
+    def warm_cache(self) -> bool:
+        """Bulk-prime every per-item memo dict with a handful of table scans
+        on ONE connection, then mark the caches authoritative
+        (`_fully_warmed`) so misses answer without touching the DB.
+
+        Every reader above opens+closes its own sqlite connection per memo
+        miss (~4ms each). The Industry tab's first compute makes ~15k such
+        lookups (recipe universe scan, chain expansion, invention-source
+        scan), which measured at ~60s of its 80s total — this replaces that
+        with <1s of bulk loading. Values are assembled into local dicts
+        first and swapped in atomically at the end, so a failure part-way
+        leaves the instance exactly as it was (per-call readers still work).
+
+        Safe to call repeatedly (no-op once warmed) and from a worker thread.
+        Returns False if the DB is unavailable or the load failed — callers
+        just fall back to the per-call readers.
+        """
+        if self._fully_warmed:
+            return True
+        try:
+            has_act_col = self._schema_has_activity_id()
+            conn = self._get_conn()
+
+            product_to_bp: Dict[int, Optional[int]] = {}
+            bp_to_product: Dict[int, Optional[int]] = {}
+            product_output: Dict[int, int] = {}
+            bp_materials: Dict[int, List[BlueprintMaterial]] = {}
+            producer: Dict[Tuple[int, int], Optional[int]] = {}
+            recipes: Dict[Tuple[int, int], Optional[Dict[str, Any]]] = {}
+            mats_by_bp_act: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+            activity_time: Dict[Tuple[int, int], Optional[int]] = {}
+            skills_req: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+            inv_products: Dict[int, List[Dict[str, Any]]] = {}
+            inv_sources: Dict[int, List[int]] = {}
+            probabilities: Dict[Tuple[int, int], float] = {}
+
+            # -- materials (one scan) --------------------------------------
+            if has_act_col:
+                mat_rows = conn.execute(
+                    "SELECT blueprint_id, activity_id, material_type_id, "
+                    "quantity FROM industry_materials").fetchall()
+            else:
+                mat_rows = conn.execute(
+                    "SELECT blueprint_id, ? AS activity_id, material_type_id, "
+                    "quantity FROM industry_materials",
+                    (ACTIVITY_MANUFACTURING,)).fetchall()
+            for r in mat_rows:
+                bp, act = r["blueprint_id"], r["activity_id"]
+                mats_by_bp_act.setdefault((bp, act), []).append(
+                    (r["material_type_id"], r["quantity"]))
+                if act == ACTIVITY_MANUFACTURING:
+                    bp_materials.setdefault(bp, []).append(BlueprintMaterial(
+                        type_id=r["material_type_id"],
+                        quantity=r["quantity"]))
+
+            # -- probabilities (optional table; one scan) -------------------
+            has_inv = False
+            try:
+                for r in conn.execute(
+                        "SELECT blueprint_id, product_type_id, probability "
+                        "FROM industry_probabilities "
+                        "WHERE activity_id = ?", (ACTIVITY_INVENTION,)):
+                    probabilities[(r["blueprint_id"], r["product_type_id"])] = \
+                        float(r["probability"])
+                has_inv = bool(probabilities)
+            except sqlite3.Error:
+                pass  # pre-5.1 DB — table absent
+            self._has_invention = has_inv
+
+            # -- activity times (optional table; one scan) ------------------
+            has_time = False
+            try:
+                for r in conn.execute(
+                        "SELECT blueprint_id, activity_id, time "
+                        "FROM industry_activity"):
+                    activity_time[(int(r["blueprint_id"]),
+                                   int(r["activity_id"]))] = int(r["time"])
+                    has_time = True
+            except sqlite3.Error:
+                pass  # pre-Phase-4 DB — table absent
+            self._has_activity_time = has_time
+
+            # -- skill requirements (optional table; one scan) --------------
+            try:
+                for r in conn.execute(
+                        "SELECT blueprint_id, activity_id, skill_type_id, "
+                        "level FROM industry_skills_req"):
+                    skills_req.setdefault(
+                        (int(r["blueprint_id"]), int(r["activity_id"])),
+                        []).append((r["skill_type_id"], r["level"]))
+            except sqlite3.Error:
+                pass  # pre-5.1 DB — table absent
+
+            # -- products (one scan; drives most maps) ----------------------
+            # First row wins for the single-row lookups, matching the
+            # per-call readers' un-ORDERed fetchone() over the same scan.
+            if has_act_col:
+                prod_rows = conn.execute(
+                    "SELECT blueprint_id, activity_id, product_type_id, "
+                    "quantity FROM industry_products").fetchall()
+            else:
+                prod_rows = conn.execute(
+                    "SELECT blueprint_id, ? AS activity_id, product_type_id, "
+                    "quantity FROM industry_products",
+                    (ACTIVITY_MANUFACTURING,)).fetchall()
+            conn.close()
+            for r in prod_rows:
+                bp, act, ptid = (r["blueprint_id"], r["activity_id"],
+                                 r["product_type_id"])
+                qty = int(r["quantity"])
+                if act == ACTIVITY_MANUFACTURING:
+                    if ptid not in product_to_bp:
+                        product_to_bp[ptid] = bp
+                        product_output[ptid] = qty
+                    if bp not in bp_to_product:
+                        bp_to_product[bp] = ptid
+                if (ptid, act) not in producer:
+                    producer[(ptid, act)] = bp
+                    recipes[(ptid, act)] = (
+                        {"blueprint_id": bp, "output_per_run": qty,
+                         "materials": mats_by_bp_act.get((bp, act), [])}
+                        if qty > 0 else None)
+                if act == ACTIVITY_INVENTION:
+                    inv_sources.setdefault(ptid, []).append(bp)
+                    inv_products.setdefault(bp, []).append({
+                        "blueprint_id": ptid,
+                        "probability": probabilities.get((bp, ptid), 0.0),
+                        "base_runs": qty,
+                    })
+
+            invention: Dict[int, Optional[Dict[str, Any]]] = {}
+            if has_inv:
+                for src, prods in inv_products.items():
+                    invention[src] = {
+                        "products": prods,
+                        "datacores": mats_by_bp_act.get(
+                            (src, ACTIVITY_INVENTION), []),
+                        "time": activity_time.get((src, ACTIVITY_INVENTION)),
+                    }
+
+            # -- atomic swap-in ---------------------------------------------
+            self._product_to_blueprint = product_to_bp
+            self._blueprint_to_product = bp_to_product
+            self._product_output = product_output
+            self._blueprint_materials = bp_materials
+            self._producer_cache = producer
+            self._recipe_activity_cache = recipes
+            self._activity_time = activity_time
+            self._skills_req_cache = skills_req
+            self._invention_cache = invention
+            self._invention_sources_cache = inv_sources
+            self._fully_warmed = True
+            return True
+        except Exception as e:
+            print(f"[SDEIndustry] warm_cache failed (per-call reads still "
+                  f"work): {e}")
+            return False
 
     # =========================================================================
     # Download and Build
@@ -766,6 +965,7 @@ class SDEIndustryDB:
                 )
 
             # Clear caches so readers reload from the new DB
+            self._fully_warmed = False   # next warm_cache() re-loads
             self._product_to_blueprint.clear()
             self._blueprint_to_product.clear()
             self._blueprint_materials.clear()

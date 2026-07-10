@@ -23,7 +23,8 @@ character is set). Phase 7 adds the "Extra (react/comp)" list page: reaction
 (activity-11) products and Components-category items ranked as sellable
 products in their own right (moon goo → advanced materials → components),
 costed via the same cheapest-of chain; reaction-only products stay off the
-All/Positive pages.
+All page. "Positive profit only" is a checkbox filter that composes with any
+page (2026-07-10; it replaced the old mutually-exclusive "Positive only" page).
 """
 
 import threading
@@ -203,7 +204,7 @@ class IndustryTabManager:
         self.pos_map: Dict[int, bool] = {}       # tid -> is POS/starbase gear (excl. by Hide POS)
         self.tech_selected = set(DEFAULT_TECH)   # active tech-level buckets
         self.extra_tids: set = set()             # Phase 7 Extra page rows (reactions + components)
-        self.reaction_tids: set = set()          # reaction-ONLY products (kept off the All/Positive pages)
+        self.reaction_tids: set = set()          # reaction-ONLY products (kept off the All page)
         self.display_order: List[int] = []       # filtered+sorted tids
         self.selected: Optional[int] = None
         # Phase 2.5: per-item "Built by" roster selection. Persists but is
@@ -212,6 +213,7 @@ class IndustryTabManager:
         self._built_by: Dict[int, int] = self._load_built_by()
 
         self._computing = False
+        self._pending_refetch = False   # startup: freshen after cache paint
         self._last_refresh = 0.0
         self._chain_rows: Dict[str, int] = {}    # tree iid -> type_id
         self._iid_seq = 0
@@ -222,7 +224,14 @@ class IndustryTabManager:
 
         self._build_tab()
         if self.sde.is_available():
-            self.frame.after(800, lambda: self._compute(refetch=True))
+            # Paint-from-cache-first (2026-07-10, Caleb): if a saved market
+            # snapshot exists, compute from it immediately (no network, lists
+            # fill in a couple of seconds) and chain a background refetch in
+            # _compute_done. Cold cache (first ever run) goes straight to a
+            # refetch — there's nothing to paint from.
+            self._pending_refetch = self.market.last_update is not None
+            self.frame.after(800, lambda: self._compute(
+                refetch=not self._pending_refetch))
         else:
             self.progress_label.configure(
                 text="Industry SDE not downloaded — use the Reprocess tab's "
@@ -346,7 +355,7 @@ class IndustryTabManager:
 
         ttk.Label(filt, text="Min profit:").pack(side=tk.LEFT, padx=(12, 2))
         # Blank = no lower bound (negatives shown for contrast). Type a number
-        # to floor the list; the "Positive only" sub-tab is the >0 view.
+        # to floor the list; the "Positive profit only" checkbox is the >0 view.
         self.min_profit_var = tk.StringVar(value="")
         mp = ttk.Entry(filt, textvariable=self.min_profit_var, width=12)
         mp.pack(side=tk.LEFT)
@@ -446,19 +455,30 @@ class IndustryTabManager:
         self._list_menu.add_separator()
         self._list_menu.add_command(label="Ignore this item",
                                     command=self._ignore_selected)
-        # Four list views sharing the detail panel: full ranked list (incl.
-        # negatives), a profit>0 view, the invention page (every T2/T3 item
-        # with an invention path, full-chain + invention cost, ignoring the
-        # tech chips), and the Phase 7 Extra page (reaction products +
-        # components as products, also tech-chip-agnostic). All render from
-        # the same results dict.
+        # "Positive only" is a FILTER, not a page (2026-07-10, Caleb): it must
+        # compose with any page (e.g. Extra + positive = profitable reactions),
+        # which a mutually-exclusive notebook tab can't do.
+        self.positive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, text="Positive profit only",
+                        variable=self.positive_var,
+                        command=self._rebuild_list).pack(anchor="w")
+        # Three list views sharing the detail panel: full ranked list (incl.
+        # negatives), the invention page (every T2/T3 item with an invention
+        # path, full-chain + invention cost, ignoring the tech chips), and the
+        # Phase 7 Extra page (reaction products + components as products, also
+        # tech-chip-agnostic). All render from the same results dict.
         self.list_nb = ttk.Notebook(left)
         self.list_nb.pack(fill=tk.BOTH, expand=True)
+        # Selector diagnostics (2026-07-10): log every page change and which
+        # tab each click physically lands on, to pin down the live "page
+        # flips / can't select" report. Non-invasive (add='+', no 'break').
+        self.list_nb.bind("<<NotebookTabChanged>>", self._log_list_page,
+                          add="+")
+        self.list_nb.bind("<Button-1>", self._log_list_click, add="+")
         self.tree = self._make_list_tree(self.list_nb, "All")
-        self.tree_pos = self._make_list_tree(self.list_nb, "Positive only")
         self.tree_t2 = self._make_list_tree(self.list_nb, "T2/T3 (invention)")
         self.tree_extra = self._make_list_tree(self.list_nb, "Extra (react/comp)")
-        self._trees = (self.tree, self.tree_pos, self.tree_t2, self.tree_extra)
+        self._trees = (self.tree, self.tree_t2, self.tree_extra)
         self._update_headings()
 
         right = ttk.Frame(main)
@@ -701,7 +721,17 @@ class IndustryTabManager:
             note = ""
             extra_tids = set()
             reaction_only = set()
+            t0 = time.time()
+            _print(f"compute start (refetch={refetch}, me={p['me']}, "
+                   f"batch={p['batch']})")
             try:
+                # Bulk-load the SDE memo caches (a few table scans) so the
+                # ~15k per-item lookups below are dict hits instead of one
+                # sqlite connection each (~60s -> <1s, 2026-07-10). No-op
+                # once warmed; False = per-call reads still work, just slow.
+                if not self.sde.warm_cache():
+                    _print("warm_cache failed - falling back to per-call reads")
+                _print(f"SDE cache warmed in {time.time() - t0:.1f}s")
                 products = self.sde.get_all_manufacturable_items()
                 # gather all type_ids needing prices; drop CCP placeholder
                 # 1-unit-mineral recipes (special-edition ships → fake profit).
@@ -714,6 +744,8 @@ class IndustryTabManager:
                     if _is_dummy_recipe(r):
                         dummies.add(tid)
                 products = [t for t in products if t not in dummies]
+                _print(f"universe: {len(products)} manufacturable items "
+                       f"({len(dummies)} placeholder recipes dropped)")
 
                 # Phase 7: reaction (activity-11) products, ranked as products
                 # in their own right on the Extra page. Empty on a pre-5.1 SDE.
@@ -749,6 +781,11 @@ class IndustryTabManager:
                             if self.sde.get_product_for_blueprint(src) is None:
                                 tids.add(src)
                     tids.update(DECRYPTORS)
+                _print(f"chain universe: {len(tids)} type_ids to price; "
+                       f"invention data="
+                       f"{'yes' if has_inv else 'NO (pre-5.1 SDE - Update SDE)'}; "
+                       f"{len(invention_tids)} items with an invention path; "
+                       f"{len(reaction_only)} reaction-only products")
 
                 if refetch:
                     systems = [get_hub_config(k)["system_id"]
@@ -770,11 +807,17 @@ class IndustryTabManager:
                 provider = self._provider_from(p)
                 calc = IndustryCalculator(provider, buildable=lambda t: False)
                 results = {}
+                t_flat = time.time()
                 for tid in products:
                     res = calc.calc_full(tid, fac, fees,
                                          me=p["me"], batch=p["batch"])
                     if res:
                         results[tid] = res
+                priced = sum(1 for r in results.values()
+                             if r["patient_profit"] is not None)
+                _print(f"flat pass: {len(results)}/{len(products)} costed, "
+                       f"{priced} fully priced (7d history + orders), in "
+                       f"{time.time() - t_flat:.1f}s")
 
                 # Shared cheapest-of calculator + memo for the invention (5.5)
                 # and Extra (Phase 7) passes — common sub-chains cost once.
@@ -790,13 +833,20 @@ class IndustryTabManager:
                 # selector overrides per item). The memo is shared across
                 # items so common components/reactions cost once.
                 if has_inv and invention_tids:
+                    t_inv = time.time()
+                    n_inv = n_skip = 0
                     for tid in invention_tids:
                         if self.meta_map.get(tid) not in (2, 14):
+                            n_skip += 1
                             continue
                         res = self._calc_t2(tid, calc_chain, facset, fac,
                                             provider, fees, p, memo=chain_memo)
                         if res:
                             results[tid] = res
+                            n_inv += 1
+                    _print(f"invention pass: {n_inv} T2/T3 re-costed full-chain"
+                           f" ({n_skip} non-T2/T3-meta skipped) in "
+                           f"{time.time() - t_inv:.1f}s")
 
                 # Phase 7 Extra pass: reaction products + Components-category
                 # items (advanced/capital/structure components, R.A.M., …)
@@ -807,6 +857,8 @@ class IndustryTabManager:
                 extra_tids = set(reaction_only)
                 extra_tids.update(t for t in products
                                   if self.category_map.get(t) == "Components")
+                t_extra = time.time()
+                n_extra = 0
                 for tid in sorted(extra_tids):
                     if results.get(tid, {}).get("invention"):
                         continue
@@ -815,6 +867,13 @@ class IndustryTabManager:
                                                memo=chain_memo)
                     if res:
                         results[tid] = res
+                        n_extra += 1
+                _print(f"extra pass: {len(extra_tids)} candidates "
+                       f"({len(reaction_only)} reaction-only + "
+                       f"{len(extra_tids) - len(reaction_only)} components), "
+                       f"{n_extra} chain-costed in {time.time() - t_extra:.1f}s")
+                _print(f"compute done: {len(results)} results in "
+                       f"{time.time() - t0:.1f}s total")
             except Exception as e:
                 err = str(e)
                 _print(f"compute failed: {e}")
@@ -863,6 +922,8 @@ class IndustryTabManager:
         self.capital_map = is_cap
         self.upwell_map = is_upwell
         self.pos_map = is_pos
+        _print(f"metadata: {len(products)} items classified (tech data="
+               f"{'yes' if self.names.has_meta_group_data() else 'NO'})")
 
     # ---------------------------------------------------- T2/T3 (5.5 + 6.1)
 
@@ -929,6 +990,10 @@ class IndustryTabManager:
         res = self._calc_t2(tid, calc, facset, fac, provider, self._fees(), p,
                             decryptor=dec, skill_fn=skill_fn,
                             source_bp=self._relic_choice.get(tid))
+        _print(f"inline T2/T3 recompute {tid}: "
+               f"decryptor={self._decryptor_choice.get(tid)}, "
+               f"relic={self._relic_choice.get(tid)}, "
+               f"built_by={char_id}, ok={bool(res)}")
         if res:
             self.results[tid] = res
             self._rebuild_list()
@@ -1000,6 +1065,14 @@ class IndustryTabManager:
         self._rebuild_list()
         if self.selected in self.results:
             self._show_detail(self.selected)
+        # Startup chain: the first compute painted from the saved market
+        # snapshot; now freshen dumps/indices/history in the background (the
+        # lists stay visible and repaint when this second pass lands).
+        if self._pending_refetch:
+            self._pending_refetch = False
+            _print("cache paint done - starting background refresh")
+            self.progress_label.configure(text="Refreshing in background…")
+            self._compute(refetch=True)
 
     # ===================================================================== list
 
@@ -1149,6 +1222,7 @@ class IndustryTabManager:
         hide_pos = self.hide_pos_var.get()
         cat = self._active_category
         bp_mode = self.bp_filter_var.get()
+        positive_only = self.positive_var.get()
 
         # Items passing the category filter (independent of tech) drive both the
         # tech-chip greying and the row set. A tech chip greys out when the
@@ -1159,8 +1233,11 @@ class IndustryTabManager:
         for label, b in self.tech_buttons.items():
             b.state(["!disabled"] if label in avail_tech else ["disabled"])
 
+        hidden_unpriced = 0
+
         def passes(tid, r, name):
             """Shared row filter (everything except the tech chips)."""
+            nonlocal hidden_unpriced
             # Auto-hide junk products ("Expired …" filaments) + user-ignored.
             if is_auto_hidden(name) or self.ignore.contains(tid):
                 return False
@@ -1179,8 +1256,14 @@ class IndustryTabManager:
                 return False
             priced = r["has_7d"] and r["patient_profit"] is not None
             if not priced and not show_unpriced:
+                hidden_unpriced += 1
                 return False
             if priced and min_profit is not None and r["patient_profit"] < min_profit:
+                return False
+            # "Positive profit only" checkbox — applies to EVERY page (so e.g.
+            # Extra + positive = profitable reactions at a glance).
+            if positive_only and (r["patient_profit"] is None
+                                  or r["patient_profit"] <= 0):
                 return False
             return True
 
@@ -1192,8 +1275,8 @@ class IndustryTabManager:
             name = self.name_map.get(tid, str(tid))
             if not passes(tid, r, name):
                 continue
-            # Reaction-only products never join All/Positive — those pages
-            # stay "every manufacturable item" (the Extra page is theirs).
+            # Reaction-only products never join the All page — it stays
+            # "every manufacturable item" (the Extra page is theirs).
             if (tid not in self.reaction_tids
                     and tech_label(self.meta_map.get(tid)) in self.tech_selected):
                 rows.append(tid)
@@ -1207,14 +1290,20 @@ class IndustryTabManager:
         t2_rows.sort(key=sort_key, reverse=self.sort_reverse)
         extra_rows.sort(key=sort_key, reverse=self.sort_reverse)
         self.display_order = rows
-        # "Positive only" sub-tab: same base filter, profit strictly > 0.
-        pos_rows = [t for t in rows
-                    if self.results[t]["patient_profit"] is not None
-                    and self.results[t]["patient_profit"] > 0]
         self._fill_tree(self.tree, rows)
-        self._fill_tree(self.tree_pos, pos_rows)
         self._fill_tree(self.tree_t2, t2_rows)
         self._fill_tree(self.tree_extra, extra_rows)
+        # Log page row counts, but only when they change — this runs on every
+        # search keystroke, so an unconditional print would spam the log.
+        summary = (f"lists: all={len(rows)} "
+                   f"t2/t3={len(t2_rows)} extra={len(extra_rows)} "
+                   f"(results={len(self.results)}, cat={cat}, "
+                   f"tech={'+'.join(sorted(self.tech_selected)) or 'none'}, "
+                   f"positive_only={positive_only}, "
+                   f"unpriced hidden={hidden_unpriced})")
+        if summary != getattr(self, "_last_list_log", None):
+            self._last_list_log = summary
+            _print(summary)
 
     def _fill_tree(self, tree, rows):
         tree.delete(*tree.get_children())
@@ -1855,7 +1944,27 @@ class IndustryTabManager:
         except tk.TclError:
             return
         if self.sde.is_available() and time.time() - self._last_refresh > 300:
+            _print("industry tab focused, data >5 min old - auto refresh")
             self._compute(refetch=True)
+
+    # ------------------------------------------------- selector diagnostics
+
+    def _log_list_page(self, _event=None):
+        try:
+            _print("list page -> "
+                   f"{self.list_nb.tab(self.list_nb.select(), 'text')}")
+        except tk.TclError:
+            pass
+
+    def _log_list_click(self, event):
+        try:
+            idx = self.list_nb.tk.call(self.list_nb, "identify", "tab",
+                                       event.x, event.y)
+            hit = (self.list_nb.tab(int(idx), "text") if idx != ""
+                   else "no tab (page body)")
+        except (tk.TclError, ValueError):
+            hit = "?"
+        _print(f"list_nb click at ({event.x},{event.y}) -> {hit}")
 
 
 def show_ignore_manager(parent, ignore_list, names, on_change):
