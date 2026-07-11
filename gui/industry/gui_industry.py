@@ -491,6 +491,17 @@ class IndustryTabManager:
             on_ignore_changed=self._apply_ignore_change,
             build_time_for=self.build_time_for, on_research=self.open_research)
 
+        # ---- Invention sub-tab (2026-07-11: invent vs buy BPC) ----
+        from gui.industry.gui_industry_invention import InventionPanel
+        inv_frame = ttk.Frame(self.sub_nb)
+        self.sub_nb.add(inv_frame, text="Invention")
+        self.invention_panel = InventionPanel(
+            inv_frame, self.bp_db, self.sde, self.names,
+            contracts_db=self.contracts_db, bpc_observed=self.bpc_observed,
+            hub_regions=self._hub_region_ids,
+            show_full_detail=self.show_item_detail,
+            set_status=self.set_status)
+
         # ---- Characters sub-tab (Phase 2) ----
         chars_frame = ttk.Frame(self.sub_nb)
         self.sub_nb.add(chars_frame, text="Characters")
@@ -512,8 +523,33 @@ class IndustryTabManager:
         calc = IndustryCalculator(provider, buildable=lambda t: False)
         return calc, fac, self._fees(), p
 
+    def _hub_region_ids(self) -> list:
+        """Distinct buy + sell hub region_ids (reads Tk vars — UI thread)."""
+        regions = []
+        for var in (self.buy_var, self.sell_var):
+            rid = self._hub_cfg(var)["region_id"]
+            if rid not in regions:
+                regions.append(rid)
+        return regions
+
+    def show_item_detail(self, tid: int):
+        """Jump from another sub-tab (Invention) to the full Top Profit detail
+        for one item: select its T2/T3 page row when visible (selection also
+        renders the detail), else render the detail directly."""
+        self.sub_nb.select(0)
+        iid = str(tid)
+        if self.tree_t2.exists(iid):
+            self.list_nb.select(1)   # the "T2/T3 (invention)" page
+            self.tree_t2.selection_set(iid)
+            self.tree_t2.see(iid)
+        elif tid in self.results:
+            self.selected = tid
+            self._show_detail(tid)
+
     def _on_blueprints_pulled(self):
         """Refresh the Owned panel after a Characters-tab blueprint pull."""
+        if getattr(self, "invention_panel", None):
+            self.invention_panel.refresh(self.results, self.name_map)
         if getattr(self, "owned_panel", None):
             self.owned_panel.refresh()
 
@@ -1148,6 +1184,8 @@ class IndustryTabManager:
         self._update_tech_note()
         self._update_legend()   # the worker resolved the fee source label
         self._rebuild_list()
+        if getattr(self, "invention_panel", None):
+            self.invention_panel.refresh(self.results, self.name_map)
         if self.selected in self.results:
             self._show_detail(self.selected)
         # Startup chain: the first compute painted from the saved market

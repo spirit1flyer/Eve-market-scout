@@ -150,7 +150,7 @@ class ObservedBpcPrices:
         except IOError as e:
             print(f"[IndustryDiag] observed-bpc save error: {e}")
 
-    def record(self, blueprint_type_id: int, offers) -> None:
+    def record(self, blueprint_type_id: int, offers, save: bool = True) -> None:
         """Snapshot the current live offers (find_bpc_offers rows) for later
         stale fallback. Empty offer lists are ignored — they'd erase the very
         knowledge this store exists to keep."""
@@ -164,6 +164,14 @@ class ObservedBpcPrices:
             "offers": len(per_runs),
             "seen": datetime.now(timezone.utc).isoformat(),
         }
+        if save:
+            self._save()
+
+    def record_many(self, sightings: Dict[int, list]) -> None:
+        """Batch variant for sweep passes (the Invention sub-tab records every
+        blueprint with live offers in one pass — one file write, not hundreds)."""
+        for bid, offers in sightings.items():
+            self.record(bid, offers, save=False)
         self._save()
 
     def get(self, blueprint_type_id: int) -> Optional[dict]:
