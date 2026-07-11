@@ -22,7 +22,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from core.sound_manager import get_data_dir
@@ -105,6 +105,71 @@ class JobCostConstants:
                 json.dump(data, f, indent=2)
         except (json.JSONDecodeError, IOError) as e:
             print(f"[IndustryDiag] settings save error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Observed contract-BPC prices (2026-07-11): stale-average fallback
+# ---------------------------------------------------------------------------
+
+OBSERVED_BPC_FILE = str(get_data_dir() / "industry_bpc_observed.json")
+
+
+class ObservedBpcPrices:
+    """Rolling per-blueprint record of contract BPC sightings.
+
+    Contract offers expire out of the local cache, so a blueprint that HAD
+    clean offers last week can read "none cached" today even though its going
+    rate is known. Whenever the GUI finds live offers it calls `record()`,
+    snapshotting the average + best per-run price, offer count and a
+    timestamp; `get()` serves that snapshot later as an explicitly-stale
+    fallback (the caller renders the disclaimer/age — a few days old is
+    acceptable per Caleb 2026-07-11). Persistence mirrors BpcPricing:
+    swallow-and-log, one JSON in the data dir (industry_bpc_observed.json),
+    keyed by blueprint type_id.
+    """
+
+    def __init__(self):
+        self.seen: Dict[int, dict] = {}
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(OBSERVED_BPC_FILE):
+            return
+        try:
+            with open(OBSERVED_BPC_FILE, "r") as f:
+                raw = json.load(f)
+            self.seen = {int(k): v for k, v in raw.items()}
+        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
+            print(f"[IndustryDiag] observed-bpc load error: {e}")
+
+    def _save(self):
+        try:
+            with open(OBSERVED_BPC_FILE, "w") as f:
+                json.dump({str(k): v for k, v in self.seen.items()}, f,
+                          indent=2)
+        except IOError as e:
+            print(f"[IndustryDiag] observed-bpc save error: {e}")
+
+    def record(self, blueprint_type_id: int, offers) -> None:
+        """Snapshot the current live offers (find_bpc_offers rows) for later
+        stale fallback. Empty offer lists are ignored — they'd erase the very
+        knowledge this store exists to keep."""
+        per_runs = [o["price"] / max(1, o["runs"]) for o in offers
+                    if o.get("price", 0) > 0]
+        if not per_runs:
+            return
+        self.seen[int(blueprint_type_id)] = {
+            "avg_per_run": sum(per_runs) / len(per_runs),
+            "best_per_run": min(per_runs),
+            "offers": len(per_runs),
+            "seen": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save()
+
+    def get(self, blueprint_type_id: int) -> Optional[dict]:
+        """Last snapshot for a blueprint ({avg_per_run, best_per_run, offers,
+        seen}) or None if it was never observed with live offers."""
+        return self.seen.get(int(blueprint_type_id))
 
 
 # ---------------------------------------------------------------------------

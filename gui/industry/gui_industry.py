@@ -48,7 +48,7 @@ from sde.sde_industry import (ACTIVITY_RESEARCH_ME, ACTIVITY_RESEARCH_TE,
                               ACTIVITY_REACTION)
 from industry.industry_market_data import (IndustryMarketData, IndustryProvider,
                                    JobCostConstants, BpcPricing, InventionPricing,
-                                   SETTINGS_FILE)
+                                   ObservedBpcPrices, SETTINGS_FILE)
 from industry.industry_characters import IndustryRoster
 from industry.industry_skills import IndustrySkills
 from industry.industry_standings import IndustryStandings
@@ -180,6 +180,9 @@ class IndustryTabManager:
         self.bp_db = IndustryBlueprintsDB.singleton()
         self.bp_puller = BlueprintPuller(self.roster, self.bp_db)
         self.bpc_pricing = BpcPricing()
+        # Contract-BPC sightings snapshot (invent-vs-buy compare's stale
+        # fallback — live offers expire out of the contracts cache).
+        self.bpc_observed = ObservedBpcPrices()
         # Stage 5.5/6.1: invented-BPC cost resolver (T2 + T3 relics). Assumed
         # skill level is persisted inside it; per-item decryptor and relic
         # choices are session-only.
@@ -1579,6 +1582,7 @@ class IndustryTabManager:
             self._kv(frame, "Copy job cost (per attempt):", copy_txt)
         self._kv(frame, "Amortized BPC cost / run:",
                  f"{isk(inv['cost_per_run'])} ISK", bold=True)
+        self._render_bpc_compare(frame, tid, inv)
 
         # Explicit source line (Stage 3) — replaces the old buried footnote so
         # WHOSE skills drove the probability is always visible.
@@ -1591,6 +1595,120 @@ class IndustryTabManager:
                       text=f"    ⚠ {len(inv['unpriced'])} consumable(s) "
                            "unpriced — invention cost understated",
                       foreground=CLR_BAD).pack(anchor="w", padx=8)
+
+    def _render_bpc_compare(self, frame, tid, inv):
+        """Cheapest cached contract BPC for this item's invented blueprint vs
+        inventing it yourself. Cache-only (no live pull): find_bpc_offers
+        already drops expired contracts, so a stale cache thins out rather
+        than lying, and the offer's REAL ME/TE come from the cached contract
+        items (contract titles lie). A refreshed-age footnote lets the user
+        judge staleness — a few days old is acceptable per Caleb."""
+        if self.contracts_db is None:
+            return
+        bp_id = self.sde.get_blueprint_for_item(tid)
+        if not bp_id:
+            return
+        regions = []
+        for var in (self.buy_var, self.sell_var):
+            rid = self._hub_cfg(var)["region_id"]
+            if rid not in regions:
+                regions.append(rid)
+        best, all_offers = None, []
+        for rid in regions:
+            try:
+                offers = self.contracts_db.find_bpc_offers(bp_id, rid)
+            except Exception as e:
+                _print(f"find_bpc_offers({bp_id}, {rid}) failed: {e}")
+                continue
+            all_offers.extend(offers)
+            for o in offers:
+                per_run = o["price"] / max(1, o["runs"])
+                if best is None or per_run < best[0]:
+                    best = (per_run, o, rid)
+        count = len(all_offers)
+        if best is None:
+            self._render_bpc_stale_fallback(frame, bp_id, inv)
+            return
+        # Live offers found — snapshot them so this blueprint keeps a known
+        # going rate after these contracts expire out of the cache.
+        self.bpc_observed.record(bp_id, all_offers)
+        per_run, o, rid = best
+        self._kv(frame, f"Contract BPC (cheapest of {count}):",
+                 f"{isk(o['price'])} ISK / {o['runs']} runs = "
+                 f"{isk(per_run)} /run  "
+                 f"(ME {o['material_efficiency']}/TE {o['time_efficiency']})")
+        inv_pr = inv.get("cost_per_run", 0.0)
+        if inv_pr > 0 and per_run < inv_pr:
+            self._kv(frame, "  → buying the BPC is cheaper:",
+                     f"saves {isk(inv_pr - per_run)} ISK / run",
+                     bold=True, color=CLR_GOOD)
+        elif inv_pr > 0:
+            self._kv(frame, "  → inventing is cheaper:",
+                     f"saves {isk(per_run - inv_pr)} ISK / run",
+                     color=CLR_MUTED)
+        age = self._contracts_age_text(rid)
+        if age:
+            ttk.Label(frame, text=f"    contract cache refreshed {age}",
+                      foreground=CLR_MUTED).pack(anchor="w", padx=8)
+
+    def _render_bpc_stale_fallback(self, frame, bp_id, inv):
+        """No live offers cached — fall back to the last recorded sighting's
+        AVERAGE per-run price, clearly disclaimed (Caleb 2026-07-11: stale
+        within a few days is fine, but it must say so)."""
+        snap = self.bpc_observed.get(bp_id)
+        if not snap:
+            self._kv(frame, "Contract BPC:",
+                     "none cached — search the Contracts tab to populate",
+                     color=CLR_MUTED)
+            return
+        per_run = snap["avg_per_run"]
+        age = self._iso_age_text(snap.get("seen")) or "age unknown"
+        self._kv(frame, "Contract BPC (stale avg):",
+                 f"~{isk(per_run)} /run  (avg of {snap['offers']} offer(s) "
+                 f"seen {age})", color=CLR_OK)
+        inv_pr = inv.get("cost_per_run", 0.0)
+        if inv_pr > 0 and per_run < inv_pr:
+            self._kv(frame, "  → buying the BPC was cheaper:",
+                     f"~{isk(inv_pr - per_run)} ISK / run", color=CLR_OK)
+        elif inv_pr > 0:
+            self._kv(frame, "  → inventing was cheaper:",
+                     f"~{isk(per_run - inv_pr)} ISK / run", color=CLR_MUTED)
+        ttk.Label(frame, text="    ⚠ no live offers cached — stale observed "
+                              "average, re-search Contracts to refresh",
+                  foreground=CLR_OK).pack(anchor="w", padx=8)
+
+    def _contracts_age_text(self, region_id) -> Optional[str]:
+        """'refreshed N h/d ago' for a region's contract-list cache, or None."""
+        try:
+            from contracts.contracts_db import scope_key_for_region
+            rec = self.contracts_db.get_scope_freshness(
+                scope_key_for_region(region_id))
+            if not rec:
+                return None
+            return self._iso_age_text(rec.get("last_fetched"))
+        except Exception as e:
+            _print(f"contract-age lookup failed: {e}")
+            return None
+
+    @staticmethod
+    def _iso_age_text(iso_str) -> Optional[str]:
+        """ISO timestamp → 'N h ago' / 'N d ago' (None on missing/bad input)."""
+        if not iso_str:
+            return None
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            hrs = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+            if hrs < 1:
+                return "<1 h ago"
+            if hrs < 48:
+                return f"{hrs:.0f} h ago"
+            return f"{hrs / 24:.0f} d ago"
+        except (ValueError, TypeError) as e:
+            _print(f"age parse failed for {iso_str!r}: {e}")
+            return None
 
     def _build_chain(self, r, tid):
         frame = ttk.LabelFrame(self.detail, text="Materials (whole batch)",
