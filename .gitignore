@@ -64,7 +64,8 @@ drug_*
 # Local agent tooling (never committed)
 .claude/
 
-# Images (screenshots etc. — never committed)
+# Images (docs art / screenshots are local-only — never on GitHub;
+# "drug page.jpg" once slipped through because its space dodged drug_*)
 *.jpg
 *.jpeg
 *.png
@@ -99,3 +100,4 @@ _review_2026-05-23/survey_F_esi_data.md
 _review_2026-05-23/survey_G_misc_gui.md
 _review_2026-05-23/SYNTHESIS.md
 supply.jpg
+REVIEW_findings_2026-07-02.md
