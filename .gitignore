@@ -61,6 +61,17 @@ tests/
 # Local-only modules (private, never committed)
 drug_*
 
+# Local agent tooling (never committed)
+.claude/
+
+# Images (screenshots etc. — never committed)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+
 # Backup files
 *.bak
 *.backup
