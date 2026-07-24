@@ -1,31 +1,43 @@
-"""Migration and daily update for market history database.
+"""Migration dialogs for the market history database.
 
-First-time archive import to SQLite. Network-resilient: if downloads fail, 
+First-time archive import to SQLite. Network-resilient: if downloads fail,
 app launches anyway with ESI fallback.
+
+The data-side checks were extracted to history/history_checks.py
+2026-07-24 (this file was over the 900-line limit); they are re-exported
+below so existing `from gui.gui_migration import ...` sites still work.
+The download/import pipeline itself lives in
+history/history_reconciler.py.
 """
 
 import tkinter as tk
 from tkinter import ttk
-from pathlib import Path
-from typing import Optional, List
+from typing import List
 import threading
-import asyncio
 import queue
 import time
 from datetime import date, timedelta
 
-from core.sound_manager import get_data_dir
 from history.market_history import MarketHistoryDB, REGION_IDS
 
-
-ARCHIVE_FOLDER = "history-archive"
-EVEREF_LAG_DAYS = 2  # Everef data is usually 2 days behind
-SCANNER_MIN_DAYS = 30
-
-
-def get_archive_path() -> Path:
-    return get_data_dir() / ARCHIVE_FOLDER
-
+# Re-exports: data-side checks (extracted; keep names importable here)
+from history.history_checks import (  # noqa: F401
+    ARCHIVE_FOLDER,
+    EVEREF_LAG_DAYS,
+    SCANNER_MIN_DAYS,
+    get_archive_path,
+    check_archive_exists,
+    count_archive_files,
+    get_archive_date_range,
+    archive_has_full_history,
+    archive_has_scanner_minimum,
+    check_needs_migration,
+    check_has_recent_data,
+    _legacy_check_has_recent_data,
+    get_scanner_missing_dates,
+    check_has_full_history,
+    get_days_short_of_full_history,
+)
 
 from history.background_import import (
     get_background_import_status,
@@ -33,230 +45,10 @@ from history.background_import import (
     is_background_import_running
 )
 
-from history.daily_update import (
-    get_missing_dates_from_db,
-    download_missing_dates,
-    import_daily_files,
-    run_daily_update,
-    run_daily_update_background
-)
+# run_daily_update_background is re-exported for main.py; it now
+# delegates to history/history_reconciler.py (the one pipeline).
+from history.daily_update import run_daily_update_background  # noqa: F401
 from gui.gui_window_utils import fit_window
-
-
-def check_needs_migration(db: MarketHistoryDB) -> bool:
-    """Check if database needs initial migration."""
-    print("[Debug] check_needs_migration: checking...")
-    if not db.db_path.exists():
-        print("[Debug] check_needs_migration: db file doesn't exist")
-        return True
-    
-    try:
-        conn = db._get_conn()
-        cursor = conn.execute("SELECT 1 FROM daily_history LIMIT 1")
-        row = cursor.fetchone()
-        result = row is None
-        print(f"[Debug] check_needs_migration: has data = {not result}")
-        return result
-    except Exception as e:
-        print(f"[Debug] check_needs_migration: error {e}")
-        return True
-
-
-def check_archive_exists() -> bool:
-    """Check if archive folder exists with files."""
-    archive_path = get_archive_path()
-    if not archive_path.exists():
-        return False
-    
-    for year_dir in archive_path.iterdir():
-        if year_dir.is_dir() and year_dir.name.isdigit():
-            files = list(year_dir.glob("market-history-*"))
-            if files:
-                return True
-    return False
-
-
-def count_archive_files() -> int:
-    """Count total files in archive for progress estimation."""
-    archive_path = get_archive_path()
-    count = 0
-
-    for year_dir in archive_path.iterdir():
-        if year_dir.is_dir() and year_dir.name.isdigit():
-            count += len(list(year_dir.glob("market-history-*")))
-
-    return count
-
-
-def get_archive_date_range() -> tuple:
-    """Get (earliest_date, latest_date) present in the archive.
-
-    Returns (None, None) if archive is empty or missing.
-    """
-    archive_path = get_archive_path()
-    if not archive_path.exists():
-        return (None, None)
-
-    earliest = None
-    latest = None
-
-    for year_dir in archive_path.iterdir():
-        if not (year_dir.is_dir() and year_dir.name.isdigit()):
-            continue
-        for f in year_dir.glob("market-history-*"):
-            stem = f.name
-            if stem.endswith('.bz2'):
-                stem = stem[:-4]
-            if stem.endswith('.csv'):
-                stem = stem[:-4]
-            date_str = stem.replace('market-history-', '')
-            try:
-                d = date.fromisoformat(date_str)
-            except ValueError:
-                continue
-            if earliest is None or d < earliest:
-                earliest = d
-            if latest is None or d > latest:
-                latest = d
-
-    return (earliest, latest)
-
-
-def archive_has_full_history(years: int = 3) -> bool:
-    """True iff local archive covers `years` of recent data with no
-    further network download needed.
-
-    Requires both:
-      - latest date is within EVEREF_LAG_DAYS+5 of today (recent enough)
-      - earliest date is at or before today - years*365 (deep enough)
-    """
-    earliest, latest = get_archive_date_range()
-    if not earliest or not latest:
-        return False
-
-    today = date.today()
-    if latest < today - timedelta(days=EVEREF_LAG_DAYS + 5):
-        return False
-    if earliest > today - timedelta(days=years * 365):
-        return False
-    return True
-
-
-def archive_has_scanner_minimum(min_days: int = SCANNER_MIN_DAYS) -> bool:
-    """True iff local archive covers the scanner's recent-day window."""
-    _, latest = get_archive_date_range()
-    if not latest:
-        return False
-
-    today = date.today()
-    if latest < today - timedelta(days=EVEREF_LAG_DAYS + 5):
-        return False
-
-    # Count actual files inside the recent window, not just date span
-    archive_path = get_archive_path()
-    available_date = today - timedelta(days=EVEREF_LAG_DAYS)
-    start_date = available_date - timedelta(days=min_days - 1)
-
-    days_present = 0
-    check_date = start_date
-    while check_date <= available_date:
-        date_str = check_date.strftime('%Y-%m-%d')
-        year_dir = archive_path / str(check_date.year)
-        csv_path = year_dir / f"market-history-{date_str}.csv"
-        bz2_path = year_dir / f"market-history-{date_str}.csv.bz2"
-        if csv_path.exists() or bz2_path.exists():
-            days_present += 1
-        check_date += timedelta(days=1)
-
-    # Allow small gaps but require near-full coverage
-    return days_present >= min_days - 2
-
-
-def check_has_recent_data(db: MarketHistoryDB, min_days: int = SCANNER_MIN_DAYS) -> bool:
-    """Check if database has enough recent data for scanner."""
-    try:
-        latest = db.get_latest_date()
-        earliest = db.get_earliest_date()
-        
-        if not latest or not earliest:
-            return False
-        
-        latest_date = date.fromisoformat(latest)
-        earliest_date = date.fromisoformat(earliest)
-        days_covered = (latest_date - earliest_date).days + 1
-        
-        today = date.today()
-        days_stale = (today - latest_date).days
-        
-        if days_stale > 7:
-            print(f"[Scanner] Data is {days_stale} days old, needs update")
-            return False
-        
-        if days_covered < min_days:
-            print(f"[Scanner] Only {days_covered} days of data, need {min_days}")
-            return False
-        
-        return True
-        
-    except Exception as e:
-        print(f"[Scanner] Error checking data: {e}")
-        return False
-
-
-def get_scanner_missing_dates(db: MarketHistoryDB) -> List[str]:
-    """Get dates needed to have 30 days of recent data."""
-    today = date.today()
-    available_date = today - timedelta(days=EVEREF_LAG_DAYS)
-    start_date = available_date - timedelta(days=SCANNER_MIN_DAYS - 1)
-    
-    try:
-        existing_dates = db.get_imported_dates()
-    except Exception:
-        existing_dates = set()
-    
-    missing = []
-    check_date = start_date
-    
-    while check_date <= available_date:
-        date_str = check_date.strftime('%Y-%m-%d')
-        if date_str not in existing_dates:
-            missing.append(date_str)
-        check_date += timedelta(days=1)
-    
-    return missing
-
-
-def check_has_full_history(db: MarketHistoryDB, years: int = 3) -> bool:
-    """Check if database has full history for Stock Market features."""
-    days_short = get_days_short_of_full_history(db, years)
-    return days_short == 0
-
-
-def get_days_short_of_full_history(db: MarketHistoryDB, years: int = 3) -> int:
-    """Get how many days short of full history the database is.
-    
-    Returns:
-        0 if full history exists, otherwise number of days missing.
-        Returns 9999 if database is empty or error occurs.
-    """
-    try:
-        earliest = db.get_earliest_date()
-        
-        if not earliest:
-            return 9999  # No data at all
-        
-        earliest_date = date.fromisoformat(earliest)
-        required_date = date.today() - timedelta(days=years * 365)
-        
-        if earliest_date > required_date:
-            days_short = (earliest_date - required_date).days
-            return days_short
-        
-        return 0  # Full history exists
-        
-    except Exception as e:
-        print(f"[StockMarket] Error checking history: {e}")
-        return 9999
 
 
 def _run_dialog_loop(root: tk.Tk, dialog):
@@ -288,7 +80,7 @@ def _run_dialog_loop(root: tk.Tk, dialog):
 # =============================================================================
 
 class FirstLaunchDialog(tk.Toplevel):
-    """Dialog to choose scanner-only (30 days) or full (3 years) mode.
+    """Dialog to choose scanner-only (60 days) or full (3 years) mode.
     
     This is a Toplevel dialog that uses the single app root window.
     """
@@ -331,9 +123,9 @@ class FirstLaunchDialog(tk.Toplevel):
         
         ttk.Label(
             frame,
-            text="Scanner needs 30 days of market history.\n"
+            text="Scanner needs 60 days of market history.\n"
                  "Stock Market features need 3 years.\n\n"
-                 "You can start scanning immediately with 30 days,\n"
+                 "You can start scanning immediately with 60 days,\n"
                  "and 3-year data will download in the background.",
             justify=tk.CENTER
         ).pack(pady=(0, 20))
@@ -342,7 +134,7 @@ class FirstLaunchDialog(tk.Toplevel):
         btn_frame.pack(fill=tk.X)
         
         ttk.Button(
-            btn_frame, text="Scanner Only (30 days)\n~2 minutes",
+            btn_frame, text="Scanner Only (60 days)\n~3-4 minutes",
             command=self._choose_scanner
         ).pack(side=tk.LEFT, expand=True, padx=5)
         
@@ -646,37 +438,32 @@ class ScannerSetupDialog(tk.Toplevel):
         self._msg_queue.put(('progress', status, current, total))
     
     def _run_download(self):
-        """Runs in background thread. Never calls Tk methods."""
-        print("[Debug] ScannerSetupDialog._run_download: starting")
+        """Runs in background thread. Never calls Tk methods.
+
+        Drives one reconcile pass; the dialog closes on the LEDGER's
+        verdict (scanner_ready), not on "files were processed". If a
+        launch-time pass is already running, the reconciler logs the
+        wait and our own pass afterwards is nearly a no-op.
+        """
+        print("[Debug] ScannerSetupDialog._run_download: starting "
+              "reconcile pass")
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                downloaded = loop.run_until_complete(
-                    download_missing_dates(
-                        self.missing_dates, self._update_progress
-                    )
-                )
-            finally:
-                loop.close()
-            
-            print(f"[Debug] ScannerSetupDialog: downloaded "
-                  f"{len(downloaded)} files")
-            
-            if downloaded:
-                print("[Debug] ScannerSetupDialog: importing files...")
-                records = import_daily_files(self.db, downloaded)
-                print(f"[Debug] ScannerSetupDialog: imported "
-                      f"{records} records")
-                self.result = True
-                self._msg_queue.put(('complete', records))
-            else:
-                print("[Debug] ScannerSetupDialog: no files, "
-                      "launching anyway")
-                self.result = True
+            from history.history_reconciler import run_reconcile
+            summary = run_reconcile(db=self.db,
+                                    progress_cb=self._update_progress,
+                                    trigger="scanner-gate")
+            print(f"[Debug] ScannerSetupDialog: pass summary: {summary}")
+
+            self.result = True  # app launches regardless (ESI fallback)
+            if summary["scanner_ready"]:
+                self._msg_queue.put(
+                    ('complete', summary["fetched"] + summary["topups"]))
+            elif summary["fetched"] == 0 and summary["failed"] > 0:
+                # Nothing downloadable — offline or everef down
                 self._msg_queue.put(('no_data',))
-                
+            else:
+                self._msg_queue.put(('failed', summary["scanner_reason"]))
+
         except Exception as e:
             print(f"[Debug] ScannerSetupDialog._run_download "
                   f"error: {e}")
@@ -717,7 +504,7 @@ def run_migration_if_needed(parent: tk.Tk, db: MarketHistoryDB) -> bool:
         parent: The single Tk root window (created in main.py)
         db: Market history database instance
     
-    First run: Shows 30-day vs 3-year choice dialog.
+    First run: Shows 60-day vs 3-year choice dialog.
     Subsequent runs: Skips if data exists, starts background import if needed.
     """
     print("[Debug] run_migration_if_needed: starting")
@@ -809,7 +596,7 @@ def run_migration_if_needed(parent: tk.Tk, db: MarketHistoryDB) -> bool:
 
 
 def _import_scanner_minimum(parent: tk.Tk, db: MarketHistoryDB) -> bool:
-    """Import just enough data for scanner (30 days)."""
+    """Import just enough data for scanner (SCANNER_MIN_DAYS days)."""
     archive_path = get_archive_path()
     # Scanner-minimum keeps the 5-region filter to stay fast on first
     # launch.  The all-regions backfill is handled by the subsequent

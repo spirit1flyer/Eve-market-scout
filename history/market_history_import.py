@@ -15,6 +15,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, Callable, List, Set
 
+from history import import_lock
+
 
 class MarketHistoryImportMixin:
     """Mixin providing import methods for MarketHistoryDB.
@@ -41,11 +43,23 @@ class MarketHistoryImportMixin:
             Number of records imported
         """
         import csv
-        
+
         if not csv_path.exists():
             print(f"[MarketHistory] File not found: {csv_path}")
             return 0
-        
+
+        # D1/D3: every writer to market_history.db serializes on the
+        # shared in-process lock (RLock - import_archive nesting is fine).
+        with import_lock.acquire(f"import_file:{csv_path.name}"):
+            return self._import_file_locked(csv_path, region_filter,
+                                            progress_callback)
+
+    def _import_file_locked(self, csv_path: Path,
+                            region_filter: Optional[Set[int]],
+                            progress_callback: Optional[Callable[[str, int, int], None]]) -> int:
+        """Body of import_file; caller holds the import lock."""
+        import csv
+
         # Determine if compressed
         is_compressed = str(csv_path).endswith('.bz2') or not str(csv_path).endswith('.csv')
         
@@ -158,12 +172,15 @@ class MarketHistoryImportMixin:
             return 0
         
         print(f"[MarketHistory] Found {len(files_to_import)} files to import")
-        
-        # Choose import mode based on file count
-        if len(files_to_import) >= 100:
-            return self._bulk_import(files_to_import, region_filter, progress_callback)
-        else:
-            return self._incremental_import(files_to_import, region_filter, progress_callback)
+
+        # D1/D3: bulk imports hold the writer lock for their whole run so
+        # the reconciler/daily update can never interleave (RLock, so the
+        # nested per-file import_file acquire is fine).
+        with import_lock.acquire(f"import_archive:{len(files_to_import)}files"):
+            if len(files_to_import) >= 100:
+                return self._bulk_import(files_to_import, region_filter, progress_callback)
+            else:
+                return self._incremental_import(files_to_import, region_filter, progress_callback)
     
     def _collect_archive_files(self, archive_path: Path, years: int) -> List[Path]:
         """Collect all archive files to import."""

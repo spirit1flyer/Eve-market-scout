@@ -341,10 +341,15 @@ class ArchiveDownloader:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     content = await resp.read()
-                    
-                    with open(dest, "wb") as f:
+
+                    # D4: write to .part then atomic-rename so a crash or
+                    # kill mid-write can never leave a truncated file
+                    # that later imports partial rows silently.
+                    part = dest.with_suffix(dest.suffix + ".part")
+                    with open(part, "wb") as f:
                         f.write(content)
-                    
+                    part.replace(dest)
+
                     return True, len(content)
                 elif resp.status == 404:
                     # File doesn't exist (date too recent)

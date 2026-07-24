@@ -58,8 +58,9 @@ class MainScanMixin:
     def _check_first_time_setup(self) -> bool:
         """Check if scanner has minimum data. Returns True if ready to scan.
 
-        Scanner only needs 30 days of recent data. This is a quick download
-        (~60MB, 1-2 minutes) compared to full 3-year archive.
+        Scanner needs 60 days of recent data (ledger-verified, hole-aware
+        — see history/history_reconciler.py). Quick download compared to
+        the full 3-year archive.
 
         Stock Market features will prompt for full history separately.
         """
@@ -91,8 +92,8 @@ class MainScanMixin:
         result = messagebox.askyesno(
             "Scanner Setup Required",
             "EVE Market Scout needs to download recent market data.\n\n"
-            "This will download 30 days of price history (~60 MB).\n"
-            "Takes about 1-2 minutes.\n\n"
+            "This will download up to 60 days of price history (~35 MB).\n"
+            "Takes a few minutes at most.\n\n"
             "Continue?"
         )
         

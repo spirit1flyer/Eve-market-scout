@@ -7,7 +7,7 @@ The values below are kept for reference/documentation only.
 # =============================================================================
 # APP VERSION - Update this single line to change version everywhere
 # =============================================================================
-APP_VERSION = "3.3 live"
+APP_VERSION = "3.4 live"
 
 # Region IDs
 JITA_REGION_ID = 10000002  # The Forge
