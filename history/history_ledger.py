@@ -12,6 +12,8 @@ Statuses:
                            (failed import, or a gutted lag-0/1 legacy import)
     missing              - download/import failed; retried with backoff
     unavailable_404      - everef says no file; tombstoned with backoff
+    pruned               - intentionally deleted by the rolling-horizon
+                           age-off; never re-downloaded
 
 Row counts stored here are MEASURED (SELECT COUNT(*) after commit via
 idx_date), never trusted from an importer's return value - that return
@@ -35,6 +37,12 @@ EVEREF_LAG_DAYS = 2
 FINALIZE_AGE_DAYS = 5      # calendar age at which a date stops changing
 SCANNER_WINDOW_DAYS = 60   # the blocking requirement (Caleb 2026-07-24)
 
+# Rolling deep-history horizon: how far back the DB is kept populated
+# (Phase D backfill) and past which data is aged off (prune). Backfill
+# wants date >= horizon, prune deletes date < horizon - same constant,
+# so the two can never fight over a date.
+HISTORY_YEARS = 3
+
 # Bootstrap: dates whose measured count is below this fraction of the
 # all-dates median get seeded `partial` so they are re-fetched. Catches
 # the legacy gutted lag-0/1 imports (500-5,000 rows vs ~50k mature).
@@ -45,6 +53,7 @@ STATUS_PROVISIONAL = "complete_provisional"
 STATUS_PARTIAL = "partial"
 STATUS_MISSING = "missing"
 STATUS_404 = "unavailable_404"
+STATUS_PRUNED = "pruned"
 COMPLETE_STATUSES = (STATUS_FINAL, STATUS_PROVISIONAL)
 
 BOOTSTRAP_META_KEY = "ledger_bootstrapped"
@@ -53,6 +62,11 @@ BOOTSTRAP_META_KEY = "ledger_bootstrapped"
 def available_date(today: Optional[date] = None) -> date:
     """Newest date everef should have a file for."""
     return (today or date.today()) - timedelta(days=EVEREF_LAG_DAYS)
+
+
+def horizon_date(today: Optional[date] = None) -> date:
+    """Oldest date we keep: backfill floor and prune cutoff."""
+    return (today or date.today()) - timedelta(days=HISTORY_YEARS * 365)
 
 
 def _now_iso() -> str:
@@ -289,8 +303,8 @@ def scanner_window_dates(today: Optional[date] = None) -> List[str]:
 
 
 def compute_work(db) -> dict:
-    """Compute this pass's work from the ledger. Scanner window only -
-    deep (3-year) backfill is deferred to the stock-market chunk.
+    """Compute this pass's window work from the ledger. Scanner window
+    only - deep-history holes are Phase D's job (compute_backfill).
 
     Returns dict:
         need_fetch:   dates in the scanner window with no complete rows
@@ -340,6 +354,108 @@ def compute_work(db) -> dict:
           f"topups={topups}")
     return {"need_fetch": need_fetch, "deferred": deferred,
             "topups": topups}
+
+
+def compute_backfill(db, limit: int) -> List[str]:
+    """Phase D work: dates older than the scanner window but inside the
+    HISTORY_YEARS horizon that are not complete, not pruned, and not in
+    retry backoff - i.e. interior holes (legacy partial imports) and
+    long-absence gaps (dates that aged out of the trailing window before
+    a pass ever saw them). Never-attempted dates have no ledger row at
+    all, so this enumerates the expected calendar rather than querying
+    existing rows. Newest first, capped at `limit` per pass.
+    """
+    today = date.today()
+    window_start = (available_date(today)
+                    - timedelta(days=SCANNER_WINDOW_DAYS - 1))
+    floor = horizon_date(today)
+    conn = db._get_conn()
+    rows = {r["date"]: r for r in conn.execute(
+        "SELECT date, status, next_retry FROM history_days "
+        "WHERE date >= ? AND date < ?",
+        (floor.isoformat(), window_start.isoformat()))}
+    now_str = _now_iso()
+
+    out: List[str] = []
+    skipped_backoff = 0
+    d = window_start - timedelta(days=1)
+    while d >= floor and len(out) < limit:
+        ds = d.isoformat()
+        row = rows.get(ds)
+        if row is None:
+            out.append(ds)
+        elif row["status"] in COMPLETE_STATUSES or row["status"] == STATUS_PRUNED:
+            pass
+        elif row["next_retry"] and row["next_retry"] > now_str:
+            skipped_backoff += 1
+        else:
+            out.append(ds)
+        d -= timedelta(days=1)
+
+    if out or skipped_backoff:
+        print(f"[Ledger] backfill: {len(out)} dates queued (cap {limit})"
+              f"{': ' + ', '.join(out[:10]) if out else ''}"
+              f"{'...' if len(out) > 10 else ''}"
+              f"{f' | {skipped_backoff} in backoff' if skipped_backoff else ''}")
+    return out
+
+
+# Age-off cap per pass: one date = one short transaction (~50k rows),
+# so concurrent readers never sit behind a multi-minute delete. Steady
+# state is 1 date/day; a first run with months of overhang catches up
+# over a few passes.
+PRUNE_DATES_PER_PASS = 30
+
+
+def apply_prune(db) -> int:
+    """Age-off: delete daily_history rows past the rolling horizon and
+    mark their ledger rows `pruned` so backfill never re-downloads what
+    was deliberately dropped. Freed pages are reused, so the DB file
+    stops growing (no VACUUM - that would rewrite the multi-GB file).
+    Returns rows deleted.
+    """
+    cutoff = horizon_date().isoformat()
+    conn = db._get_conn()
+    dates = [r["date"] for r in conn.execute(
+        "SELECT date FROM history_days WHERE date < ? AND status != ? "
+        "ORDER BY date LIMIT ?",
+        (cutoff, STATUS_PRUNED, PRUNE_DATES_PER_PASS))]
+    if not dates:
+        return 0
+
+    now = _now_iso()
+    deleted = 0
+    for ds in dates:
+        deleted += conn.execute(
+            "DELETE FROM daily_history WHERE date=?", (ds,)).rowcount
+        conn.execute(
+            "UPDATE history_days SET status=?, row_count=0, updated_at=? "
+            "WHERE date=?", (STATUS_PRUNED, now, ds))
+        conn.commit()
+
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM history_days WHERE date < ? AND status != ?",
+        (cutoff, STATUS_PRUNED)).fetchone()[0]
+    print(f"[Ledger] prune: deleted {deleted:,} rows across "
+          f"{len(dates)} dates (date < {cutoff})"
+          f"{f', {remaining} dates still overhanging' if remaining else ''}")
+    return deleted
+
+
+def coverage(db, years: int = HISTORY_YEARS) -> Tuple[int, int]:
+    """(complete_days, expected_days) over the rolling horizon - the
+    stock-market data-sufficiency number (D7)."""
+    today = date.today()
+    end = available_date(today)
+    start = today - timedelta(days=years * 365)
+    expected = (end - start).days + 1
+    conn = db._get_conn()
+    complete = conn.execute(
+        "SELECT COUNT(*) FROM history_days "
+        "WHERE date >= ? AND date <= ? AND status IN (?, ?)",
+        (start.isoformat(), end.isoformat(),
+         STATUS_FINAL, STATUS_PROVISIONAL)).fetchone()[0]
+    return complete, expected
 
 
 def scanner_ready(db) -> Tuple[bool, str]:

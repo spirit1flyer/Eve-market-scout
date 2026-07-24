@@ -248,15 +248,39 @@ def get_scanner_missing_dates(db: MarketHistoryDB) -> List[str]:
     return missing
 
 
-def check_has_full_history(db: MarketHistoryDB, years: int = 3) -> bool:
-    """Check if database has full history for Stock Market features.
+# Stock-market gate: fraction of the rolling horizon that must be
+# complete in the ledger. Not 100% - a handful of 404/unfetchable days
+# out of ~1,100 shouldn't lock the whole tab.
+STOCK_COVERAGE_MIN = 0.95
 
-    NOTE (D7): earliest-date-only heuristic - no staleness or hole
-    check. Replacing it with a ledger predicate is deferred with the
-    rest of the stock-market chunk (PLAN_history_reconciler.md).
+# Overlay polls this every few seconds - only log when the answer moves.
+_last_coverage_msg: str = ""
+
+
+def check_has_full_history(db: MarketHistoryDB, years: int = 3) -> bool:
+    """Stock-market gate (D7): ledger coverage over the rolling horizon
+    - hole- and staleness-aware, ms-fast. Falls back to the legacy
+    earliest-date heuristic while the ledger isn't bootstrapped.
     """
-    days_short = get_days_short_of_full_history(db, years)
-    return days_short == 0
+    global _last_coverage_msg
+    from history import history_ledger as ledger
+
+    try:
+        if ledger.is_bootstrapped(db):
+            complete, expected = ledger.coverage(db, years)
+            frac = complete / expected if expected else 0.0
+            ok = frac >= STOCK_COVERAGE_MIN
+            msg = (f"[StockMarket] history coverage: {complete}/{expected} "
+                   f"days ({frac:.1%}) -> "
+                   f"{'OK' if ok else 'INSUFFICIENT'}")
+            if msg != _last_coverage_msg:
+                print(msg)
+                _last_coverage_msg = msg
+            return ok
+    except Exception as e:
+        print(f"[StockMarket] ledger coverage check failed ({e}) - "
+              f"falling back to legacy earliest-date check")
+    return get_days_short_of_full_history(db, years) == 0
 
 
 def get_days_short_of_full_history(db: MarketHistoryDB, years: int = 3) -> int:

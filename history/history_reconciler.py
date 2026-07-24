@@ -12,9 +12,12 @@ ledger-driven pass:
     Phase B: top-ups - re-fetch provisional dates younger than 5 days
             because everef keeps appending rows to young files (D6).
     Phase C: finalize aged provisionals.
-
-Deep (3-year) backfill and the stock-market on-access verify are
-DEFERRED to a later chunk (Caleb 2026-07-24).
+    Phase D: rolling-horizon backfill drip (D7) - a few files per pass
+            for any incomplete date older than the scanner window but
+            inside the HISTORY_YEARS horizon (legacy partial imports,
+            long-absence gaps). Never blocks the scanner.
+    Phase E: age-off - delete data past the horizon, mark it `pruned`
+            in the ledger so Phase D never re-downloads it.
 
 Downloads are atomic (D4): .part file, full bz2-decompress validation,
 then rename. Imports run under history.import_lock (D1/D3) and are
@@ -42,6 +45,11 @@ from history import import_lock
 from history.market_history import MarketHistoryDB
 
 DOWNLOAD_TIMEOUT = 60  # seconds per file
+
+# Phase D drip cap: at ~40 s/import a full pass's backfill stays under
+# ~7 minutes of background work; a fresh 3-year fill spreads over
+# ~110 sessions instead of hammering everef in one sitting.
+BACKFILL_PER_PASS = 10
 
 # Single-flight guard
 _pass_lock = threading.Lock()
@@ -231,8 +239,8 @@ def run_reconcile(db: Optional[MarketHistoryDB] = None,
 
     Returns a summary dict:
         scanner_ready (bool), scanner_reason (str), fetched (int),
-        failed (int), topups (int), finalized (int), elapsed (float),
-        waited_for_other_pass (bool)
+        failed (int), topups (int), finalized (int), backfilled (int),
+        pruned_rows (int), elapsed (float), waited_for_other_pass (bool)
     """
     if db is None:
         db = MarketHistoryDB()
@@ -252,7 +260,8 @@ def run_reconcile(db: Optional[MarketHistoryDB] = None,
     t0 = time.perf_counter()
     summary = {"trigger": trigger, "scanner_ready": False,
                "scanner_reason": "", "fetched": 0, "failed": 0,
-               "topups": 0, "finalized": 0, "elapsed": 0.0,
+               "topups": 0, "finalized": 0, "backfilled": 0,
+               "pruned_rows": 0, "elapsed": 0.0,
                "waited_for_other_pass": waited}
     try:
         print(f"[Reconciler] ===== pass start (trigger={trigger}) =====")
@@ -327,11 +336,42 @@ def run_reconcile(db: Optional[MarketHistoryDB] = None,
         # ---- Phase C: finalize aged provisionals
         summary["finalized"] = ledger.finalize_aged_provisionals(db)
 
+        # ---- Phase D: rolling-horizon backfill drip (D7). Runs after
+        # the scanner gate is already settled, so it never blocks a
+        # scan; no progress_cb - this is pure background work.
+        backfill = ledger.compute_backfill(db, BACKFILL_PER_PASS)
+        if backfill:
+            print(f"[Reconciler] phase D: {len(backfill)} backfill dates "
+                  f"(cap {BACKFILL_PER_PASS}/pass)")
+            dl = _download_dates_sync(backfill, None, "Backfill",
+                                      len(backfill), 0)
+            for d in backfill:
+                res = dl.get(d)
+                if isinstance(res, Path):
+                    if _import_and_record(db, d, res):
+                        summary["backfilled"] += 1
+                    else:
+                        summary["failed"] += 1
+                elif isinstance(res, FileNotFoundError):
+                    ledger.record_failure(db, d, "404", "everef 404")
+                    summary["failed"] += 1
+                else:
+                    ledger.record_failure(db, d, "error", str(res))
+                    summary["failed"] += 1
+        else:
+            print("[Reconciler] phase D: no backfill needed")
+
+        # ---- Phase E: age-off past the rolling horizon
+        with import_lock.acquire("reconciler:prune"):
+            summary["pruned_rows"] = ledger.apply_prune(db)
+
         summary["elapsed"] = time.perf_counter() - t0
         print(f"[Reconciler] ===== pass end (trigger={trigger}): "
               f"ready={ready} fetched={summary['fetched']} "
               f"topups={summary['topups']} failed={summary['failed']} "
               f"finalized={summary['finalized']} "
+              f"backfilled={summary['backfilled']} "
+              f"pruned_rows={summary['pruned_rows']} "
               f"elapsed={summary['elapsed']:.1f}s =====")
         return summary
     except Exception as e:
