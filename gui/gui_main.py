@@ -302,6 +302,12 @@ class MarketScoutGUI(MainControlsMixin, MainScanMixin):
         # Start background import status polling
         self._start_bg_import_polling()
 
+        # Route live reconciler status (downloads/backfill/prune) to
+        # the top-right status label (2026-08-01)
+        self._recon_status_shown = False
+        self._recon_label_hold = 0.0
+        self._poll_reconciler_status()
+
     def _setup_styles(self):
         """Configure ttk styles."""
         style = ttk.Style()
@@ -462,6 +468,37 @@ class MarketScoutGUI(MainControlsMixin, MainScanMixin):
         
         # Poll again in 2 seconds while running
         self._bg_import_poll_job = self.root.after(2000, self._poll_bg_import_status)
+
+    def _poll_reconciler_status(self):
+        """Show live reconciler work in the top-right status label.
+
+        Only overwrites the label when it shows 'Ready' or a previous
+        reconciler message - never a scan result or alert text, and
+        never while a scan is running.
+        """
+        import time as _t
+        try:
+            from history.history_reconciler import get_status
+            st = get_status()
+            if self.is_scanning:
+                # Scan owns the label; give its result/alert text 90s
+                # to be seen before reconciler text may take over.
+                self._recon_status_shown = False
+                self._recon_label_hold = _t.time() + 90
+            else:
+                current = self.status_label.cget("text")
+                may_take = (current == "Ready"
+                            or self._recon_status_shown
+                            or _t.time() > self._recon_label_hold)
+                if st and st.get("status") and may_take:
+                    self.status_label.configure(text=st["status"])
+                    self._recon_status_shown = True
+                elif st is None and self._recon_status_shown:
+                    self.status_label.configure(text="Ready")
+                    self._recon_status_shown = False
+        except Exception as e:
+            print(f"[Reconciler] status-label poll error: {e}")
+        self.root.after(2000, self._poll_reconciler_status)
 
     # =========================================================================
     # STATION SELECTION

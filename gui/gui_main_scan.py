@@ -180,6 +180,10 @@ class MainScanMixin:
             # TODO: Get buyer skills when second character is implemented
             buyer_skills = seller_skills  # For now, use same skills
 
+        # Reconciler maintenance (backfill/prune) finishes its current
+        # chunk and pauses while this is set.
+        from history.history_reconciler import set_scan_active
+        set_scan_active(True)
         try:
             # Determine scan mode
             if self.is_crosshub_mode():
@@ -226,6 +230,7 @@ class MainScanMixin:
             traceback.print_exc()
         finally:
             loop.close()
+            set_scan_active(False)
 
         # Schedule UI updates on main thread
         if error_msg:

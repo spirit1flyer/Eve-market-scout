@@ -400,31 +400,35 @@ def compute_backfill(db, limit: int) -> List[str]:
     return out
 
 
-# Age-off cap per pass: one date = one short transaction (~50k rows),
-# so concurrent readers never sit behind a multi-minute delete. Steady
-# state is 1 date/day; a first run with months of overhang catches up
-# over a few passes.
+# Default age-off cap per call: one date = one short transaction
+# (~50k rows), so concurrent readers never sit behind a multi-minute
+# delete. The reconciler calls with limit=1 in a loop until the
+# overhang is gone (each date is ~10-20s of scattered-page deletes on
+# the full DB - the 2026-08-01 startup hang was 30 of these in one
+# uninterruptible import-lock hold).
 PRUNE_DATES_PER_PASS = 30
 
 
-def apply_prune(db) -> int:
+def apply_prune(db, limit: int = PRUNE_DATES_PER_PASS) -> Tuple[int, int]:
     """Age-off: delete daily_history rows past the rolling horizon and
     mark their ledger rows `pruned` so backfill never re-downloads what
     was deliberately dropped. Freed pages are reused, so the DB file
     stops growing (no VACUUM - that would rewrite the multi-GB file).
-    Returns rows deleted.
+    Returns (dates_pruned, rows_deleted).
     """
+    import time as _t
     cutoff = horizon_date().isoformat()
     conn = db._get_conn()
     dates = [r["date"] for r in conn.execute(
         "SELECT date FROM history_days WHERE date < ? AND status != ? "
         "ORDER BY date LIMIT ?",
-        (cutoff, STATUS_PRUNED, PRUNE_DATES_PER_PASS))]
+        (cutoff, STATUS_PRUNED, limit))]
     if not dates:
-        return 0
+        return 0, 0
 
     now = _now_iso()
     deleted = 0
+    t0 = _t.perf_counter()
     for ds in dates:
         deleted += conn.execute(
             "DELETE FROM daily_history WHERE date=?", (ds,)).rowcount
@@ -437,9 +441,10 @@ def apply_prune(db) -> int:
         "SELECT COUNT(*) FROM history_days WHERE date < ? AND status != ?",
         (cutoff, STATUS_PRUNED)).fetchone()[0]
     print(f"[Ledger] prune: deleted {deleted:,} rows across "
-          f"{len(dates)} dates (date < {cutoff})"
+          f"{len(dates)} dates in {_t.perf_counter() - t0:.1f}s "
+          f"(date < {cutoff})"
           f"{f', {remaining} dates still overhanging' if remaining else ''}")
-    return deleted
+    return len(dates), deleted
 
 
 def coverage(db, years: int = HISTORY_YEARS) -> Tuple[int, int]:
@@ -458,7 +463,7 @@ def coverage(db, years: int = HISTORY_YEARS) -> Tuple[int, int]:
     return complete, expected
 
 
-def scanner_ready(db) -> Tuple[bool, str]:
+def scanner_ready(db, quiet: bool = False) -> Tuple[bool, str]:
     """The scanner gate predicate: is the 60-day window usable?
 
     Ready when every window date is complete, OR the only incomplete
@@ -469,6 +474,7 @@ def scanner_ready(db) -> Tuple[bool, str]:
 
     Returns (ready, reason). Callers must handle a non-bootstrapped
     ledger themselves (fall back to the legacy span check).
+    quiet=True suppresses the verdict print (sub-second pollers).
     """
     window = scanner_window_dates()
     rows = get_rows(db, window)
@@ -490,16 +496,20 @@ def scanner_ready(db) -> Tuple[bool, str]:
         reason = (f"{len(hard_missing)}/{len(window)} window dates "
                   f"incomplete: {hard_missing[:5]}"
                   f"{'...' if len(hard_missing) > 5 else ''}")
-        print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: BLOCKED - {reason}")
+        if not quiet:
+            print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: "
+                  f"BLOCKED - {reason}")
         return False, reason
 
     if tolerated:
-        print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: READY with "
-              f"tolerated gaps (unfetchable right now): {tolerated}")
+        if not quiet:
+            print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: READY with "
+                  f"tolerated gaps (unfetchable right now): {tolerated}")
         return True, f"ready ({len(tolerated)} tolerated gaps)"
 
-    print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: READY "
-          f"({len(window)}/{len(window)} complete)")
+    if not quiet:
+        print(f"[Ledger] scanner-{SCANNER_WINDOW_DAYS}d: READY "
+              f"({len(window)}/{len(window)} complete)")
     return True, "ready"
 
 

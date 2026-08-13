@@ -398,10 +398,12 @@ class ScannerSetupDialog(tk.Toplevel):
                 
                 elif msg_type == 'complete':
                     _, records = msg
-                    print(f"[Debug] ScannerSetupDialog: "
-                          f"{records:,} records imported")
-                    self.status_var.set("Setup complete!")
-                    self.count_var.set(f"{records:,} records imported")
+                    print(f"[Debug] ScannerSetupDialog: complete "
+                          f"({records} days fetched)")
+                    self.status_var.set("Scanner data ready!")
+                    self.count_var.set(
+                        f"{records} days fetched" if records
+                        else "All days present")
                     self.progress['value'] = 100
                     self._close_at = time.time() + 1.5
                 
@@ -440,29 +442,72 @@ class ScannerSetupDialog(tk.Toplevel):
     def _run_download(self):
         """Runs in background thread. Never calls Tk methods.
 
-        Drives one reconcile pass; the dialog closes on the LEDGER's
-        verdict (scanner_ready), not on "files were processed". If a
-        launch-time pass is already running, the reconciler logs the
-        wait and our own pass afterwards is nearly a no-op.
+        Observer (2026-08-01): polls the ledger predicate and the
+        reconciler's live get_status() snapshot instead of joining the
+        pass queue - the old version blocked on the pass lock for the
+        WHOLE launch pass, including the Phase E prune (the 10-minute
+        dialog hang). Now the dialog shows whatever the running pass is
+        actually doing and closes the moment the ledger says the 60-day
+        window is usable, while background maintenance carries on.
+        Starts a pass of its own only if none is running.
         """
-        print("[Debug] ScannerSetupDialog._run_download: starting "
-              "reconcile pass")
+        print("[Debug] ScannerSetupDialog._run_download: "
+              "observer starting")
         try:
-            from history.history_reconciler import run_reconcile
-            summary = run_reconcile(db=self.db,
-                                    progress_cb=self._update_progress,
-                                    trigger="scanner-gate")
-            print(f"[Debug] ScannerSetupDialog: pass summary: {summary}")
+            from history import history_reconciler as reconciler
+            started_own_pass = False
+            while True:
+                if reconciler.check_scanner_ready(self.db, quiet=True):
+                    print("[Debug] ScannerSetupDialog: ledger says "
+                          "ready - closing")
+                    self.result = True
+                    st = reconciler.get_status() or {}
+                    self._msg_queue.put(('complete',
+                                         st.get("fetched", 0)))
+                    return
 
-            self.result = True  # app launches regardless (ESI fallback)
-            if summary["scanner_ready"]:
-                self._msg_queue.put(
-                    ('complete', summary["fetched"] + summary["topups"]))
-            elif summary["fetched"] == 0 and summary["failed"] > 0:
-                # Nothing downloadable — offline or everef down
-                self._msg_queue.put(('no_data',))
-            else:
-                self._msg_queue.put(('failed', summary["scanner_reason"]))
+                st = reconciler.get_status()
+                if st is None:
+                    if started_own_pass:
+                        # Our pass ended (or crashed) and the window
+                        # is still unusable - launch with ESI fallback.
+                        self.result = True
+                        self._msg_queue.put(
+                            ('failed', 'history window incomplete'))
+                        return
+                    started_own_pass = True
+                    print("[Debug] ScannerSetupDialog: no pass "
+                          "running - starting scanner-gate pass")
+                    threading.Thread(
+                        target=reconciler.run_reconcile,
+                        kwargs={"trigger": "scanner-gate"},
+                        daemon=True,
+                        name="reconciler-scanner-gate").start()
+                    # Give the pass a moment to publish its status so
+                    # the next loop doesn't mistake the gap for "ended"
+                    for _ in range(20):
+                        time.sleep(0.5)
+                        if reconciler.get_status() is not None:
+                            break
+                    continue
+
+                if st.get("gate_settled") and not st.get("gate_ready"):
+                    # Phase A is done and the window is still blocked
+                    # (everef down / 404s). Report and let the app
+                    # launch; maintenance keeps running behind us.
+                    self.result = True
+                    if (st.get("fetched", 0) == 0
+                            and st.get("failed", 0) > 0):
+                        self._msg_queue.put(('no_data',))
+                    else:
+                        self._msg_queue.put(
+                            ('failed', st.get("gate_reason", "")))
+                    return
+
+                self._msg_queue.put(('progress', st.get("status", ""),
+                                     st.get("current", 0),
+                                     st.get("total", 0)))
+                time.sleep(0.5)
 
         except Exception as e:
             print(f"[Debug] ScannerSetupDialog._run_download "
