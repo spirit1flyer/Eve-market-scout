@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 import os
 import json
+import math
 import threading
 from typing import Callable, Union
 
@@ -79,6 +80,16 @@ def passes_category_filters_for_name(
 
 # File for persistent ignore list - use centralized data directory
 IGNORE_FILE = str(get_data_dir() / "ignored_items.json")
+FILTER_SETTINGS_FILE = get_data_dir() / "scanner_filter_settings.json"
+
+DEFAULT_FILTER_SETTINGS = {
+    "min_profit_per_unit": 5_000,
+    "min_total_profit": MIN_TOTAL_PROFIT,
+    "max_cost": 100_000_000,
+    "min_margin_percent": 12,
+    "min_daily_volume": MIN_DAILY_VOLUME,
+    "est_sell_percent": 100,
+}
 
 
 class FilterManager:
@@ -90,12 +101,15 @@ class FilterManager:
         # Selected hub (updated by gui_main when dropdown changes)
         self.selected_hub = DEFAULT_HUB
         
-        # Default filter values
-        self.default_min_profit = 10_000
-        self.default_min_total = MIN_TOTAL_PROFIT
-        self.default_max_cost = 100_000_000  # 100M (also wallet size)
-        self.default_min_margin = 12
-        self.default_min_volume = MIN_DAILY_VOLUME
+        # Persisted scanner filters.  Values live in AppData, not the public
+        # repository, and are saved whenever a scan applies them.
+        saved_filters = self._load_filter_settings()
+        self.default_min_profit = saved_filters["min_profit_per_unit"]
+        self.default_min_total = saved_filters["min_total_profit"]
+        self.default_max_cost = saved_filters["max_cost"]
+        self.default_min_margin = saved_filters["min_margin_percent"]
+        self.default_min_volume = saved_filters["min_daily_volume"]
+        self.default_est_sell_pct = saved_filters["est_sell_percent"]
 
         # Ignore lists: persistent (always) and session-only (this session)
         self.ignored_type_ids: set[int] = self._load_ignore_list()  # Always ignored
@@ -151,6 +165,45 @@ class FilterManager:
         except Exception as e:
             print(f"Error saving ignore list: {e}")
 
+    def _load_filter_settings(self) -> dict[str, float]:
+        """Load numeric scanner filters, falling back field-by-field."""
+        settings = dict(DEFAULT_FILTER_SETTINGS)
+        if not FILTER_SETTINGS_FILE.exists():
+            return settings
+
+        try:
+            with open(FILTER_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise TypeError("settings root must be an object")
+
+            for key, default in DEFAULT_FILTER_SETTINGS.items():
+                value = float(saved.get(key, default))
+                if not math.isfinite(value):
+                    raise ValueError(f"{key} must be finite")
+                settings[key] = value
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            print(f"[Filters] Could not load scanner settings: {e}")
+
+        return settings
+
+    def _save_filter_settings(self, settings: dict[str, float]):
+        """Atomically persist the numeric filters most recently applied."""
+        temp_path = FILTER_SETTINGS_FILE.with_suffix(".json.tmp")
+        try:
+            FILTER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+            temp_path.replace(FILTER_SETTINGS_FILE)
+        except OSError as e:
+            print(f"[Filters] Could not save scanner settings: {e}")
+
+    @staticmethod
+    def _format_filter_value(value: float) -> str:
+        """Show whole-number settings without a trailing decimal."""
+        value = float(value)
+        return str(int(value)) if value.is_integer() else f"{value:g}"
+
     def create_widgets(self, parent: tk.Widget):
         """Create filter control widgets."""
         filter_container = ttk.Frame(parent, padding=(10, 5))
@@ -168,32 +221,44 @@ class FilterManager:
 
         # Min Profit Per Unit
         ttk.Label(filter_row1, text="Min Profit/Unit:").pack(side=tk.LEFT)
-        self.min_profit_var = tk.StringVar(value=str(self.default_min_profit))
+        self.min_profit_var = tk.StringVar(
+            value=self._format_filter_value(self.default_min_profit)
+        )
         ttk.Entry(filter_row1, textvariable=self.min_profit_var, width=12).pack(side=tk.LEFT, padx=(2, 15))
 
         # Min Total Profit
         ttk.Label(filter_row1, text="Min Total Profit:").pack(side=tk.LEFT)
-        self.min_total_var = tk.StringVar(value=str(self.default_min_total))
+        self.min_total_var = tk.StringVar(
+            value=self._format_filter_value(self.default_min_total)
+        )
         ttk.Entry(filter_row1, textvariable=self.min_total_var, width=12).pack(side=tk.LEFT, padx=(2, 15))
 
         # Max Cost / Wallet
         ttk.Label(filter_row1, text="Max Cost/Wallet:").pack(side=tk.LEFT)
-        self.max_cost_var = tk.StringVar(value=str(self.default_max_cost))
+        self.max_cost_var = tk.StringVar(
+            value=self._format_filter_value(self.default_max_cost)
+        )
         ttk.Entry(filter_row1, textvariable=self.max_cost_var, width=12).pack(side=tk.LEFT, padx=(2, 15))
 
         # Min Margin %
         ttk.Label(filter_row1, text="Min Margin %:").pack(side=tk.LEFT)
-        self.min_margin_var = tk.StringVar(value=str(self.default_min_margin))
+        self.min_margin_var = tk.StringVar(
+            value=self._format_filter_value(self.default_min_margin)
+        )
         ttk.Entry(filter_row1, textvariable=self.min_margin_var, width=6).pack(side=tk.LEFT, padx=(2, 15))
 
         # Min Daily Volume
         ttk.Label(filter_row1, text="Min Vol:").pack(side=tk.LEFT)
-        self.min_volume_var = tk.StringVar(value=str(self.default_min_volume))
+        self.min_volume_var = tk.StringVar(
+            value=self._format_filter_value(self.default_min_volume)
+        )
         ttk.Entry(filter_row1, textvariable=self.min_volume_var, width=6).pack(side=tk.LEFT, padx=(2, 15))
 
         # Est Sell % (adjusts displayed profit/unit assuming you sell at X% of ceiling)
         ttk.Label(filter_row1, text="Est Sell %:").pack(side=tk.LEFT)
-        self.est_sell_pct_var = tk.StringVar(value="100")
+        self.est_sell_pct_var = tk.StringVar(
+            value=self._format_filter_value(self.default_est_sell_pct)
+        )
         self.est_sell_pct_entry = ttk.Entry(filter_row1, textvariable=self.est_sell_pct_var, width=5)
         self.est_sell_pct_entry.pack(side=tk.LEFT, padx=(2, 15))
         self.est_sell_pct_entry.bind("<KeyRelease>", self._on_est_sell_pct_changed)
@@ -292,6 +357,15 @@ class FilterManager:
             min_volume = float(self.min_volume_var.get().replace(",", ""))
         except ValueError:
             min_volume = self.default_min_volume
+
+        self._save_filter_settings({
+            "min_profit_per_unit": min_profit,
+            "min_total_profit": min_total,
+            "max_cost": max_cost,
+            "min_margin_percent": min_margin,
+            "min_daily_volume": min_volume,
+            "est_sell_percent": self.get_est_sell_pct(),
+        })
 
         return min_profit, min_total, max_cost, min_margin, min_volume
 
