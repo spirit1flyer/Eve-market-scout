@@ -19,6 +19,9 @@ import requests
 import secrets
 import hashlib
 import base64
+import hmac
+import html
+from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from typing import Optional, Dict, Callable
@@ -115,33 +118,99 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress HTTP logging
 
-    def do_GET(self):
-        query = parse_qs(urlparse(self.path).query)
+    def _send_page(self, status: int, title: str, message: str):
+        body = f"""
+            <html><body style="background:#1a1a2e;color:#eee;font-family:sans-serif;text-align:center;padding-top:50px;">
+            <h1>{html.escape(title)}</h1>
+            <p>{html.escape(message)}</p>
+            </body></html>
+        """.encode()
+        self.send_response(status)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-        if "code" in query:
-            self.server.auth_code = query["code"][0]
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"""
-                <html><body style="background:#1a1a2e;color:#eee;font-family:sans-serif;text-align:center;padding-top:50px;">
-                <h1>Authorization Successful!</h1>
-                <p>You can close this window and return to EVE Market Scout.</p>
-                </body></html>
-            """)
-        else:
-            error = query.get("error", ["Unknown error"])[0]
-            self.server.auth_code = None
-            self.server.auth_error = error
-            self.send_response(400)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(f"""
-                <html><body style="background:#1a1a2e;color:#eee;font-family:sans-serif;text-align:center;padding-top:50px;">
-                <h1>Authorization Failed</h1>
-                <p>Error: {error}</p>
-                </body></html>
-            """.encode())
+    def _reject(self, reason: str, message: str):
+        server = self.server
+        server.auth_code = None
+        server.auth_error = message
+        server.auth_complete = True
+        print(
+            f"[AuthState] attempt={server.attempt_id} flow={server.flow_label} "
+            f"target={server.flow_target} callback rejected reason={reason}"
+        )
+        self._send_page(400, "Authorization Rejected", message)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != urlparse(CALLBACK_URL).path:
+            print(
+                f"[AuthState] attempt={self.server.attempt_id} "
+                f"ignored non-callback path"
+            )
+            self._send_page(404, "Not Found", "This is not an authorization callback.")
+            return
+
+        server = self.server
+        if server.sso_cancelled or not _is_latest_sso_attempt(server.attempt_id):
+            self._reject("superseded", "This login attempt was replaced by a newer one.")
+            return
+        if time.monotonic() >= server.expires_at:
+            self._reject("expired", "This login attempt has expired. Please try again.")
+            return
+        if server.state_consumed:
+            self._reject("consumed", "This login callback has already been used.")
+            return
+
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        states = query.get("state", [])
+        if len(states) != 1 or not states[0]:
+            reason = "missing" if not states or not states[0] else "multiple"
+            self._reject(reason, "The authorization response did not contain a valid state.")
+            return
+
+        expected_state = server.expected_state
+        if not expected_state or not hmac.compare_digest(states[0], expected_state):
+            self._reject("mismatch", "The authorization response could not be verified.")
+            return
+
+        codes = query.get("code", [])
+        errors = query.get("error", [])
+        if len(codes) == 1 and codes[0] and not errors:
+            server.state_consumed = True
+            server.auth_code = codes[0]
+            server.auth_error = None
+            server.auth_complete = True
+            print(
+                f"[AuthState] attempt={server.attempt_id} flow={server.flow_label} "
+                f"target={server.flow_target} callback accepted state=match result=code"
+            )
+            self._send_page(
+                200,
+                "Authorization Successful!",
+                "You can close this window and return to EVE Market Scout.",
+            )
+            return
+
+        if len(errors) == 1 and errors[0] and not codes:
+            server.state_consumed = True
+            server.auth_code = None
+            server.auth_error = errors[0]
+            server.auth_complete = True
+            print(
+                f"[AuthState] attempt={server.attempt_id} flow={server.flow_label} "
+                f"target={server.flow_target} callback accepted state=match "
+                f"result=oauth_error"
+            )
+            self._send_page(400, "Authorization Failed", "EVE SSO declined the login.")
+            return
+
+        self._reject("malformed", "The authorization response was malformed.")
 
 
 # Only one login flow at a time can hold CALLBACK_PORT. server.timeout is
@@ -156,9 +225,91 @@ _SSO_BIND_WAIT = 15      # seconds to wait for a cancelled predecessor to let go
 
 _pending_sso_server = None
 _pending_sso_lock = threading.Lock()
+_sso_attempt_counter = 0
+_latest_sso_attempt_id = 0
 
 
-def perform_sso_callback_flow(auth_url: str):
+@dataclass
+class OAuthLoginAttempt:
+    """Per-login OAuth/PKCE material; never shared between login attempts."""
+
+    attempt_id: int
+    flow_label: str
+    flow_target: str
+    state: Optional[str]
+    code_verifier: Optional[str]
+    authorization_url: Optional[str]
+    created_at: float
+    expires_at: float
+
+    def clear_callback_material(self):
+        self.state = None
+        self.authorization_url = None
+
+    def clear_all(self):
+        self.clear_callback_material()
+        self.code_verifier = None
+
+
+def _is_latest_sso_attempt(attempt_id: int) -> bool:
+    with _pending_sso_lock:
+        return attempt_id == _latest_sso_attempt_id
+
+
+def create_sso_login_attempt(scopes: list[str], flow_label: str,
+                             flow_target: str) -> OAuthLoginAttempt:
+    """Reserve the newest SSO attempt and build its OAuth/PKCE request."""
+    global _sso_attempt_counter, _latest_sso_attempt_id
+
+    code_verifier = generate_code_verifier()
+    code_challenge = generate_code_challenge(code_verifier)
+    state = secrets.token_urlsafe(32)
+    created_at = time.monotonic()
+
+    with _pending_sso_lock:
+        _sso_attempt_counter += 1
+        attempt_id = _sso_attempt_counter
+        _latest_sso_attempt_id = attempt_id
+        previous = _pending_sso_server
+        if previous is not None:
+            previous.sso_cancelled = True
+
+    params = {
+        "response_type": "code",
+        "redirect_uri": CALLBACK_URL,
+        "client_id": CLIENT_ID,
+        "scope": " ".join(scopes),
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    query = "&".join(
+        f"{key}={requests.utils.quote(str(value))}"
+        for key, value in params.items()
+    )
+    attempt = OAuthLoginAttempt(
+        attempt_id=attempt_id,
+        flow_label=flow_label,
+        flow_target=flow_target,
+        state=state,
+        code_verifier=code_verifier,
+        authorization_url=f"{AUTH_URL}?{query}",
+        created_at=created_at,
+        expires_at=created_at + SSO_FLOW_TIMEOUT,
+    )
+    print(
+        f"[AuthState] attempt={attempt_id} flow={flow_label} "
+        f"target={flow_target} created timeout={SSO_FLOW_TIMEOUT}s"
+    )
+    if previous is not None:
+        print(
+            f"[AuthState] attempt={previous.attempt_id} flow={previous.flow_label} "
+            f"target={previous.flow_target} superseded by attempt={attempt_id}"
+        )
+    return attempt
+
+
+def perform_sso_callback_flow(attempt: OAuthLoginAttempt):
     """Bind the callback port, open the SSO page, wait for the redirect.
 
     Returns (auth_code, error) — exactly one is set. The port is released on
@@ -167,48 +318,83 @@ def perform_sso_callback_flow(auth_url: str):
     """
     global _pending_sso_server
 
-    with _pending_sso_lock:
-        prev = _pending_sso_server
-    if prev is not None:
-        prev.sso_cancelled = True  # its thread notices within _SSO_POLL_SECONDS
+    if not _is_latest_sso_attempt(attempt.attempt_id):
+        attempt.clear_callback_material()
+        print(
+            f"[AuthState] attempt={attempt.attempt_id} flow={attempt.flow_label} "
+            f"target={attempt.flow_target} stopped before listener reason=superseded"
+        )
+        return None, "Login attempt replaced by a newer one"
 
     server = None
     bind_deadline = time.monotonic() + _SSO_BIND_WAIT
     while server is None:
+        if not _is_latest_sso_attempt(attempt.attempt_id):
+            attempt.clear_callback_material()
+            return None, "Login attempt replaced by a newer one"
         try:
             server = HTTPServer(("localhost", CALLBACK_PORT), OAuthCallbackHandler)
         except OSError as e:
             if time.monotonic() >= bind_deadline:
+                print(
+                    f"[AuthState] attempt={attempt.attempt_id} "
+                    f"flow={attempt.flow_label} target={attempt.flow_target} "
+                    f"listener stopped reason=port_unavailable"
+                )
                 return None, (f"Port {CALLBACK_PORT} is in use "
                               f"(maybe another program): {e}")
             time.sleep(0.5)
 
     server.auth_code = None
     server.auth_error = None
+    server.auth_complete = False
     server.sso_cancelled = False
+    server.state_consumed = False
+    server.expected_state = attempt.state
+    server.attempt_id = attempt.attempt_id
+    server.flow_label = attempt.flow_label
+    server.flow_target = attempt.flow_target
+    server.expires_at = attempt.expires_at
     server.timeout = _SSO_POLL_SECONDS
 
     with _pending_sso_lock:
+        if attempt.attempt_id != _latest_sso_attempt_id:
+            server.server_close()
+            attempt.clear_callback_material()
+            return None, "Login attempt replaced by a newer one"
         _pending_sso_server = server
 
     try:
-        opened = _open_url_robust(auth_url)
+        print(
+            f"[AuthState] attempt={attempt.attempt_id} flow={attempt.flow_label} "
+            f"target={attempt.flow_target} listener opened"
+        )
+        opened = _open_url_robust(attempt.authorization_url)
 
-        # Surface URL if auto-open failed, but keep listening: EVE redirects
-        # to localhost:8888 regardless of how the auth page was reached, so
-        # paste-manually completes the same flow.
+        # Never print the authorization URL: it contains the active state and
+        # PKCE challenge, and stdout is persisted to eve_scout.log.
         if not opened:
-            print("=" * 70)
-            print("BROWSER DID NOT OPEN AUTOMATICALLY.")
-            print("Paste this URL into any browser to continue login:")
-            print(auth_url)
-            print("=" * 70)
+            print(
+                f"[AuthState] attempt={attempt.attempt_id} "
+                f"flow={attempt.flow_label} target={attempt.flow_target} "
+                f"listener stopped reason=browser_open_failed"
+            )
+            return None, "Could not open the EVE login page; click login to retry"
 
-        deadline = time.monotonic() + SSO_FLOW_TIMEOUT
-        while server.auth_code is None and server.auth_error is None:
+        while not server.auth_complete:
             if server.sso_cancelled:
+                print(
+                    f"[AuthState] attempt={attempt.attempt_id} "
+                    f"flow={attempt.flow_label} target={attempt.flow_target} "
+                    f"listener stopped reason=superseded"
+                )
                 return None, "Login attempt replaced by a newer one"
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= attempt.expires_at:
+                print(
+                    f"[AuthState] attempt={attempt.attempt_id} "
+                    f"flow={attempt.flow_label} target={attempt.flow_target} "
+                    f"listener stopped reason=expired"
+                )
                 return None, (f"Login timed out after {SSO_FLOW_TIMEOUT // 60} "
                               "minutes - click login again to retry")
             server.handle_request()
@@ -221,6 +407,12 @@ def perform_sso_callback_flow(auth_url: str):
             server.server_close()
         except Exception:
             pass
+        server.expected_state = None
+        attempt.clear_callback_material()
+        print(
+            f"[AuthState] attempt={attempt.attempt_id} flow={attempt.flow_label} "
+            f"target={attempt.flow_target} listener closed"
+        )
 
 
 class CharacterAuth:
@@ -281,12 +473,6 @@ class ESIAuth:
         # Two character slots
         self.seller: Optional[CharacterAuth] = None  # Primary - always used for selling
         self.buyer: Optional[CharacterAuth] = None   # Secondary - used for buying in cross-hub
-
-        # Track which slot we're authenticating
-        self._pending_slot: str = "seller"
-
-        # PKCE: store code_verifier during auth flow
-        self._code_verifier: Optional[str] = None
 
         # Serializes token refresh + auth-file writes (RLock: refresh holds
         # it while calling _save_auth). Concurrent refreshes with the same
@@ -479,26 +665,6 @@ class ESIAuth:
     # OAUTH FLOW (PKCE)
     # =========================================================================
 
-    def get_auth_url(self) -> str:
-        """Generate the authorization URL with PKCE challenge."""
-        # Generate new PKCE verifier for this auth attempt
-        self._code_verifier = generate_code_verifier()
-        code_challenge = generate_code_challenge(self._code_verifier)
-
-        scopes = " ".join(REQUIRED_SCOPES)
-        params = {
-            "response_type": "code",
-            "redirect_uri": CALLBACK_URL,
-            "client_id": CLIENT_ID,
-            "scope": scopes,
-            "state": "eve_market_scout",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256"
-        }
-
-        query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
-        return f"{AUTH_URL}?{query}"
-
     def start_auth_flow(self, callback: Optional[Callable[[bool, str], None]] = None, slot: str = "seller"):
         """
         Start OAuth flow in background thread.
@@ -507,18 +673,29 @@ class ESIAuth:
             callback: Function(success: bool, message: str) called when complete
             slot: Which character slot to authenticate ("seller" or "buyer")
         """
-        self._pending_slot = slot
+        target_slot = "buyer" if slot == "buyer" else "seller"
+        attempt = create_sso_login_attempt(
+            REQUIRED_SCOPES, flow_label="trading", flow_target=target_slot
+        )
         
         def do_auth():
             try:
-                code, error = perform_sso_callback_flow(self.get_auth_url())
+                code, error = perform_sso_callback_flow(attempt)
 
                 if code:
-                    success, error_detail = self._exchange_code(code)
+                    success, error_detail = self._exchange_code(
+                        code, attempt.code_verifier, target_slot
+                    )
+                    outcome = "succeeded" if success else "failed"
+                    print(
+                        f"[AuthState] attempt={attempt.attempt_id} "
+                        f"flow={attempt.flow_label} target={attempt.flow_target} "
+                        f"token exchange {outcome}"
+                    )
                     if success:
-                        char = self.get_character(self._pending_slot)
+                        char = self.get_character(target_slot)
                         if callback:
-                            callback(True, f"Logged in as {char.character_name} ({self._pending_slot})")
+                            callback(True, f"Logged in as {char.character_name} ({target_slot})")
                     elif callback:
                         callback(False, f"Failed to exchange code: {error_detail}")
                 else:
@@ -526,19 +703,27 @@ class ESIAuth:
                         callback(False, f"Authorization failed: {error}")
 
             except Exception as e:
+                print(
+                    f"[AuthState] attempt={attempt.attempt_id} "
+                    f"flow={attempt.flow_label} target={attempt.flow_target} "
+                    f"failed exception={type(e).__name__}"
+                )
                 if callback:
                     callback(False, str(e))
+            finally:
+                attempt.clear_all()
 
         thread = threading.Thread(target=do_auth, daemon=True)
         thread.start()
 
-    def _exchange_code(self, code: str):
+    def _exchange_code(self, code: str, code_verifier: Optional[str],
+                       target_slot: str):
         """Exchange authorization code for tokens using PKCE.
         
         Returns:
             (True, "") on success, (False, error_detail) on failure.
         """
-        if not self._code_verifier:
+        if not code_verifier:
             print("Error: No code verifier available")
             return False, "No PKCE code verifier (auth flow state lost)"
             
@@ -549,7 +734,7 @@ class ESIAuth:
                     "grant_type": "authorization_code",
                     "code": code,
                     "client_id": CLIENT_ID,
-                    "code_verifier": self._code_verifier
+                    "code_verifier": code_verifier
                 },
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -575,7 +760,7 @@ class ESIAuth:
             # Verify and get character info
             if self._verify_token(new_char):
                 # Assign to correct slot
-                if self._pending_slot == "buyer":
+                if target_slot == "buyer":
                     self.buyer = new_char
                 else:
                     self.seller = new_char
@@ -587,10 +772,6 @@ class ESIAuth:
         except requests.RequestException as e:
             print(f"Error exchanging code: {e}")
             return False, f"Network error: {e}"
-        finally:
-            # Clear verifier after use
-            self._code_verifier = None
-
     def _verify_token(self, char: CharacterAuth) -> bool:
         """Verify token and get character info."""
         try:

@@ -28,12 +28,9 @@ from core.sound_manager import get_data_dir
 from core.config import ESI_USER_AGENT
 from esi.esi_auth import (
     CharacterAuth,
-    generate_code_verifier,
-    generate_code_challenge,
+    create_sso_login_attempt,
     perform_sso_callback_flow,
     CLIENT_ID,
-    CALLBACK_URL,
-    AUTH_URL,
     TOKEN_URL,
     VERIFY_URL,
 )
@@ -84,7 +81,6 @@ class IndustryRoster:
 
     def __init__(self):
         self.characters: List[RosterCharacter] = []
-        self._code_verifier: Optional[str] = None
         self._load()
 
     @classmethod
@@ -167,24 +163,6 @@ class IndustryRoster:
     # OAUTH FLOW (PKCE) - mirrors ESIAuth but with INDUSTRY_SCOPES
     # =========================================================================
 
-    def _get_auth_url(self) -> str:
-        self._code_verifier = generate_code_verifier()
-        code_challenge = generate_code_challenge(self._code_verifier)
-        scopes = " ".join(INDUSTRY_SCOPES)
-        params = {
-            "response_type": "code",
-            "redirect_uri": CALLBACK_URL,
-            "client_id": CLIENT_ID,
-            "scope": scopes,
-            "state": "eve_market_scout_industry",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-        }
-        query = "&".join(
-            f"{k}={requests.utils.quote(str(v))}" for k, v in params.items()
-        )
-        return f"{AUTH_URL}?{query}"
-
     def start_auth_flow(self, callback: Optional[Callable[[bool, str], None]] = None,
                         expected_character_id: int = None):
         """Start OAuth flow in a background thread to add/refresh a roster char.
@@ -204,13 +182,29 @@ class IndustryRoster:
                 callback(False, f"Roster full ({MAX_CHARACTERS} characters max)")
             return
 
+        flow_target = "refresh" if expected_character_id is not None else "add"
+        attempt = create_sso_login_attempt(
+            INDUSTRY_SCOPES,
+            flow_label="industry",
+            flow_target=flow_target,
+        )
+
         def do_auth():
             try:
-                code, error = perform_sso_callback_flow(self._get_auth_url())
+                code, error = perform_sso_callback_flow(attempt)
 
                 if code:
                     success, detail = self._exchange_code(
-                        code, expected_character_id=expected_character_id)
+                        code,
+                        code_verifier=attempt.code_verifier,
+                        expected_character_id=expected_character_id,
+                    )
+                    outcome = "succeeded" if success else "failed"
+                    print(
+                        f"[AuthState] attempt={attempt.attempt_id} "
+                        f"flow={attempt.flow_label} target={attempt.flow_target} "
+                        f"token exchange {outcome}"
+                    )
                     if success and callback:
                         callback(True, detail)
                     elif callback:
@@ -219,14 +213,22 @@ class IndustryRoster:
                     callback(False, f"Authorization failed: {error}")
 
             except Exception as e:
+                print(
+                    f"[AuthState] attempt={attempt.attempt_id} "
+                    f"flow={attempt.flow_label} target={attempt.flow_target} "
+                    f"failed exception={type(e).__name__}"
+                )
                 if callback:
                     callback(False, str(e))
+            finally:
+                attempt.clear_all()
 
         threading.Thread(target=do_auth, daemon=True).start()
 
-    def _exchange_code(self, code: str, expected_character_id: int = None):
+    def _exchange_code(self, code: str, code_verifier: Optional[str],
+                       expected_character_id: int = None):
         """Exchange the auth code for tokens. Returns (success, message)."""
-        if not self._code_verifier:
+        if not code_verifier:
             return False, "No PKCE code verifier (auth flow state lost)"
         try:
             response = requests.post(
@@ -235,7 +237,7 @@ class IndustryRoster:
                     "grant_type": "authorization_code",
                     "code": code,
                     "client_id": CLIENT_ID,
-                    "code_verifier": self._code_verifier,
+                    "code_verifier": code_verifier,
                 },
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -274,9 +276,6 @@ class IndustryRoster:
 
         except requests.RequestException as e:
             return False, f"Network error: {e}"
-        finally:
-            self._code_verifier = None
-
     def _verify_token(self, char: RosterCharacter) -> bool:
         try:
             response = requests.get(
