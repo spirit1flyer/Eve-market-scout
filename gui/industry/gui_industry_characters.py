@@ -1,10 +1,10 @@
 """Characters sub-tab for the Industry tab (Phase 2.4).
 
-Minimal roster cards: portrait + name, with [Skills] / [Standings] / [Remove]
-buttons and an [Add character] login. Skills dialog shows the pulled industry
-skill levels plus the write-in implant % fields (time-only, never cost — see
-PLAN_industry_tab.md S1) and a re-pull button. Standings dialog is display-only
-(kept for future; zero effect on T1 job cost).
+Minimal roster cards: portrait + name, with [Skills] / [Standings] /
+[Refresh login] / [Remove] buttons and an [Add character] login. Skills dialog
+shows the pulled industry skill levels plus the write-in implant % fields
+(time-only, never cost — see PLAN_industry_tab.md S1) and a re-pull button.
+Standings dialog is display-only (kept for future; zero effect on T1 job cost).
 
 All ESI work (login, skill/standing pulls, portrait download) runs in worker
 threads and marshals back to the UI via `tk_queue.submit`. Backend lives in
@@ -134,6 +134,9 @@ class CharactersPanel:
             if meta and meta.get("last_pulled"):
                 ttk.Label(info, text=f"{meta.get('count', 0)} blueprints pulled",
                           foreground=CLR_MUTED).pack(anchor="w")
+        ttk.Button(btns, text="Refresh login",
+                   command=lambda c=char: self._refresh_login(c)
+                   ).pack(side=tk.LEFT, padx=2)
         ttk.Button(btns, text="Remove",
                    command=lambda c=char: self._remove(c)).pack(side=tk.LEFT, padx=2)
 
@@ -179,12 +182,20 @@ class CharactersPanel:
         self.roster.start_auth_flow(
             callback=lambda ok, msg: submit(lambda: self._on_auth_done(ok, msg)))
 
-    def _on_auth_done(self, ok, msg):
+    def _refresh_login(self, char):
+        self.set_status(
+            f"Industry: opening EVE login for {char.character_name}…")
+        self.roster.start_auth_flow(
+            expected_character_id=char.character_id,
+            callback=lambda ok, msg: submit(
+                lambda: self._on_auth_done(ok, msg, char.character_id)))
+
+    def _on_auth_done(self, ok, msg, character_id=None):
         self.set_status(f"Industry: {msg}")
         if ok:
             self.refresh_cards()
             if self.on_authenticated:
-                self.on_authenticated()
+                self.on_authenticated(character_id)
 
     def _remove(self, char):
         self.roster.remove(char.character_id)

@@ -185,12 +185,21 @@ class IndustryRoster:
         )
         return f"{AUTH_URL}?{query}"
 
-    def start_auth_flow(self, callback: Optional[Callable[[bool, str], None]] = None):
+    def start_auth_flow(self, callback: Optional[Callable[[bool, str], None]] = None,
+                        expected_character_id: int = None):
         """Start OAuth flow in a background thread to add/refresh a roster char.
 
         callback(success: bool, message: str) is called when complete.
+        When expected_character_id is set, only that existing roster character
+        may complete the flow. This prevents a card-level refresh from replacing
+        or adding the wrong character when EVE SSO has another account selected.
         """
-        if self.is_full:
+        expected = self.get(expected_character_id) if expected_character_id else None
+        if expected_character_id and not expected:
+            if callback:
+                callback(False, f"Character {expected_character_id} is not in the roster")
+            return
+        if not expected_character_id and self.is_full:
             if callback:
                 callback(False, f"Roster full ({MAX_CHARACTERS} characters max)")
             return
@@ -200,7 +209,8 @@ class IndustryRoster:
                 code, error = perform_sso_callback_flow(self._get_auth_url())
 
                 if code:
-                    success, detail = self._exchange_code(code)
+                    success, detail = self._exchange_code(
+                        code, expected_character_id=expected_character_id)
                     if success and callback:
                         callback(True, detail)
                     elif callback:
@@ -214,7 +224,7 @@ class IndustryRoster:
 
         threading.Thread(target=do_auth, daemon=True).start()
 
-    def _exchange_code(self, code: str):
+    def _exchange_code(self, code: str, expected_character_id: int = None):
         """Exchange the auth code for tokens. Returns (success, message)."""
         if not self._code_verifier:
             return False, "No PKCE code verifier (auth flow state lost)"
@@ -244,7 +254,21 @@ class IndustryRoster:
             new_char.token_expiry = datetime.now() + timedelta(seconds=expires_in)
 
             if self._verify_token(new_char):
+                if (expected_character_id is not None
+                        and new_char.character_id != expected_character_id):
+                    expected = self.get(expected_character_id)
+                    expected_name = (expected.character_name if expected else
+                                     str(expected_character_id))
+                    selected_name = (new_char.character_name or
+                                     str(new_char.character_id))
+                    print(f"[IndustryRoster] Refresh login mismatch: expected "
+                          f"{expected_character_id}, selected {new_char.character_id}")
+                    return False, (f"Selected {selected_name}; choose "
+                                   f"{expected_name} to refresh this login")
                 self._upsert(new_char)
+                if expected_character_id is not None:
+                    print(f"[IndustryRoster] Refreshed login for "
+                          f"{new_char.character_name} ({new_char.character_id})")
                 return True, f"Logged in as {new_char.character_name}"
             return False, "Token verify failed (could not get character info)"
 

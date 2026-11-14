@@ -1273,14 +1273,16 @@ class IndustryTabManager:
         messagebox.showwarning(
             "Character Login Required",
             f"Relog in character {name}\n\n"
-            "Open Industry > Characters and use Add character (EVE login).",
+            f"Open Industry > Characters and use Refresh login beside {name}.",
             parent=self.frame,
         )
 
-    def _on_industry_character_authenticated(self):
+    def _on_industry_character_authenticated(self, authenticated_id=None):
         """Retry skill warms that were paused pending an Industry SSO login."""
         waiting = list(self._skill_login_waiting.items())
         for char_id, tid in waiting:
+            if authenticated_id is not None and char_id != authenticated_id:
+                continue
             self._skill_login_waiting.pop(char_id, None)
             self._skill_warm_attempts.pop(char_id, None)
             if self._built_by.get(tid) != char_id:
