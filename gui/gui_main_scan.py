@@ -244,6 +244,12 @@ class MainScanMixin:
     def _set_refresh_timing(self, seconds: float):
         """Store ESI cache expiry timing for next refresh."""
         self.next_refresh_seconds = int(seconds) if seconds > 0 else AUTO_REFRESH_INTERVAL
+        reason = "esi_expiry" if seconds > 0 else "fallback"
+        print(
+            "[ESI-Timing] resource=regional_orders trigger=scanner "
+            f"decision=SCHEDULE reason={reason} "
+            f"next_in={self.next_refresh_seconds}s"
+        )
 
     def _scan_complete(self):
         """Called when scan finishes."""

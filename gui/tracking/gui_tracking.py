@@ -567,12 +567,15 @@ class TrackingTabManager:
         if not can_refresh and seconds_remaining > 0:
             mins = seconds_remaining // 60
             secs = seconds_remaining % 60
+            print(f"[ESI-Timing] resource=skills_standings trigger=manual decision=SKIP reason=esi_cache next_in={seconds_remaining}s")
             self.set_status(f"Skills cache valid for {mins}m {secs}s")
             return
         
         # Disable button during refresh
         self.skills_btn.configure(state=tk.DISABLED)
         self.set_status("Refreshing skills/standings...")
+        slots = "seller,buyer" if getattr(self.auth, "has_buyer", False) else "seller"
+        print(f"[ESI-Timing] resource=skills_standings trigger=manual decision=FETCH slots={slots}")
         
         def do_fetch():
             """Background thread work."""
@@ -844,10 +847,9 @@ class TrackingTabManager:
                     # Update auth display first
                     self._update_auth_display()
                     
-                    # Fetch skills async (non-blocking)
-                    self._refresh_skills_async()
-                    
-                    self.set_status(f"{message} - fetching skills...")
+                    # Login establishes authorization; character data is on-demand.
+                    print(f"[ESI-Timing] resource=skills_standings trigger=login decision=MANUAL_ONLY slot={slot}")
+                    self.set_status(f"{message} - use Refresh Skills when needed")
                     
                     if slot == "seller":
                         if self.auto_refresh_var.get():
@@ -932,21 +934,18 @@ class TrackingTabManager:
         self.skills, self.buyer_skills = self.buyer_skills, self.skills
         self.tracker.set_skills(self.skills)
         
-        # Clear all caches to force fresh fetches
+        # Characters moved, so clear caches but leave fetching on-demand.
         if self.esi_skills:
             self.esi_skills.clear_cache()
         if self.esi_standings:
             self.esi_standings.clear_cache()
+        print("[ESI-Timing] resource=skills_standings trigger=swap decision=MANUAL_ONLY")
         
         # Clear any stale hub overrides from prior calls
         self._sell_hub_override = None
         self._buy_hub_override = None
         
-        # Re-fetch both characters with fresh data
-        self.refresh_all_character_data()
-        
         # Refresh wallet/orders/transactions for the new seller
-        # (skills fetch above is async; wallet refresh runs in parallel)
         if self.wallet:
             self.sync_manager.refresh_esi_data()
         
@@ -956,7 +955,7 @@ class TrackingTabManager:
         if self._on_characters_changed:
             self._on_characters_changed()
         
-        self.set_status(f"Swapped: Seller={self.auth.seller_name}, Buyer={self.auth.buyer_name}")
+        self.set_status(f"Swapped: Seller={self.auth.seller_name}, Buyer={self.auth.buyer_name} - use Refresh Skills when needed")
 
     def _toggle_auto_refresh(self):
         """Toggle auto-refresh on/off."""

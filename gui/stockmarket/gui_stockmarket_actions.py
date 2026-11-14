@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import asyncio
 import threading
+from datetime import datetime, timezone
 from typing import Dict, List, TYPE_CHECKING
 
 from core.tk_queue import submit
@@ -33,6 +34,8 @@ class StockMarketActionsMixin:
         - percentile_label: ttk.Label
         - sde_label: ttk.Label
     """
+
+    _HOLDINGS_FRESHEN_MIN_INTERVAL = 60 * 60
     
     # =========================================================================
     # Add Item
@@ -167,6 +170,7 @@ class StockMarketActionsMixin:
         def fetch():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            client = None
             
             try:
                 client = self.get_client()
@@ -177,8 +181,29 @@ class StockMarketActionsMixin:
                 async def do_fetch():
                     client.ensure_session()
                     client.reset_for_new_loop()
-                    # Manual refresh — bypass cache, always hit ESI
-                    return await client.get_market_orders(region_id, force_refresh=True)
+                    timing = client.order_cache.get_cache_timing(region_id)
+                    age = timing['age_seconds']
+                    expires_in = timing['expires_in_seconds']
+                    age_text = f"{age:.0f}s" if age is not None else "none"
+                    expires_text = (
+                        f"{expires_in:.0f}s"
+                        if expires_in is not None else "unknown"
+                    )
+                    decision = 'CACHE' if timing['reusable'] else 'FETCH'
+                    print(
+                        "[ESI-Timing] resource=regional_orders "
+                        f"trigger=stock_manual region={region_id} "
+                        f"decision={decision} "
+                        f"reason={timing['reason']} "
+                        f"age={age_text} expires_in={expires_text} "
+                        f"orders={timing['order_count']}"
+                    )
+                    # Re-run the Stock Market update on every click, but let
+                    # the shared order cache enforce ESI's expiry window.  A
+                    # missing/expired snapshot still pulls the full region;
+                    # a fresh snapshot is reapplied to panels without asking
+                    # ESI for the same cached representation again.
+                    return await client.get_market_orders(region_id)
                 
                 orders = loop.run_until_complete(do_fetch())
                 
@@ -189,9 +214,69 @@ class StockMarketActionsMixin:
                 err_msg = str(e)
                 submit(lambda msg=err_msg: self.set_status(f"Error: {msg}"))
             finally:
+                if client is not None:
+                    client.close_loop_state(loop)
                 loop.close()
         
         threading.Thread(target=fetch, daemon=True).start()
+
+    def _freshen_holdings_for_hub(self, hub_key, panel, client):
+        """Fetch tracked-item history at most hourly per hub."""
+        if self._stock_market_off() or not client:
+            return
+        holdings_panel = getattr(panel, "holdings_panel", None)
+        if holdings_panel is None:
+            return
+        type_ids = [e.type_id for e in holdings_panel.holdings.get_all()]
+        if not type_ids:
+            return
+        now = datetime.now(timezone.utc)
+        last = self._holdings_freshen_ts.get(hub_key)
+        if last is not None:
+            age = (now - last).total_seconds()
+            if age < self._HOLDINGS_FRESHEN_MIN_INTERVAL:
+                next_in = self._HOLDINGS_FRESHEN_MIN_INTERVAL - age
+                print(
+                    "[ESI-Timing] resource=market_history "
+                    f"trigger=holdings_tab hub={hub_key} decision=SKIP "
+                    f"reason=hourly_interval age={age:.0f}s "
+                    f"next_in={next_in:.0f}s items={len(type_ids)}"
+                )
+                return
+        age_text = f"{(now - last).total_seconds():.0f}s" if last else "never"
+        print(
+            "[ESI-Timing] resource=market_history "
+            f"trigger=holdings_tab hub={hub_key} decision=FETCH "
+            f"reason=due age={age_text} items={len(type_ids)}"
+        )
+        self._holdings_freshen_ts[hub_key] = now
+        region_id = holdings_panel.region_id
+
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                async def do_freshen():
+                    client.ensure_session()
+                    client.reset_for_new_loop()
+                    await client.freshen_history_for_items(region_id, type_ids)
+                loop.run_until_complete(do_freshen())
+                self._holdings_freshen_ts[hub_key] = datetime.now(timezone.utc)
+                print(
+                    "[ESI-Timing] resource=market_history "
+                    f"trigger=holdings_tab hub={hub_key} decision=FETCHED "
+                    f"items={len(type_ids)}"
+                )
+                submit(holdings_panel._schedule_refresh)
+            except Exception as e:
+                if self._holdings_freshen_ts.get(hub_key) == now:
+                    self._holdings_freshen_ts.pop(hub_key, None)
+                print(f"[StockMarket-{hub_key}] holdings ESI freshen failed: {e}")
+            finally:
+                client.close_loop_state(loop)
+                loop.close()
+
+        threading.Thread(target=run, daemon=True).start()
     
     def _validate_refresh_prerequisites(self, hub_key: str) -> bool:
         """Validate prerequisites for price refresh. Returns True if OK."""

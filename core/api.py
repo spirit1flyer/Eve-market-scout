@@ -16,6 +16,7 @@ from esi.esi_supplement import ESISupplementCache
 from history.market_history import MarketHistoryDB
 from core.ssl_context import make_connector
 from core.order_cache import OrderCacheStore
+from core.market_snapshot import ESIPaginationChangedError, fetch_market_snapshot
 from core.type_name_mixin import TypeNameMixin
 
 # Local debug flag - set True to enable diagnostic output
@@ -172,7 +173,7 @@ class ESIClient(TypeNameMixin):
 
     async def _fetch_pages_staged(
         self, endpoint: str, pages: list[int]
-    ) -> dict[int, list]:
+    ) -> tuple[dict[int, list], dict[int, Optional[str]], set[int]]:
         """Fetch `pages` of one region, retrying timed-out pages at
         progressively lower concurrency: 20 -> 10 -> 5 -> 2 -> 1.
 
@@ -182,11 +183,14 @@ class ESIClient(TypeNameMixin):
         a link that's already struggling. That's the difference from a global
         dial: the in-flight count for the *failing* pages is actually bounded.
 
-        Returns {page -> orders}. 404 (stale pagination) counts as an empty,
-        resolved page. If pages still time out at concurrency 1, the link
-        can't move the data — hard-halt and raise ESIConnectionHaltedError.
+        Returns page data, each page's Last-Modified validator, and the set
+        of pages that returned 404 because pagination changed mid-pull. If
+        pages still time out at concurrency 1, the link can't move the data —
+        hard-halt and raise ESIConnectionHaltedError.
         """
         results: dict[int, list] = {}
+        validators: dict[int, Optional[str]] = {}
+        stale_pages: set[int] = set()
         remaining = list(pages)
         concurrency = MAX_CONCURRENT_REQUESTS
 
@@ -202,11 +206,17 @@ class ESIClient(TypeNameMixin):
             async def fetch_one(p: int):
                 async with sem:
                     try:
-                        orders = await self._get(endpoint, {"page": p})
-                        return p, orders
+                        orders, headers = await self._get_with_headers(
+                            endpoint, {"page": p}
+                        )
+                        last_modified = (
+                            headers.get("Last-Modified")
+                            or headers.get("last-modified")
+                        )
+                        return p, orders, last_modified, False
                     except aiohttp.ClientResponseError as e:
                         if e.status == 404:
-                            return p, []  # page gone (stale pagination)
+                            return p, [], None, True
                         if e.status in (500, 502, 503, 504):
                             # Transient ESI/gateway error (500 backend error,
                             # 502/503/504 gateway) — treat like a timeout: mark
@@ -217,7 +227,7 @@ class ESIClient(TypeNameMixin):
                                 f"[ESI] HTTP {e.status} on {endpoint} page {p} "
                                 f"(concurrency {cur}) — retrying"
                             )
-                            return p, None
+                            return p, None, None, False
                         raise
                     except (asyncio.TimeoutError, TimeoutError):
                         # Live heartbeat — surface each timeout as it happens
@@ -226,16 +236,19 @@ class ESIClient(TypeNameMixin):
                             f"[ESI] Timeout on {endpoint} page {p} "
                             f"(concurrency {cur})"
                         )
-                        return p, None  # mark for a gentler retry wave
+                        return p, None, None, False
 
             wave = await asyncio.gather(*[fetch_one(p) for p in remaining])
 
             failed = []
-            for p, orders in wave:
+            for p, orders, last_modified, is_stale in wave:
                 if orders is None:
                     failed.append(p)
                 else:
                     results[p] = orders
+                    validators[p] = last_modified
+                    if is_stale:
+                        stale_pages.add(p)
 
             print(
                 f"[ESI-Adapt] {endpoint}: concurrency {cur} wave done — "
@@ -260,7 +273,7 @@ class ESIClient(TypeNameMixin):
             )
             remaining = failed
 
-        return results
+        return results, validators, stale_pages
 
     def _notify_halt(self):
         """Pop a one-time user-facing error that ESI has been halted."""
@@ -518,8 +531,9 @@ class ESIClient(TypeNameMixin):
                 f"— resuming ESI requests"
             )
 
-    async def _get(self, endpoint: str, params: dict = None) -> dict | list:
-        """Rate-limited GET. Honors X-ESI-Error-Limit-* and 429 Retry-After.
+    async def _get_with_headers(self, endpoint: str,
+                                params: dict = None) -> tuple[dict | list, dict]:
+        """Rate-limited GET returning JSON plus response-header metadata.
 
         429s get one automatic retry after sleeping for `Retry-After` seconds;
         any other 4xx/5xx falls through to `raise_for_status()` as before so
@@ -548,10 +562,15 @@ class ESIClient(TypeNameMixin):
                             f"retry — giving up, raising"
                         )
                     response.raise_for_status()
-                    return await response.json()
+                    return await response.json(), dict(response.headers)
         # Unreachable — the loop always returns or raises — but kept for type
         # checkers that can't prove that.
-        raise RuntimeError("ESI _get fell through retry loop unexpectedly")
+        raise RuntimeError("ESI _get_with_headers fell through retry loop unexpectedly")
+
+    async def _get(self, endpoint: str, params: dict = None) -> dict | list:
+        """Rate-limited GET. Honors ESI error-budget and 429 headers."""
+        data, _headers = await self._get_with_headers(endpoint, params)
+        return data
 
     async def get_system_info(self, system_id: int) -> dict:
         """Get system info including security status and stargates."""
@@ -732,49 +751,29 @@ class ESIClient(TypeNameMixin):
                     return cached
 
             self._check_halted()
-            all_orders = []
+            for snapshot_attempt in range(2):
+                try:
+                    all_orders, expires, total_pages = (
+                        await fetch_market_snapshot(self, region_id)
+                    )
+                    break
+                except ESIPaginationChangedError as e:
+                    decision = "RETRY" if snapshot_attempt == 0 else "REJECT"
+                    print(
+                        "[ESI-Timing] resource=regional_orders "
+                        f"trigger=page_validation region={region_id} "
+                        f"decision={decision} reason=representation_changed "
+                        f"details={e}"
+                    )
+                    if snapshot_attempt == 1:
+                        raise
 
-            url = f"{ESI_BASE_URL}/markets/{region_id}/orders/"
-            orders_endpoint = f"/markets/{region_id}/orders/"
-            await self._await_rate_limit_pause()
-            async with self.semaphore:
-                # Mirror _get's 429 retry but keep the response object live so
-                # we can read X-Pages / Cache-Control before the body parse.
-                for attempt in range(2):
-                    async with self.session.get(url, params={"page": 1}) as response:
-                        self._record_response_headers(response, orders_endpoint)
-                        if response.status == 429 and attempt == 0:
-                            retry_after = max(
-                                1, int(response.headers.get("Retry-After", "1") or "1")
-                            )
-                            print(
-                                f"[ESI-RL] HTTP 429 on {orders_endpoint} — "
-                                f"Retry-After {retry_after}s, sleeping then retrying once"
-                            )
-                            await asyncio.sleep(retry_after)
-                            continue
-                        if response.status == 429:
-                            print(
-                                f"[ESI-RL] HTTP 429 on {orders_endpoint} AGAIN "
-                                f"after retry — giving up, raising"
-                            )
-                        response.raise_for_status()
-                        total_pages = int(response.headers.get("X-Pages", 1))
-                        expires = self._parse_expires_header(response)
-                        self._apply_earliest_expires(expires)
-                        all_orders.extend(await response.json())
-                        break
-
-            if total_pages > 1:
-                # Staged retry: pages 2..N as one unit of demand, timed-out
-                # pages re-attempted at progressively lower concurrency rather
-                # than stacking fresh requests on a struggling link.
-                page_results = await self._fetch_pages_staged(
-                    orders_endpoint, list(range(2, total_pages + 1))
-                )
-                for page_orders in page_results.values():
-                    if page_orders:
-                        all_orders.extend(page_orders)
+            self._apply_earliest_expires(expires)
+            print(
+                "[ESI-Timing] resource=regional_orders trigger=page_validation "
+                f"region={region_id} decision=ACCEPT pages={total_pages} "
+                f"orders={len(all_orders)}"
+            )
 
             self.order_cache.cache_orders_for_region(region_id, all_orders, expires=expires)
 

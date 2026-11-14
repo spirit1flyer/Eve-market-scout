@@ -246,8 +246,6 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
             except Exception:
                 pass
 
-    _HOLDINGS_FRESHEN_MIN_INTERVAL = 60  # seconds; rapid tab-switch debounce
-
     def _on_hub_tab_changed(self, event=None):
         if self._stock_market_off():
             return
@@ -290,43 +288,6 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
             f"first_render_kick={_step_first_render*1000:.0f}ms "
             f"freshen_spawn={_step_freshen_spawn*1000:.0f}ms"
         )
-
-    def _freshen_holdings_for_hub(self, hub_key, panel, client):
-        if self._stock_market_off():
-            return
-        if not client:
-            return
-        holdings_panel = getattr(panel, "holdings_panel", None)
-        if holdings_panel is None:
-            return
-        type_ids = [e.type_id for e in holdings_panel.holdings.get_all()]
-        if not type_ids:
-            return
-        now = datetime.now(timezone.utc)
-        last = self._holdings_freshen_ts.get(hub_key)
-        if last is not None:
-            age = (now - last).total_seconds()
-            if age < self._HOLDINGS_FRESHEN_MIN_INTERVAL:
-                return
-        self._holdings_freshen_ts[hub_key] = now
-        region_id = holdings_panel.region_id
-
-        def run():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                async def do_freshen():
-                    client.ensure_session()
-                    client.reset_for_new_loop()
-                    await client.freshen_history_for_items(region_id, type_ids)
-                loop.run_until_complete(do_freshen())
-                submit(holdings_panel._schedule_refresh)
-            except Exception as e:
-                print(f"[StockMarket-{hub_key}] holdings ESI freshen failed: {e}")
-            finally:
-                loop.close()
-
-        threading.Thread(target=run, daemon=True).start()
 
     # =========================================================================
     # Status Updates

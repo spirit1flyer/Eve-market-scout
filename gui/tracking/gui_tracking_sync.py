@@ -185,6 +185,7 @@ class ESISyncManager:
             # a short wait so the first sync fires quickly and populates the
             # cache; subsequent schedules fall into the floor branch below.
             wait_seconds = 60
+            reason = "bootstrap"
         else:
             # Floor at 20 minutes: matches the NPC Sales tracker's update
             # cadence and aligns with the wallet transactions endpoint's
@@ -192,6 +193,14 @@ class ESISyncManager:
             MIN_REFRESH_SECONDS = 1200
             if wait_seconds < MIN_REFRESH_SECONDS:
                 wait_seconds = MIN_REFRESH_SECONDS
+                reason = "20m_floor"
+            else:
+                reason = "esi_expiry"
+
+        print(
+            "[ESI-Timing] resource=trade_bundle trigger=auto "
+            f"decision=SCHEDULE reason={reason} next_in={wait_seconds:.0f}s"
+        )
 
         # Start countdown
         self._start_countdown(int(wait_seconds))
@@ -232,19 +241,44 @@ class ESISyncManager:
     
     def refresh_esi_data(self, is_auto: bool = False):
         """Refresh wallet data from ESI and sync with tracked trades."""
-        if not self.wallet or self.is_refreshing:
+        trigger = "auto" if is_auto else "manual"
+        if not self.wallet:
+            print(
+                "[ESI-Timing] resource=trade_bundle "
+                f"trigger={trigger} decision=SKIP reason=no_wallet"
+            )
             return
+        if self.is_refreshing:
+            print(
+                "[ESI-Timing] resource=trade_bundle "
+                f"trigger={trigger} decision=SKIP reason=in_flight"
+            )
+            return
+
+        expires_in = self.wallet.get_seconds_until_refresh()
+        print(
+            "[ESI-Timing] resource=trade_bundle "
+            f"trigger={trigger} decision=FETCH "
+            f"orders_expires_in={expires_in:.0f}s"
+        )
         
         self.is_refreshing = True
         if self.refresh_btn:
             self.refresh_btn.configure(state="disabled")
         self.set_status("Refreshing ESI data...")
         
-        # Clear expiry before refresh so we get fresh timing
-        self.wallet.orders_cache_expires = None
-        
         def do_refresh():
             success = self.wallet.refresh_all()
+            next_orders = self.wallet.get_seconds_until_refresh()
+            print(
+                "[ESI-Timing] resource=trade_bundle "
+                f"trigger={trigger} decision={'FETCHED' if success else 'FAILED'} "
+                f"orders_expires_in={next_orders:.0f}s "
+                f"transactions={len(self.wallet.transactions)} "
+                f"journal={len(self.wallet.journal)} "
+                f"orders={len(self.wallet.orders)} "
+                f"order_history={len(self.wallet.order_history)}"
+            )
             
             # Debug: check what orders came back
             print(f"Orders fetched: {len(self.wallet.orders)}")

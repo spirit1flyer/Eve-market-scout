@@ -54,21 +54,58 @@ class OrderCacheStore:
         2. Stored ESI Expires must still be in the future — a cache hit on an
            already-expired entry would poison the scanner's countdown timer.
         """
-        cached = self._order_cache.get(region_id)
-        if not cached:
+        timing = self.get_cache_timing(region_id, max_age_seconds)
+        if not timing['reusable']:
             return None
 
-        now = datetime.now(timezone.utc)
-        age = (now - cached['timestamp']).total_seconds()
-        if age > max_age_seconds:
-            return None
-
-        expires = cached.get('expires')
-        if expires is not None and expires <= now:
-            return None
-
+        cached = self._order_cache[region_id]
+        age = timing['age_seconds']
         print(f"[API] Using cached orders for region {region_id} (age: {age:.0f}s)")
         return cached['orders']
+
+    def get_cache_timing(self, region_id: int,
+                         max_age_seconds: int = 300) -> dict:
+        """Describe whether a regional order snapshot can be reused.
+
+        This is deliberately metadata-only so UI diagnostics can explain a
+        cache decision without inspecting or printing any individual order.
+        The decision exactly mirrors :meth:`get_cached_orders`.
+        """
+        cached = self._order_cache.get(region_id)
+        if not cached:
+            return {
+                'present': False,
+                'reusable': False,
+                'reason': 'missing',
+                'age_seconds': None,
+                'expires_in_seconds': None,
+                'order_count': 0,
+            }
+
+        now = datetime.now(timezone.utc)
+        age = max(0.0, (now - cached['timestamp']).total_seconds())
+        expires = cached.get('expires')
+        expires_in = ((expires - now).total_seconds()
+                      if expires is not None else None)
+
+        if age > max_age_seconds:
+            reusable = False
+            reason = 'age_limit'
+        elif expires_in is not None and expires_in <= 0:
+            reusable = False
+            reason = 'esi_expired'
+        else:
+            reusable = True
+            reason = 'fresh'
+
+        return {
+            'present': True,
+            'reusable': reusable,
+            'reason': reason,
+            'age_seconds': age,
+            'expires_in_seconds': expires_in,
+            'order_count': len(cached.get('orders') or []),
+        }
 
     def peek_cached_orders(self, region_id: int,
                            max_age_seconds: int) -> Optional[tuple]:
