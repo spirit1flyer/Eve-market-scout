@@ -43,6 +43,7 @@ class SellInfo:
     highest_buy: float = 0.0   # best buy order now (immediate dump)
     avg_7d: float = 0.0        # 7-day average transaction price
     avg_30d: float = 0.0       # 30-day average transaction price
+    avg_90d: float = 0.0       # 90-day fallback for thinly traded items
     volume: float = 0.0        # average daily volume (7d)
     history_days: int = 0      # how many days of history we actually have
 
@@ -434,28 +435,38 @@ class IndustryCalculator:
                  fees: SellFees) -> dict:
         """Per-unit revenue/profit/margin for the three output strategies.
 
-        patient  = list a sell order at max(lowest_sell, 7d avg); pays broker+tax.
+        patient  = list at max(lowest_sell, best historical average), using
+                   7d → 30d → 90d as the fallback order; pays broker+tax.
         immediate= dump to the best buy order; pays sales tax only.
         d30      = list at the 30-day average; pays broker+tax (long-horizon view).
         spot     = list at the CURRENT lowest sell order; pays broker+tax. Unlike
                    patient it needs no transaction history — just a live sell
                    order — so thinly-traded items (most rigs, faction gear) still
                    get an estimate. The Owned-blueprints lens falls back to this.
-        Availability flags let the GUI exclude unpriced items from the ranked
-        sort. `avg_7d`/`avg_30d` are CALENDAR-WINDOW averages (the average of the
-        trades that fell in the last 7 / 30 days), NOT "7 distinct trade-days" —
-        a thinly-traded item with 2 trades in the last week still has a 7-day
-        average. So availability is simply "was there any trade in that window"
-        (avg > 0); `sell.history_days` is the trade-day count, for display only.
+        Availability flags describe each calendar window; the patient result is
+        available when any of the three historical windows has a price.
+        `sell.history_days` is the 30-day trade-day count, for display only.
         """
         list_keep = 1.0 - (fees.broker_fee_pct + fees.sales_tax_pct) / 100.0
         dump_keep = 1.0 - fees.sales_tax_pct / 100.0
 
         has_7d = sell.avg_7d > 0
         has_30d = sell.avg_30d > 0
+        has_90d = sell.avg_90d > 0
         has_spot = sell.lowest_sell > 0
 
-        patient_price = max(sell.lowest_sell, sell.avg_7d) if has_7d else 0.0
+        if has_7d:
+            history_price, patient_source = sell.avg_7d, "7d"
+        elif has_30d:
+            history_price, patient_source = sell.avg_30d, "30d"
+        elif has_90d:
+            history_price, patient_source = sell.avg_90d, "90d"
+        else:
+            history_price, patient_source = 0.0, None
+        has_history = history_price > 0
+
+        patient_price = (max(sell.lowest_sell, history_price)
+                         if has_history else 0.0)
         patient_net = patient_price * list_keep
         immediate_net = sell.highest_buy * dump_keep
         d30_net = sell.avg_30d * list_keep if has_30d else 0.0
@@ -468,11 +479,14 @@ class IndustryCalculator:
         return {
             "has_7d": has_7d,
             "has_30d": has_30d,
+            "has_90d": has_90d,
             "has_spot": has_spot,
+            "has_history": has_history,
+            "patient_source": patient_source,
             "patient_price": patient_price,
             "patient_net": patient_net,
-            "patient_profit": patient_net - unit_cost if has_7d else None,
-            "patient_margin": margin(patient_net) if has_7d else None,
+            "patient_profit": patient_net - unit_cost if has_history else None,
+            "patient_margin": margin(patient_net) if has_history else None,
             "immediate_net": immediate_net,
             "immediate_profit": immediate_net - unit_cost if sell.highest_buy > 0 else None,
             "immediate_margin": margin(immediate_net) if sell.highest_buy > 0 else None,

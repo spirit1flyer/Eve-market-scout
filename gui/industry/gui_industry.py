@@ -15,7 +15,7 @@ data (skills/standings/blueprints) is Phase 2+; nothing here needs it.
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from typing import Callable, Dict, List, Optional
 
 from core.tk_queue import submit
@@ -31,6 +31,7 @@ from industry.industry_engine import (IndustryCalculator, SellFees, FacilityPara
 from sde.sde_industry import ACTIVITY_RESEARCH_ME, ACTIVITY_RESEARCH_TE
 from industry.industry_market_data import (IndustryMarketData, IndustryProvider,
                                    JobCostConstants, BpcPricing)
+from industry.industry_diagnostics import format_counts, summarize_results
 from industry.industry_characters import IndustryRoster
 from industry.industry_skills import IndustrySkills
 from industry.industry_standings import IndustryStandings
@@ -190,6 +191,13 @@ class IndustryTabManager:
         self._chain_rows: Dict[str, int] = {}    # tree iid -> type_id
         self._iid_seq = 0
         self._active_category = "All"
+        self._compute_run_seq = 0
+        self._last_filter_diag = None
+        self._filter_diag_after = None
+        self._last_detail_diag = None
+        self._pending_sde_recompute = False
+        self._skill_warm_attempts: Dict[int, int] = {}
+        self._skill_login_waiting: Dict[int, int] = {}
 
         self.sort_col = "profit"
         self.sort_reverse = True
@@ -430,7 +438,8 @@ class IndustryTabManager:
             chars_frame, self.roster, self.char_skills, self.char_standings,
             self.set_status, root=self.root,
             bp_puller=self.bp_puller, bp_db=self.bp_db,
-            on_blueprints_pulled=self._on_blueprints_pulled)
+            on_blueprints_pulled=self._on_blueprints_pulled,
+            on_authenticated=self._on_industry_character_authenticated)
 
     def build_calc_context(self):
         """Snapshot a calc context (calc, facility, fees, params) from the current
@@ -553,6 +562,7 @@ class IndustryTabManager:
 
     def _compute(self, refetch: bool):
         if self._computing:
+            _print(f"compute_skip reason=busy refetch={refetch}")
             return
         if not self.sde.is_available():
             self.progress_label.configure(text="Industry SDE not downloaded.")
@@ -565,12 +575,24 @@ class IndustryTabManager:
         p = self._params()
         fees = self._fees()
         need_meta = not self.name_map
+        self._compute_run_seq += 1
+        run_id = self._compute_run_seq
+        started = time.perf_counter()
+        diag_context = {
+            "buy": self.buy_var.get(), "sell": self.sell_var.get(),
+            "facility": self.facility_var.get(),
+            "input": self.input_var.get(), "me": p["me"],
+            "batch": p["batch"],
+        }
 
         def _work():
             err = None
             note = ""
+            raw_count = 0
+            dummy_count = 0
             try:
                 products = self.sde.get_all_manufacturable_items()
+                raw_count = len(products)
                 # gather all type_ids needing prices; drop CCP placeholder
                 # 1-unit-mineral recipes (special-edition ships → fake profit).
                 tids = set(products)
@@ -582,6 +604,16 @@ class IndustryTabManager:
                     if _is_dummy_recipe(r):
                         dummies.add(tid)
                 products = [t for t in products if t not in dummies]
+                dummy_count = len(dummies)
+                _print(
+                    f"compute_start run={run_id} refetch={refetch} "
+                    f"products={raw_count} usable={len(products)} "
+                    f"dummy={dummy_count} buy={diag_context['buy']!r} "
+                    f"sell={diag_context['sell']!r} "
+                    f"facility={diag_context['facility']!r} "
+                    f"input={diag_context['input']!r} me={diag_context['me']} "
+                    f"batch={diag_context['batch']}"
+                )
 
                 if refetch:
                     systems = [get_hub_config(k)["system_id"]
@@ -613,6 +645,17 @@ class IndustryTabManager:
                 import traceback
                 traceback.print_exc()
                 results = {}
+            summary = summarize_results(results)
+            _print(
+                f"compute_done run={run_id} "
+                f"status={'failed' if err else 'ok'} "
+                f"seconds={time.perf_counter() - started:.2f} "
+                f"products={raw_count} dummy={dummy_count} "
+                f"results={len(results)} "
+                f"price_sources={format_counts(summary['price_sources'])} "
+                f"zero_input_products={summary['zero_input_products']} "
+                f"zero_input_rows={summary['zero_input_rows']}"
+            )
             submit(lambda: self._compute_done(results, err, note, refetch))
 
         threading.Thread(target=_work, daemon=True, name="IndustryCompute").start()
@@ -674,6 +717,16 @@ class IndustryTabManager:
     def _compute_done(self, results, err, note, refetch):
         self._computing = False
         self.refresh_btn.configure(state="normal")
+        if self._pending_sde_recompute:
+            # The completed run started against the pre-update recipe DB and
+            # may contain a mixture of old/new lookups. Discard it, invalidate
+            # metadata only now (so names remain usable while it winds down),
+            # and immediately run once against the fully swapped SDE.
+            self._pending_sde_recompute = False
+            self._invalidate_sde_metadata()
+            _print("sde_recompute_start reason=queued_after_active_compute")
+            self._compute(refetch=False)
+            return
         if refetch:
             self._last_refresh = time.time()
             self.status_label.configure(text=f"Data: {self.market.get_last_update()}")
@@ -726,9 +779,7 @@ class IndustryTabManager:
                 foreground=CLR_MUTED)
 
     def _on_update_sde(self):
-        """Rebuild the names/meta SDE (sde_types.db) behind the shared progress
-        dialog, then rebuild metadata + recompute so the tech filter lights up
-        without an app restart."""
+        """Rebuild type/meta and Industry recipe SDEs, then recompute."""
         try:
             from gui.sde_download_dialog import download_sde_with_progress
         except Exception as e:
@@ -738,9 +789,21 @@ class IndustryTabManager:
                                    on_complete=self._after_sde_download)
 
     def _after_sde_download(self, success: bool):
+        _print(f"sde_update_complete success={success}")
         if not success:
             return
-        # Force names/categories/meta to rebuild from the fresh SDE.
+        if self._computing:
+            self._pending_sde_recompute = True
+            self.progress_label.configure(
+                text="SDE updated; recompute queued after current run")
+            _print("sde_recompute_queued reason=compute_busy")
+            return
+        self._invalidate_sde_metadata()
+        _print("sde_recompute_start reason=update_complete")
+        self._compute(refetch=False)
+
+    def _invalidate_sde_metadata(self):
+        """Force names/classification to rebuild against the current SDE."""
         self.name_map = {}
         self.category_map = {}
         self.meta_map = {}
@@ -749,7 +812,6 @@ class IndustryTabManager:
         self.upwell_map = {}
         self.pos_map = {}
         self._update_tech_note()
-        self._compute(refetch=False)
 
     def _on_sort(self, col):
         if self.sort_col == col:
@@ -774,7 +836,8 @@ class IndustryTabManager:
 
     def _update_legend(self):
         self.legend_label.configure(
-            text=f"Profit = patient-sell (7d) at {self.sell_var.get()} net of "
+            text=f"Profit = patient-sell (7d/30d/90d history) at "
+                 f"{self.sell_var.get()} net of "
                  f"fees − build cost.   Input = {self.input_var.get()}.")
 
     def _sort_value(self, tid, col):
@@ -804,12 +867,18 @@ class IndustryTabManager:
         hide_pos = self.hide_pos_var.get()
         cat = self._active_category
         bp_mode = self.bp_filter_var.get()
+        excluded = {
+            "category": 0, "hidden": 0, "search_miss": 0, "tech": 0,
+            "capital": 0, "upwell": 0, "pos": 0, "blueprint": 0,
+            "unpriced": 0, "min_profit": 0,
+        }
 
         # Items passing the category filter (independent of tech) drive both the
         # tech-chip greying and the row set. A tech chip greys out when the
         # active category contains no item of that tech level.
         cat_items = [tid for tid in self.results
-                     if cat == "All" or self.category_map.get(tid) == cat]
+                     if search or cat == "All" or self.category_map.get(tid) == cat]
+        excluded["category"] = len(self.results) - len(cat_items)
         avail_tech = {tech_label(self.meta_map.get(tid)) for tid in cat_items}
         for label, b in self.tech_buttons.items():
             b.state(["!disabled"] if label in avail_tech else ["disabled"])
@@ -818,28 +887,44 @@ class IndustryTabManager:
         for tid in cat_items:
             r = self.results[tid]
             name = self.name_map.get(tid, str(tid))
-            # Auto-hide junk products ("Expired …" filaments) + user-ignored items.
-            if is_auto_hidden(name) or self.ignore.contains(tid):
+            hidden = is_auto_hidden(name) or self.ignore.contains(tid)
+            # Search is a direct item lookup and bypasses every visibility
+            # filter, including auto-hidden/user-ignored status.
+            if search:
+                if search in name.lower():
+                    rows.append(tid)
+                    excluded["hidden"] += int(hidden)
+                else:
+                    excluded["search_miss"] += 1
+                continue
+            if hidden:
+                excluded["hidden"] += 1
                 continue
             if tech_label(self.meta_map.get(tid)) not in self.tech_selected:
+                excluded["tech"] += 1
                 continue
             if subcap_only and self.capital_map.get(tid):
+                excluded["capital"] += 1
                 continue
             if hide_upwell and self.upwell_map.get(tid):
+                excluded["upwell"] += 1
                 continue
             if hide_pos and self.pos_map.get(tid):
+                excluded["pos"] += 1
                 continue
             has_bpo = self.bpo_map.get(tid, True)
             if bp_mode == "BPO only" and not has_bpo:
+                excluded["blueprint"] += 1
                 continue
             if bp_mode == "BPC-only" and has_bpo:
+                excluded["blueprint"] += 1
                 continue
-            if search and search not in name.lower():
-                continue
-            priced = r["has_7d"] and r["patient_profit"] is not None
+            priced = r["patient_profit"] is not None
             if not priced and not show_unpriced:
+                excluded["unpriced"] += 1
                 continue
             if priced and min_profit is not None and r["patient_profit"] < min_profit:
+                excluded["min_profit"] += 1
                 continue
             rows.append(tid)
 
@@ -847,11 +932,44 @@ class IndustryTabManager:
                   reverse=self.sort_reverse)
         self.display_order = rows
         # "Positive only" sub-tab: same base filter, profit strictly > 0.
-        pos_rows = [t for t in rows
-                    if self.results[t]["patient_profit"] is not None
-                    and self.results[t]["patient_profit"] > 0]
+        pos_rows = (list(rows) if search else
+                    [t for t in rows
+                     if self.results[t]["patient_profit"] is not None
+                     and self.results[t]["patient_profit"] > 0])
         self._fill_tree(self.tree, rows)
         self._fill_tree(self.tree_pos, pos_rows)
+        if search:
+            diag = (f"search text={search!r} total={len(self.results)} "
+                    f"matches={len(rows)} filters_bypassed=True "
+                    f"hidden_matches={excluded['hidden']}")
+        else:
+            diag = (
+                f"filter total={len(self.results)} visible={len(rows)} "
+                f"positive={len(pos_rows)} category={cat!r} "
+                f"tech={','.join(sorted(self.tech_selected)) or 'none'} "
+                f"blueprint={bp_mode!r} excluded={format_counts(excluded)}"
+            )
+        self._queue_filter_diag(diag, delayed=bool(search))
+
+    def _queue_filter_diag(self, diag: str, delayed: bool = False):
+        """Deduplicate filter logs and debounce search typing only."""
+        if self._filter_diag_after is not None:
+            try:
+                self.frame.after_cancel(self._filter_diag_after)
+            except tk.TclError:
+                pass
+            self._filter_diag_after = None
+        if delayed:
+            self._filter_diag_after = self.frame.after(
+                300, lambda d=diag: self._emit_filter_diag(d))
+        else:
+            self._emit_filter_diag(diag)
+
+    def _emit_filter_diag(self, diag: str):
+        self._filter_diag_after = None
+        if diag != self._last_filter_diag:
+            self._last_filter_diag = diag
+            _print(diag)
 
     def _fill_tree(self, tree, rows):
         tree.delete(*tree.get_children())
@@ -894,6 +1012,20 @@ class IndustryTabManager:
         self._clear_detail()
         self._detail_canvas.yview_moveto(0)
         name = self.name_map.get(tid, str(tid))
+        summary = summarize_results({tid: r})
+        detail_diag = (
+            tid, r.get("patient_source") or "unpriced",
+            summary["zero_input_rows"], round(float(r["unit_cost"]), 2),
+        )
+        if detail_diag != self._last_detail_diag:
+            self._last_detail_diag = detail_diag
+            _print(
+                f"detail type_id={tid} "
+                f"blueprint_id={self.sde.get_blueprint_for_item(tid)} "
+                f"price_basis={detail_diag[1]} inputs={len(r.get('inputs') or [])} "
+                f"zero_inputs={summary['zero_input_rows']} "
+                f"unit_cost={r['unit_cost']:.2f}"
+            )
 
         header = ttk.Frame(self.detail)
         header.pack(fill=tk.X, pady=(0, 6))
@@ -925,8 +1057,9 @@ class IndustryTabManager:
         frame.pack(fill=tk.X, pady=(0, 6))
         self._kv(frame, "Build cost / unit:", f"{isk(r['unit_cost'])} ISK", bold=True)
         sell = r["sell"]
+        patient_source = r.get("patient_source") or "no history"
         for label, net, profit, margin in (
-                ("Patient (7d list)", r["patient_net"], r["patient_profit"], r["patient_margin"]),
+                (f"Patient ({patient_source} list)", r["patient_net"], r["patient_profit"], r["patient_margin"]),
                 ("Immediate (buy order)", r["immediate_net"], r["immediate_profit"], r["immediate_margin"]),
                 ("30-day list", r["d30_net"], r["d30_profit"], r["d30_margin"])):
             row = ttk.Frame(frame)
@@ -940,6 +1073,7 @@ class IndustryTabManager:
                       foreground=margin_color(margin)).pack(side=tk.RIGHT)
         ttk.Label(frame,
                   text=f"    7d {isk(sell.avg_7d)}   30d {isk(sell.avg_30d)}   "
+                       f"90d {isk(sell.avg_90d)}   "
                        f"low-sell {isk(sell.lowest_sell)}   "
                        f"best-buy {isk(sell.highest_buy)}   "
                        f"({sell.history_days}d history)",
@@ -1099,19 +1233,61 @@ class IndustryTabManager:
         return params, char_id, state
 
     def _warm_skills(self, char_id: int, tid: int):
+        if char_id in self._skill_login_waiting:
+            return
         if getattr(self, "_warming_skill_id", None) == char_id:
             return
         self._warming_skill_id = char_id
 
         def work():
             try:
-                self.char_skills.fetch(char_id)
-            finally:
-                self._warming_skill_id = None
-            submit(lambda: self._refresh_detail_if_selected()
-                   if self.selected == tid else None)
+                success = self.char_skills.fetch(char_id) is not None
+            except Exception as e:
+                _print(f"skill_warm_failed character_id={char_id} error={e}")
+                success = False
+            submit(lambda: self._skill_warm_done(char_id, tid, success))
 
         threading.Thread(target=work, daemon=True, name="IndustrySkillWarm").start()
+
+    def _skill_warm_done(self, char_id: int, tid: int, success: bool):
+        self._warming_skill_id = None
+        if success:
+            self._skill_warm_attempts.pop(char_id, None)
+            self._skill_login_waiting.pop(char_id, None)
+            if self.selected == tid:
+                self._refresh_detail_if_selected()
+            return
+
+        attempts = self._skill_warm_attempts.get(char_id, 0) + 1
+        self._skill_warm_attempts[char_id] = attempts
+        if attempts < 2:
+            _print(f"skill_warm_retry character_id={char_id} attempt=2")
+            self.frame.after(500, lambda: self._warm_skills(char_id, tid))
+            return
+
+        self._skill_login_waiting[char_id] = tid
+        char = self.roster.get(char_id)
+        name = char.character_name if char and char.character_name else str(char_id)
+        _print(f"skill_login_required character_id={char_id} attempts={attempts}")
+        self.set_status(f"Industry: relog in character {name}")
+        messagebox.showwarning(
+            "Character Login Required",
+            f"Relog in character {name}\n\n"
+            "Open Industry > Characters and use Add character (EVE login).",
+            parent=self.frame,
+        )
+
+    def _on_industry_character_authenticated(self):
+        """Retry skill warms that were paused pending an Industry SSO login."""
+        waiting = list(self._skill_login_waiting.items())
+        for char_id, tid in waiting:
+            self._skill_login_waiting.pop(char_id, None)
+            self._skill_warm_attempts.pop(char_id, None)
+            if self._built_by.get(tid) != char_id:
+                continue
+            self.char_skills.clear(char_id)
+            _print(f"skill_warm_after_login character_id={char_id}")
+            self._warm_skills(char_id, tid)
 
     def _build_time_section(self, r, tid: int):
         frame = ttk.LabelFrame(self.detail, text="Build time (Phase 4)", padding=4)
@@ -1188,6 +1364,12 @@ class IndustryTabManager:
         """Open the ME/TE research popup for an item. Shared by Top Profit and
         the Owned panel (which passes the blueprint's real current ME/TE)."""
         ctx = self._research_context(tid, eiv, cur_me, cur_te)
+        _print(
+            f"research type_id={tid} character_id={ctx['char_id'] or 'none'} "
+            f"skills_cached={ctx['skills_cached']} cur_me={cur_me} cur_te={cur_te} "
+            f"base_me={ctx['base_me']} base_te={ctx['base_te']} "
+            f"me_index={ctx['me_index']:.6f} te_index={ctx['te_index']:.6f}"
+        )
         show_research_popup(self.frame, ctx, self.set_status)
 
     def _research_context(self, tid: int, eiv: float,
@@ -1217,6 +1399,7 @@ class IndustryTabManager:
             "rparams": rparams,
             "cur_me": int(cur_me), "cur_te": int(cur_te),
             "skills_cached": levels is not None,
+            "char_id": char_id,
             "char_name": (rc.character_name if rc else None),
             "has_time_data": self.sde.has_activity_time_data(),
         }

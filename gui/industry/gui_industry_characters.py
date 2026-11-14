@@ -47,7 +47,8 @@ class CharactersPanel:
     """Builds + manages the Characters sub-tab inside the Industry notebook."""
 
     def __init__(self, parent, roster, skills, standings, set_status, root=None,
-                 bp_puller=None, bp_db=None, on_blueprints_pulled=None):
+                 bp_puller=None, bp_db=None, on_blueprints_pulled=None,
+                 on_authenticated=None):
         self.parent = parent
         self.roster = roster
         self.skills = skills
@@ -57,6 +58,7 @@ class CharactersPanel:
         self.bp_puller = bp_puller          # Phase 3: BlueprintPuller (or None)
         self.bp_db = bp_db                  # Phase 3: IndustryBlueprintsDB (or None)
         self.on_blueprints_pulled = on_blueprints_pulled
+        self.on_authenticated = on_authenticated
         self._portraits = {}   # character_id -> PhotoImage (keep refs alive)
         self._pulling = set()  # character_ids with a blueprint pull in flight
         self._build()
@@ -181,6 +183,8 @@ class CharactersPanel:
         self.set_status(f"Industry: {msg}")
         if ok:
             self.refresh_cards()
+            if self.on_authenticated:
+                self.on_authenticated()
 
     def _remove(self, char):
         self.roster.remove(char.character_id)

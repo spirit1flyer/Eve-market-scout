@@ -442,6 +442,7 @@ class IndustryMarketData:
         today = date.today()
         cut_7 = (today - timedelta(days=7)).isoformat()
         cut_30 = (today - timedelta(days=30)).isoformat()
+        cut_90 = (today - timedelta(days=HISTORY_FETCH_DAYS)).isoformat()
         out = {}
         for tid, rows in bulk.items():
             def avg(entries):
@@ -461,10 +462,13 @@ class IndustryMarketData:
 
             rows_7 = [r for r in clean if (r.get("date") or "") >= cut_7]
             rows_30 = [r for r in clean if (r.get("date") or "") >= cut_30]
+            rows_90 = [r for r in clean if (r.get("date") or "") >= cut_90]
             vol_7, price_7 = avg(rows_7)
             vol_30, price_30 = avg(rows_30)
+            vol_90, price_90 = avg(rows_90)
             out[tid] = {"avg_volume_7d": vol_7, "avg_price_7d": price_7,
                         "avg_volume_30d": vol_30, "avg_price_30d": price_30,
+                        "avg_volume_90d": vol_90, "avg_price_90d": price_90,
                         "days": len(rows_30)}
         return out
 
@@ -535,10 +539,11 @@ class IndustryProvider:
             return px
         # No live order in the dump for this material (thin market). Fall back to
         # its recent market-history average so the build cost isn't understated
-        # to 0 (e.g. abyssal mutaplasmid inputs). 7d preferred, else 30d.
+        # to 0 (e.g. abyssal mutaplasmid inputs). Prefer 7d, then 30d, then 90d.
         if self.buy_region is not None:
             h = self.market.product_history(self.buy_region, type_id)
-            return h.get("avg_price_7d") or h.get("avg_price_30d") or 0.0
+            return (h.get("avg_price_7d") or h.get("avg_price_30d")
+                    or h.get("avg_price_90d") or 0.0)
         return 0.0
 
     def adjusted_price(self, type_id: int) -> float:
@@ -554,7 +559,9 @@ class IndustryProvider:
             highest_buy=self.market.station_price(self.sell_station, type_id, "buy"),
             avg_7d=h.get("avg_price_7d", 0.0),
             avg_30d=h.get("avg_price_30d", 0.0),
-            volume=h.get("avg_volume_7d", 0.0),
+            avg_90d=h.get("avg_price_90d", 0.0),
+            volume=(h.get("avg_volume_7d") or h.get("avg_volume_30d")
+                    or h.get("avg_volume_90d") or 0.0),
             history_days=h.get("days", 0),
         )
 

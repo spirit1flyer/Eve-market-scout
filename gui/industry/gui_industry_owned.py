@@ -15,6 +15,7 @@ this stage costs the build the same way Phase 1 does (blueprint cost ignored).
 """
 
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional
@@ -22,6 +23,7 @@ from typing import Callable, Dict, List, Optional
 from core.tk_queue import submit
 from gui.gui_window_utils import make_scrollable
 from industry.industry_ignore import IgnoreList, is_auto_hidden
+from industry.industry_diagnostics import format_counts, summarize_results
 
 # Reuse the shared formatting + colour helpers from the main Industry tab.
 from gui.industry.gui_industry import (
@@ -69,6 +71,8 @@ class OwnedBlueprintsPanel:
         self._params: Optional[dict] = None  # last calc-context params (regions)
         self._chain_menu = None
         self._chain_selected: Optional[int] = None
+        self._compute_run_seq = 0
+        self._last_detail_diag = None
 
         self.sort_col = "profit"
         self.sort_reverse = True
@@ -177,10 +181,12 @@ class OwnedBlueprintsPanel:
         """
         bps = self.bp_db.get_blueprints()
         rows = []
+        unmapped = []
         for bp in bps:
             bp_tid = bp["type_id"]
             product_tid = self.sde.get_product_for_blueprint(bp_tid)
             if product_tid is None:
+                unmapped.append(bp_tid)
                 continue  # no manufacturing product (research-only/odd BP)
             char = self.roster.get(bp["character_id"])
             rows.append({
@@ -196,10 +202,18 @@ class OwnedBlueprintsPanel:
                          str(bp["character_id"])),
             })
         self.rows = rows
+        bpo_count = sum(1 for r in rows if not r["is_copy"])
+        bpc_count = sum(1 for r in rows if r["is_copy"])
+        _print(
+            f"refresh blueprints={len(bps)} mapped={len(rows)} "
+            f"unmapped={len(unmapped)} bpo={bpo_count} bpc={bpc_count}"
+        )
+        if unmapped:
+            sample = ",".join(str(tid) for tid in unmapped[:10])
+            _print(f"unmapped_blueprint_ids={sample} total={len(unmapped)}")
         self.count_label.configure(
             text=f"{len(rows)} blueprints "
-                 f"({sum(1 for r in rows if not r['is_copy'])} BPO / "
-                 f"{sum(1 for r in rows if r['is_copy'])} BPC)")
+                 f"({bpo_count} BPO / {bpc_count} BPC)")
         self._fill_tree()
         self._update_struct_button()
         if not rows:
@@ -218,6 +232,9 @@ class OwnedBlueprintsPanel:
         regions = [r for r in (params.get("buy_region"),
                                params.get("sell_region")) if r]
         snapshot = [dict(r) for r in rows]  # decouple from UI-thread mutation
+        self._compute_run_seq += 1
+        run_id = self._compute_run_seq
+        started = time.perf_counter()
 
         def work():
             results = {}
@@ -233,6 +250,15 @@ class OwnedBlueprintsPanel:
                 if res:
                     res["_bpc"] = bpc
                     results[r["item_id"]] = res
+            summary = summarize_results(results)
+            _print(
+                f"cost_done run={run_id} seconds={time.perf_counter() - started:.2f} "
+                f"requested={len(snapshot)} results={len(results)} "
+                f"price_sources={format_counts(summary['price_sources'])} "
+                f"bpc_sources={format_counts(summary['bpc_sources'])} "
+                f"zero_input_products={summary['zero_input_products']} "
+                f"zero_input_rows={summary['zero_input_rows']}"
+            )
             submit(lambda: self._costs_done(results))
 
         threading.Thread(target=work, daemon=True, name="OwnedBPCompute").start()
@@ -339,16 +365,15 @@ class OwnedBlueprintsPanel:
     @staticmethod
     def _display_pm(res):
         """Profit/margin to show in the list, with graceful fallback:
-        7-day patient average → 30-day average → spot (current lowest sell order).
-        The averages are calendar-window means, so any trade in the last week
-        gives a 7d figure; an item with trades only further back falls to 30d;
-        a stale-but-listed item (no trades, live sell order) falls to spot.
-        Returns (profit, margin, basis) with basis in {"7d","30d","spot",None}.
+        patient historical average (7d → 30d → 90d) → current lowest sell.
+        Returns (profit, margin, basis), where the historical basis comes from
+        the engine's `patient_source`.
         """
         if not res:
             return None, None, None
         if res.get("patient_profit") is not None:
-            return res["patient_profit"], res["patient_margin"], "7d"
+            return (res["patient_profit"], res["patient_margin"],
+                    res.get("patient_source") or "history")
         if res.get("d30_profit") is not None:
             return res["d30_profit"], res["d30_margin"], "30d"
         if res.get("spot_profit") is not None:
@@ -488,6 +513,21 @@ class OwnedBlueprintsPanel:
                       foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=8)
             return
 
+        summary = summarize_results({row["item_id"]: res})
+        bpc_source = (res.get("_bpc") or {}).get("source") or "none"
+        detail_diag = (
+            row["item_id"], res.get("patient_source") or "unpriced",
+            bpc_source, summary["zero_input_rows"],
+        )
+        if detail_diag != self._last_detail_diag:
+            self._last_detail_diag = detail_diag
+            _print(
+                f"detail item_id={row['item_id']} type_id={row['product_tid']} "
+                f"blueprint_id={row['bp_type_id']} bpc_source={bpc_source} "
+                f"price_basis={detail_diag[1]} "
+                f"zero_inputs={summary['zero_input_rows']}"
+            )
+
         self._build_bpc(row, res)
         self._build_margins(res)
         self._build_chain(res)
@@ -574,9 +614,10 @@ class OwnedBlueprintsPanel:
         frame = ttk.LabelFrame(self.detail, text="Profit (per unit)", padding=4)
         frame.pack(fill=tk.X, pady=(0, 6))
         self._kv(frame, "Build cost / unit:", f"{isk(r['unit_cost'])} ISK", bold=True)
+        patient_source = r.get("patient_source") or "history"
         for label, net, profit, margin, empty in (
                 ("Spot (current sell)", r.get("spot_net"), r.get("spot_profit"), r.get("spot_margin"), "no sell order"),
-                ("Patient (7d list)", r["patient_net"], r["patient_profit"], r["patient_margin"], "no 7d history"),
+                (f"Patient ({patient_source} list)", r["patient_net"], r["patient_profit"], r["patient_margin"], "no recent history"),
                 ("Immediate (buy order)", r["immediate_net"], r["immediate_profit"], r["immediate_margin"], "no buy order"),
                 ("30-day list", r["d30_net"], r["d30_profit"], r["d30_margin"], "no 30d history")):
             row = ttk.Frame(frame)
@@ -593,6 +634,7 @@ class OwnedBlueprintsPanel:
                   text=f"    low-sell {isk(sell.lowest_sell)}   "
                        f"best-buy {isk(sell.highest_buy)}   "
                        f"7d {isk(sell.avg_7d)}   30d {isk(sell.avg_30d)}   "
+                       f"90d {isk(sell.avg_90d)}   "
                        f"({sell.history_days}d history)",
                   foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=(2, 0))
 

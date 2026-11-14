@@ -5,12 +5,14 @@ local SDE can offer a re-download without duplicating the threading / progress
 boilerplate. The Reprocess tab uses this for its "Download/Update SDE" button
 (the SDE's `type_materials` table only exists after a fresh rebuild).
 
-The download itself runs on a daemon thread with its own asyncio loop; UI
-updates are marshalled back to the Tk thread via `tk_queue.submit`.
+Every manual update rebuilds both the item/type database and the industry
+recipe database. The download runs on a daemon thread with its own asyncio
+loop; UI updates are marshalled back to the Tk thread via `tk_queue.submit`.
 """
 
 import asyncio
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
@@ -35,23 +37,33 @@ def download_sde_with_progress(
             re-downloading.
     """
     from sde.sde_manager import get_sde_manager
+    from sde.sde_industry import get_sde_industry_db
 
     sde = get_sde_manager()
+    industry_sde = get_sde_industry_db()
+    old_type_info = sde.get_version_info()
+    old_industry_info = industry_sde.get_version_info()
 
-    if confirm_if_present and sde.is_available():
+    if confirm_if_present and (sde.is_available() or industry_sde.is_available()):
         age = sde.get_age_days()
-        info = sde.get_version_info()
-        count = info.get("record_count", "?")
+        count = old_type_info.get("record_count", "?")
+        industry_age = industry_sde.get_age_days()
+        product_count = old_industry_info.get("products_count", "?")
         try:
             count_str = f"{count:,}"
         except (ValueError, TypeError):
             count_str = str(count)
+        try:
+            product_count_str = f"{product_count:,}"
+        except (ValueError, TypeError):
+            product_count_str = str(product_count)
         if not messagebox.askyesno(
             "SDE Already Downloaded",
-            f"SDE database already exists:\n"
-            f"  Items: {count_str}\n"
-            f"  Age: {age} days\n\n"
-            f"Re-download to update?",
+            f"SDE databases already exist:\n"
+            f"  Item types: {count_str} ({age} days old)\n"
+            f"  Manufacturing recipes: {product_count_str} "
+            f"({industry_age} days old)\n\n"
+            f"Re-download both to update?",
         ):
             return
 
@@ -77,31 +89,74 @@ def download_sde_with_progress(
         submit(lambda: status_label.configure(text=msg))
         submit(lambda: progress_var.set(pct))
 
+    outcome = {"types": False, "industry": False, "started": None}
+
     def finish(success: bool):
         try:
             progress_win.destroy()
         except Exception:
             pass
+        new_type_info = sde.get_version_info()
+        new_industry_info = industry_sde.get_version_info()
+        elapsed = (time.perf_counter() - outcome["started"]
+                   if outcome["started"] is not None else 0.0)
+        print(
+            f"[SDEIndustry] manual_update_done success={success} "
+            f"seconds={elapsed:.2f} types_ok={outcome['types']} "
+            f"recipes_ok={outcome['industry']} "
+            f"new_types={new_type_info.get('record_count', 0)} "
+            f"new_recipe_rows={new_industry_info.get('products_count', 0)} "
+            f"new_unique_products="
+            f"{new_industry_info.get('unique_products_count', 'unknown')}"
+        )
         if success:
-            info = sde.get_version_info()
-            count = info.get("record_count", 0)
-            set_status(f"SDE downloaded: {count:,} items")
+            count = new_type_info.get("record_count", 0)
+            products = new_industry_info.get("products_count", 0)
+            set_status(f"SDE downloaded: {count:,} item types, "
+                       f"{products:,} manufacturing recipes")
             messagebox.showinfo(
                 "SDE Downloaded",
-                f"Successfully downloaded {count:,} item types.",
+                f"Successfully downloaded {count:,} item types and "
+                f"{products:,} manufacturing recipes.",
             )
         else:
-            set_status("SDE download failed")
+            partial = outcome["types"] and not outcome["industry"]
+            set_status("Item types updated, but industry recipes failed"
+                       if partial else "SDE download failed")
             messagebox.showerror(
                 "Download Failed",
-                "Failed to download SDE. Check your internet connection.",
+                ("Item types were updated, but the manufacturing recipe "
+                 "download failed. The previous recipe database is still safe."
+                 if partial else
+                 "Failed to download SDE. Check your internet connection."),
             )
         if on_complete is not None:
             on_complete(success)
 
     def do_download():
+        outcome["started"] = time.perf_counter()
+        print(
+            f"[SDEIndustry] manual_update_start "
+            f"old_types={old_type_info.get('record_count', 0)} "
+            f"old_recipe_rows={old_industry_info.get('products_count', 0)} "
+            f"old_unique_products="
+            f"{old_industry_info.get('unique_products_count', 'unknown')}"
+        )
+
         async def _run():
-            return await sde.download_and_build(progress_callback=update_progress)
+            def type_progress(msg: str, pct: int):
+                update_progress(f"Items: {msg}", int(pct * 0.55))
+
+            def industry_progress(msg: str, pct: int):
+                update_progress(f"Recipes: {msg}", 55 + int(pct * 0.45))
+
+            outcome["types"] = await sde.download_and_build(
+                progress_callback=type_progress)
+            if not outcome["types"]:
+                return False
+            outcome["industry"] = await industry_sde.download_and_build(
+                progress_callback=industry_progress)
+            return outcome["industry"]
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

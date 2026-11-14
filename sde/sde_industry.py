@@ -15,6 +15,7 @@ import io
 import json
 import sqlite3
 import asyncio
+import time
 import aiohttp
 from datetime import datetime
 from pathlib import Path
@@ -366,7 +367,24 @@ class SDEIndustryDB:
             if progress_callback:
                 progress_callback(msg, pct)
         
-        update("Starting industry data download...", 0)
+        started = time.perf_counter()
+        old_info = self.get_version_info()
+
+        def failed(stage: str) -> bool:
+            update(
+                f"update_done status=failed stage={stage} "
+                f"seconds={time.perf_counter() - started:.2f}",
+                0,
+            )
+            return False
+
+        update(
+            f"update_start old_recipe_rows={old_info.get('products_count', 0)} "
+            f"old_unique_products="
+            f"{old_info.get('unique_products_count', 'unknown')} "
+            f"age_days={self.get_age_days()}",
+            0,
+        )
 
         try:
             timeout = aiohttp.ClientTimeout(total=120)
@@ -376,19 +394,19 @@ class SDEIndustryDB:
                 update("Downloading materials data...", 5)
                 materials_data = await self._download_csv(session, MATERIALS_URL, update, 5, 30)
                 if materials_data is None:
-                    return False
+                    return failed("materials_download")
                 
                 # Download products CSV
                 update("Downloading products data...", 35)
                 products_data = await self._download_csv(session, PRODUCTS_URL, update, 35, 48)
                 if products_data is None:
-                    return False
+                    return failed("products_download")
 
                 # Download per-activity base-time CSV (Phase 4)
                 update("Downloading activity time data...", 48)
                 activity_data = await self._download_csv(session, ACTIVITY_URL, update, 48, 55)
                 if activity_data is None:
-                    return False
+                    return failed("activity_download")
 
             # Build the replacement at <db>.new; build_then_swap swaps it
             # in only on success, so a failed download/build leaves the
@@ -401,9 +419,12 @@ class SDEIndustryDB:
 
             # Clear caches so readers reload from the new DB
             self._product_to_blueprint.clear()
+            self._blueprint_to_product.clear()
             self._blueprint_materials.clear()
+            self._product_output.clear()
             self._activity_time.clear()
             self._has_activity_time = None
+            unique_products_count = len(self.get_all_manufacturable_items())
 
             # Save version info
             version_info = {
@@ -411,20 +432,26 @@ class SDEIndustryDB:
                 "source": "fuzzwork",
                 "materials_count": materials_count,
                 "products_count": products_count,
+                "unique_products_count": unique_products_count,
                 "activity_count": activity_count,
             }
             with open(self.version_path, "w") as f:
                 json.dump(version_info, f, indent=2)
             
-            update(f"Complete: {materials_count:,} materials, "
-                   f"{products_count:,} products, {activity_count:,} activity times", 100)
+            update(
+                f"update_done status=ok seconds={time.perf_counter() - started:.2f} "
+                f"materials={materials_count} recipe_rows={products_count} "
+                f"unique_products={unique_products_count} "
+                f"activity_times={activity_count}",
+                100,
+            )
             return True
             
         except Exception as e:
             # The working DB (if any) was never touched — build_then_swap
             # already removed the partial .new file.
             update(f"Error: {e}", 0)
-            return False
+            return failed("exception")
     
     async def _download_csv(
         self,
