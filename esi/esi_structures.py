@@ -20,7 +20,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from core.config import ESI_USER_AGENT
+from core.config import get_esi_headers
+from core.esi_rate_limit import esi_request
 from esi.esi_auth import ESIAuth
 
 BASE_URL = "https://esi.evetech.net/latest"
@@ -45,6 +46,10 @@ class StructureAccessError(Exception):
         super().__init__(f"structure {structure_id}: HTTP {status} {message}")
 
 
+class StructureSnapshotError(RuntimeError):
+    """Raised rather than returning a partial or mixed-page order snapshot."""
+
+
 def _parse_expires(response: requests.Response) -> Optional[datetime]:
     expires_str = response.headers.get("Expires")
     if not expires_str:
@@ -64,7 +69,7 @@ def _request_with_retry(
     auth/permission failures."""
     last: Optional[requests.Response] = None
     for attempt in (1, 2):
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp = esi_request("GET", url, headers=headers, params=params, timeout=30)
         if resp.status_code < 500:
             return resp
         last = resp
@@ -107,16 +112,18 @@ def is_structure_id(value: int) -> bool:
 
 def resolve_region_for_system(system_id: int) -> int:
     """Walk system → constellation → region via public ESI (no auth)."""
-    r1 = requests.get(
+    r1 = esi_request(
+        "GET",
         f"{BASE_URL}/universe/systems/{system_id}/",
-        headers={"User-Agent": ESI_USER_AGENT}, timeout=30
+        headers=get_esi_headers(), timeout=30
     )
     r1.raise_for_status()
     const_id = r1.json()["constellation_id"]
 
-    r2 = requests.get(
+    r2 = esi_request(
+        "GET",
         f"{BASE_URL}/universe/constellations/{const_id}/",
-        headers={"User-Agent": ESI_USER_AGENT}, timeout=30
+        headers=get_esi_headers(), timeout=30
     )
     r2.raise_for_status()
     return r2.json()["region_id"]
@@ -203,22 +210,52 @@ def fetch_structure_orders(
         raise StructureAccessError(structure_id, 401, "not authenticated")
 
     url = f"{BASE_URL}/markets/structures/{structure_id}/"
-    first = _request_with_retry(url, headers=headers, params={"page": 1})
+    for snapshot_attempt in range(2):
+        first = _request_with_retry(url, headers=headers, params={"page": 1})
+        if first.status_code in (403, 404):
+            raise StructureAccessError(
+                structure_id, first.status_code, first.text[:160]
+            )
+        first.raise_for_status()
 
-    if first.status_code in (403, 404):
-        raise StructureAccessError(structure_id, first.status_code, first.text[:160])
-    first.raise_for_status()
+        orders: list = list(first.json())
+        expires = _parse_expires(first)
+        total_pages = int(first.headers.get("X-Pages", "1"))
+        first_validator = first.headers.get("Last-Modified")
+        changed_page = None
 
-    orders: list = list(first.json())
-    expires = _parse_expires(first)
-    total_pages = int(first.headers.get("X-Pages", "1"))
+        for page in range(2, total_pages + 1):
+            resp = _request_with_retry(url, headers=headers, params={"page": page})
+            if resp.status_code in (403, 404):
+                raise StructureAccessError(
+                    structure_id, resp.status_code, resp.text[:160]
+                )
+            if resp.status_code >= 400:
+                raise StructureSnapshotError(
+                    f"structure {structure_id} page {page}/{total_pages}: "
+                    f"HTTP {resp.status_code}"
+                )
+            if resp.headers.get("Last-Modified") != first_validator:
+                changed_page = page
+                break
+            orders.extend(resp.json())
 
-    for page in range(2, total_pages + 1):
-        resp = _request_with_retry(url, headers=headers, params={"page": page})
-        if resp.status_code >= 400:
-            print(f"[ESI-Struct] page {page}/{total_pages} for {structure_id}: "
-                  f"HTTP {resp.status_code} — partial results returned")
-            break
-        orders.extend(resp.json())
+        if changed_page is None:
+            validation = "validated" if first_validator else "unvalidated"
+            print(
+                "[ESI-Timing] resource=structure_orders "
+                f"trigger=page_validation decision=ACCEPT pages={total_pages} "
+                f"validation={validation}"
+            )
+            return orders, expires
 
-    return orders, expires
+        decision = "RETRY" if snapshot_attempt == 0 else "REJECT"
+        print(
+            "[ESI-Timing] resource=structure_orders "
+            f"trigger=page_validation decision={decision} "
+            f"reason=representation_changed page={changed_page}"
+        )
+
+    raise StructureSnapshotError(
+        f"structure {structure_id} changed during both snapshot attempts"
+    )

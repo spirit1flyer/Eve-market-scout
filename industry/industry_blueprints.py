@@ -41,6 +41,7 @@ from typing import Optional
 import requests
 
 from core.sound_manager import get_data_dir
+from core.esi_rate_limit import esi_request
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +334,8 @@ class BlueprintPuller:
         all_rows: list[dict] = []
         url = f"{BASE_URL}/characters/{character_id}/blueprints/"
         try:
-            first = requests.get(
+            first = esi_request(
+                "GET",
                 url, headers=headers,
                 params={"datasource": "tranquility", "page": 1},
                 timeout=30,
@@ -341,6 +343,7 @@ class BlueprintPuller:
             first.raise_for_status()
             all_rows.extend(first.json() or [])
             total_pages = int(first.headers.get("X-Pages", "1"))
+            first_validator = first.headers.get("Last-Modified")
             print(f"[IndustryBP] character {character_id}: X-Pages={total_pages}")
         except (requests.RequestException, ValueError) as e:
             print(f"[IndustryBP] character {character_id} page 1 error: {e}")
@@ -349,12 +352,21 @@ class BlueprintPuller:
         for page in range(2, total_pages + 1):
             time.sleep(PAGE_PAUSE_SECONDS)  # slow-pace safety
             try:
-                resp = requests.get(
+                resp = esi_request(
+                    "GET",
                     url, headers=headers,
                     params={"datasource": "tranquility", "page": page},
                     timeout=30,
                 )
                 resp.raise_for_status()
+                validator = resp.headers.get("Last-Modified")
+                if validator != first_validator:
+                    print(
+                        "[ESI-Timing] resource=blueprints "
+                        "trigger=page_validation decision=REJECT "
+                        f"reason=representation_changed page={page}"
+                    )
+                    return None
                 all_rows.extend(resp.json() or [])
             except (requests.RequestException, ValueError) as e:
                 print(f"[IndustryBP] character {character_id} page {page} "
@@ -391,7 +403,8 @@ def fetch_structure_meta(structure_id: int, headers: dict) -> Optional[dict]:
     if not headers:
         return None
     try:
-        resp = requests.get(
+        resp = esi_request(
+            "GET",
             f"{BASE_URL}/universe/structures/{int(structure_id)}/",
             headers=headers, timeout=30,
         )

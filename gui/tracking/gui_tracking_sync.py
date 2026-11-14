@@ -1,14 +1,14 @@
 """ESI sync logic for Trade Tracking - refresh, backfill, auto-refresh timers."""
 
 import threading
-import requests
 from datetime import datetime
 from typing import Optional, Callable, List, TYPE_CHECKING
 
 from esi.esi_wallet import ESIWallet
 from analytics.trade_tracker import TradeTracker
 from core.calculate import format_isk
-from core.config import TRADE_HUBS, ESI_USER_AGENT
+from core.config import TRADE_HUBS, get_esi_headers
+from core.esi_rate_limit import esi_request
 from core.tk_queue import submit
 
 if TYPE_CHECKING:
@@ -17,23 +17,9 @@ if TYPE_CHECKING:
 
 def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = None,
                              order_cache=None) -> List[dict]:
-    """
-    Fetch market orders synchronously for underbid checking.
+    """Return orders for underbid checks from the shared regional snapshot.
 
-    Prefers the scanner's shared region dump (complete order book, no
-    duplicate download). On a cache miss, queries ESI per listed type_id
-    (`?type_id=&order_type=sell`) instead of paging the whole region — the
-    old whole-region path truncated at 20 pages, so hub regions (300+ pages)
-    gave the underbid check a partial book that could miss undercuts.
-
-    Args:
-        region_id: Region ID to fetch orders from
-        type_ids: type_ids of the user's listings (fallback path fetches
-            only these; empty/None means nothing to check)
-        order_cache: shared OrderCacheStore to peek before hitting ESI
-
-    Returns:
-        List of market order dicts
+    On a cache miss, fetch only the listed types and reject mixed ESI pages.
     """
     if order_cache is not None:
         peeked = order_cache.peek_cached_orders(region_id, max_age_seconds=300)
@@ -52,10 +38,13 @@ def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = Non
     for type_id in type_ids:
         try:
             page = 1
+            type_orders = []
+            first_validator = None
             while True:
-                response = requests.get(
+                response = esi_request(
+                    "GET",
                     f"{base_url}/markets/{region_id}/orders/",
-                    headers={"User-Agent": ESI_USER_AGENT},
+                    headers=get_esi_headers(),
                     params={"type_id": type_id, "order_type": "sell", "page": page},
                     timeout=30
                 )
@@ -63,10 +52,18 @@ def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = Non
                     break  # Page vanished, stop
                 response.raise_for_status()
                 total_pages = int(response.headers.get("X-Pages", 1))
-                all_orders.extend(response.json())
+                validator = response.headers.get("Last-Modified")
+                if page == 1:
+                    first_validator = validator
+                elif validator != first_validator:
+                    raise RuntimeError(
+                        f"representation changed on page {page}"
+                    )
+                type_orders.extend(response.json())
                 if page >= total_pages:
                     break
                 page += 1
+            all_orders.extend(type_orders)
         except Exception as e:
             print(f"Error fetching market orders for type {type_id}: {e}")
 
@@ -268,7 +265,7 @@ class ESISyncManager:
         self.set_status("Refreshing ESI data...")
         
         def do_refresh():
-            success = self.wallet.refresh_all()
+            success = self.wallet.refresh_all(trigger=trigger)
             next_orders = self.wallet.get_seconds_until_refresh()
             print(
                 "[ESI-Timing] resource=trade_bundle "

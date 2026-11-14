@@ -27,7 +27,8 @@ import threading
 from core.calculate import (
     get_broker_fee_rate, get_sales_tax_rate, TradingSkills, DEFAULT_SKILLS,
 )
-from core.config import REQUEST_TIMEOUT, ESI_USER_AGENT
+from core.config import REQUEST_TIMEOUT, get_esi_headers
+from core.esi_rate_limit import make_trace_config
 from core.tk_queue import submit
 
 
@@ -225,7 +226,8 @@ class MaxBuyCalcMixin:
 
         client.reset_for_new_loop()
         async with aiohttp.ClientSession(
-            headers={"User-Agent": ESI_USER_AGENT},
+            headers=get_esi_headers(),
+            trace_configs=[make_trace_config()],
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         ) as session:
             client.session = session

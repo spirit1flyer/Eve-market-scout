@@ -202,9 +202,22 @@ async def fetch_region_contract_list(client, region_id: int,
             for p in range(2, total_pages + 1)
         ]
         results = await asyncio.gather(*tasks)
-        for page_rows in results:
-            if page_rows:
-                contracts.extend(page_rows)
+        first_validator = headers.get("Last-Modified")
+        for page, page_status, page_headers, page_rows in results:
+            if (page_status != 200 or not isinstance(page_rows, list)
+                    or page_headers.get("Last-Modified") != first_validator):
+                _print(
+                    f"region {region_id} list rejected at page {page}: "
+                    f"status={page_status} representation_changed="
+                    f"{page_headers.get('Last-Modified') != first_validator}"
+                )
+                return {
+                    "status": 502,
+                    "expires": expires,
+                    "etag": new_etag,
+                    "contracts": None,
+                }
+            contracts.extend(page_rows)
 
     _print(f"region {region_id} list assembled — {len(contracts)} total rows "
            f"across {total_pages} pages")
@@ -212,15 +225,12 @@ async def fetch_region_contract_list(client, region_id: int,
             "contracts": contracts}
 
 
-async def _fetch_list_page(client, endpoint: str, page: int) -> Optional[list]:
-    """Fetch one extra list page; None on failure (logged, non-fatal)."""
-    status, _headers, body = await _raw_request(
+async def _fetch_list_page(client, endpoint: str, page: int) -> tuple:
+    """Fetch one extra page while preserving validation metadata."""
+    status, headers, body = await _raw_request(
         client, "GET", endpoint, params={"page": page}
     )
-    if status == 200 and isinstance(body, list):
-        return body
-    _print(f"list page {page} of {endpoint} failed status={status}")
-    return None
+    return page, status, headers, body
 
 
 # =============================================================================
@@ -260,21 +270,26 @@ async def fetch_contract_items(client, contract_id: int) -> dict:
             _fetch_items_page(client, endpoint, p)
             for p in range(2, total_pages + 1)
         ]
-        for page_items in await asyncio.gather(*tasks):
-            if page_items:
-                items.extend(page_items)
+        first_validator = headers.get("Last-Modified")
+        for page, page_status, page_headers, page_items in await asyncio.gather(*tasks):
+            if (page_status != 200 or not isinstance(page_items, list)
+                    or page_headers.get("Last-Modified") != first_validator):
+                _print(
+                    f"contract {cid} items rejected at page {page}: "
+                    f"status={page_status}"
+                )
+                return {"status": 502, "items": None, "gone": False}
+            items.extend(page_items)
 
     _vprint(f"contract {cid} items 200 — {len(items)} records")
     return {"status": 200, "items": items, "gone": False}
 
 
-async def _fetch_items_page(client, endpoint: str, page: int) -> Optional[list]:
-    status, _headers, body = await _raw_request(
+async def _fetch_items_page(client, endpoint: str, page: int) -> tuple:
+    status, headers, body = await _raw_request(
         client, "GET", endpoint, params={"page": page}
     )
-    if status == 200 and isinstance(body, list):
-        return body
-    return None
+    return page, status, headers, body
 
 
 async def fetch_items_for_contracts(client, contract_ids: list[int],

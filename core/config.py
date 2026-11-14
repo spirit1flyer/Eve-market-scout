@@ -7,7 +7,7 @@ The values below are kept for reference/documentation only.
 # =============================================================================
 # APP VERSION - Update this single line to change version everywhere
 # =============================================================================
-APP_VERSION = "3.63 live"
+APP_VERSION = "3.64 live"
 
 # Region IDs
 JITA_REGION_ID = 10000002  # The Forge
@@ -140,6 +140,22 @@ REQUEST_TIMEOUT = 60  # total per-request wall-clock; doubled from 30 so a
 # when CCP investigates abuse. Format: "app-name/version (contact)".
 # Update the contact if you want CCP to reach a different inbox/handle.
 ESI_USER_AGENT = f"EVE-Market-Scout/{APP_VERSION} (spirit1flyer@yahoo.com; Discord: spirit1flyer)"
+
+# Pin the ESI behavior this release was reviewed against. Without this header
+# ESI serves its oldest supported compatibility date, which can hide newer
+# response contracts and defer breaking changes until that oldest date moves.
+ESI_COMPATIBILITY_DATE = "2026-11-13"
+
+
+def get_esi_headers(extra: dict = None) -> dict:
+    """Return standard headers for an ESI request, plus caller overrides."""
+    headers = {
+        "User-Agent": ESI_USER_AGENT,
+        "X-Compatibility-Date": ESI_COMPATIBILITY_DATE,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
 
 # When the X-ESI-Error-Limit-Remain header drops to or below this number,
 # we pre-emptively pause outgoing requests until the window resets. Hitting

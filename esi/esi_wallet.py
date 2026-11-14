@@ -1,12 +1,21 @@
 """ESI Wallet and Order data fetching for EVE Market Scout."""
 
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from esi.esi_auth import ESIAuth
+from core.esi_rate_limit import esi_request
 
 BASE_URL = "https://esi.evetech.net/latest"
+
+_RESOURCE_FALLBACK_SECONDS = {
+    "balance": 60,
+    "transactions": 60 * 60,
+    "journal": 60 * 60,
+    "orders": 20 * 60,
+    "order_history": 60 * 60,
+}
 
 
 @dataclass
@@ -87,6 +96,9 @@ class ESIWallet:
         # ESI cache expiry tracking - we track orders specifically
         # since that's what matters for trade sync (not balance which is ~60s)
         self.orders_cache_expires: Optional[datetime] = None
+        self.resource_cache_expires: Dict[str, datetime] = {}
+        self.resource_last_success: Dict[str, datetime] = {}
+        self.resource_generations: Dict[str, int] = {}
 
     def _parse_expires_header(self, response: requests.Response) -> Optional[datetime]:
         """Parse the Expires header from an ESI response."""
@@ -96,7 +108,6 @@ class ESIWallet:
         
         try:
             # ESI format: "Thu, 16 Jan 2025 14:05:22 GMT"
-            from datetime import timezone
             return datetime.strptime(expires_str, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
         except ValueError:
             return None
@@ -110,7 +121,6 @@ class ESIWallet:
         if self.orders_cache_expires is None:
             return 0
         
-        from datetime import timezone
         now = datetime.now(timezone.utc)
         delta = (self.orders_cache_expires - now).total_seconds()
         
@@ -120,28 +130,47 @@ class ESIWallet:
         # Add 1s buffer to ensure CCP servers have refreshed
         return delta + 1.0
 
-    def _make_request(self, endpoint: str, params: dict = None) -> Optional[dict | list]:
-        """Make authenticated ESI request."""
+    def _record_resource_success(self, resource: str,
+                                 response: requests.Response):
+        now = datetime.now(timezone.utc)
+        expires = self._parse_expires_header(response)
+        if expires is None:
+            expires = now + timedelta(
+                seconds=_RESOURCE_FALLBACK_SECONDS[resource]
+            )
+        self.resource_cache_expires[resource] = expires
+        self.resource_last_success[resource] = now
+        self.resource_generations[resource] = (
+            self.resource_generations.get(resource, 0) + 1
+        )
+        if resource == "orders":
+            self.orders_cache_expires = expires
+
+    def _seconds_until_resource_due(self, resource: str) -> float:
+        if resource not in self.resource_last_success:
+            return 0.0
+        expires = self.resource_cache_expires.get(resource)
+        if expires is None:
+            return 0.0
+        return max(0.0, (expires - datetime.now(timezone.utc)).total_seconds())
+
+    def _make_request(self, endpoint: str, params: dict = None
+                      ) -> tuple[Optional[dict | list],
+                                 Optional[requests.Response]]:
+        """Make an authenticated request without advancing a cache clock."""
         headers = self.auth.get_auth_headers()
         if not headers:
             print("Not authenticated")
-            return None
+            return None, None
 
         url = f"{BASE_URL}{endpoint}"
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = esi_request("GET", url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
-            
-            # Track orders endpoint cache expiry specifically
-            if "/orders/" in endpoint and "/history" not in endpoint:
-                expires = self._parse_expires_header(response)
-                if expires:
-                    self.orders_cache_expires = expires
-            
-            return response.json()
-        except requests.RequestException as e:
+            return response.json(), response
+        except (requests.RequestException, ValueError) as e:
             print(f"ESI request error: {e}")
-            return None
+            return None, None
 
     def fetch_balance(self) -> float:
         """Fetch current wallet balance."""
@@ -149,9 +178,15 @@ class ESIWallet:
         if not char_id:
             return 0
             
-        data = self._make_request(f"/characters/{char_id}/wallet/")
+        data, response = self._make_request(f"/characters/{char_id}/wallet/")
         if data is not None:
-            self.balance = float(data)
+            try:
+                balance = float(data)
+            except (TypeError, ValueError):
+                print("Wallet balance parse error")
+                return self.balance
+            self.balance = balance
+            self._record_resource_success("balance", response)
         return self.balance
 
     def fetch_transactions(self, from_id: int = None) -> List[Transaction]:
@@ -167,25 +202,39 @@ class ESIWallet:
         if from_id:
             params["from_id"] = from_id
 
-        data = self._make_request(f"/characters/{char_id}/wallet/transactions/", params)
-        
+        data, response = self._make_request(
+            f"/characters/{char_id}/wallet/transactions/", params
+        )
+
+        if data is not None and not isinstance(data, list):
+            print("Wallet transaction response was not a list")
+            return self.transactions
         if data is not None:
-            self.transactions = []
-            for t in data:
-                self.transactions.append(Transaction(
-                    transaction_id=t["transaction_id"],
-                    date=datetime.fromisoformat(t["date"].replace("Z", "+00:00")),
-                    type_id=t["type_id"],
-                    type_name="",  # Resolve later
-                    quantity=t["quantity"],
-                    unit_price=t["unit_price"],
-                    is_buy=t["is_buy"],
-                    location_id=t["location_id"],
-                    journal_ref_id=t["journal_ref_id"]
-                ))
+            try:
+                staged = [
+                    Transaction(
+                        transaction_id=item["transaction_id"],
+                        date=datetime.fromisoformat(
+                            item["date"].replace("Z", "+00:00")
+                        ),
+                        type_id=item["type_id"],
+                        type_name="",
+                        quantity=item["quantity"],
+                        unit_price=item["unit_price"],
+                        is_buy=item["is_buy"],
+                        location_id=item["location_id"],
+                        journal_ref_id=item["journal_ref_id"],
+                    )
+                    for item in data
+                ]
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"Wallet transaction parse error: {e}")
+                return self.transactions
             # Sort newest first
-            self.transactions.sort(key=lambda x: x.date, reverse=True)
-        
+            staged.sort(key=lambda x: x.date, reverse=True)
+            self.transactions = staged
+            self._record_resource_success("transactions", response)
+
         return self.transactions
 
     def fetch_journal(self, page: int = 1) -> List[JournalEntry]:
@@ -206,55 +255,79 @@ class ESIWallet:
         if not headers:
             return self.journal
 
-        # Single-page fetch via raw request so we can read X-Pages.
-        try:
-            response = requests.get(
-                f"{BASE_URL}/characters/{char_id}/wallet/journal/",
-                headers=headers,
-                params={"datasource": "tranquility", "page": page},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as e:
-            print(f"[FeeDiag] journal page={page} fetch error: {e}")
-            return self.journal
+        prior_journal = self.journal
+        staged: List[JournalEntry] = []
+        first_response = None
+        first_validator = None
+        total_pages = page
 
-        if page == 1:
-            self.journal = []
-            total_pages = int(response.headers.get("X-Pages", "1"))
-            print(f"[FeeDiag] journal X-Pages={total_pages} (will fetch all)")
-        else:
-            total_pages = None  # Only set on the first page
+        for current_page in range(page, 10_000):
+            try:
+                response = esi_request(
+                    "GET",
+                    f"{BASE_URL}/characters/{char_id}/wallet/journal/",
+                    headers=headers,
+                    params={"datasource": "tranquility", "page": current_page},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except (requests.RequestException, TypeError, ValueError) as e:
+                print(f"[FeeDiag] journal page={current_page} fetch error: {e}")
+                return prior_journal
 
-        for j in data:
-            self.journal.append(JournalEntry(
-                entry_id=j["id"],
-                date=datetime.fromisoformat(j["date"].replace("Z", "+00:00")),
-                ref_type=j.get("ref_type", ""),
-                amount=j.get("amount", 0),
-                balance=j.get("balance", 0),
-                description=j.get("description", ""),
-                context_id=j.get("context_id"),
-                context_type=j.get("context_id_type")
-            ))
+            validator = response.headers.get("Last-Modified")
+            if first_response is None:
+                first_response = response
+                first_validator = validator
+                try:
+                    total_pages = int(response.headers.get("X-Pages", "1"))
+                except (TypeError, ValueError):
+                    print("[FeeDiag] journal invalid X-Pages header")
+                    return prior_journal
+                print(f"[FeeDiag] journal X-Pages={total_pages} (will fetch all)")
+            elif validator != first_validator:
+                print(
+                    "[ESI-Timing] resource=journal trigger=page_validation "
+                    f"decision=REJECT reason=representation_changed "
+                    f"page={current_page}"
+                )
+                return prior_journal
 
-        # On the first call, recursively fetch remaining pages before sort/diag.
-        if page == 1 and total_pages and total_pages > 1:
-            for p in range(2, total_pages + 1):
-                self.fetch_journal(page=p)
+            if not isinstance(data, list):
+                print("[FeeDiag] journal response was not a list")
+                return prior_journal
 
-        # Sort + summary only on the outermost call (page=1).
-        if page == 1:
-            self.journal.sort(key=lambda x: x.date, reverse=True)
+            try:
+                for entry in data:
+                    staged.append(JournalEntry(
+                        entry_id=entry["id"],
+                        date=datetime.fromisoformat(
+                            entry["date"].replace("Z", "+00:00")
+                        ),
+                        ref_type=entry.get("ref_type", ""),
+                        amount=entry.get("amount", 0),
+                        balance=entry.get("balance", 0),
+                        description=entry.get("description", ""),
+                        context_id=entry.get("context_id"),
+                        context_type=entry.get("context_id_type"),
+                    ))
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"[FeeDiag] journal parse error: {e}")
+                return prior_journal
 
-            # === FEE DIAGNOSTIC (temp) ===
-            ref_counts = {}
-            for je in self.journal:
-                ref_counts[je.ref_type] = ref_counts.get(je.ref_type, 0) + 1
-            print(f"[FeeDiag] journal full fetch: {len(self.journal)} entries; "
-                  f"ref_type counts: {ref_counts}")
+            if current_page >= total_pages:
+                break
 
+        staged.sort(key=lambda x: x.date, reverse=True)
+        self.journal = staged
+        self._record_resource_success("journal", first_response)
+
+        ref_counts = {}
+        for entry in self.journal:
+            ref_counts[entry.ref_type] = ref_counts.get(entry.ref_type, 0) + 1
+        print(f"[FeeDiag] journal full fetch: {len(self.journal)} entries; "
+              f"ref_type counts: {ref_counts}")
         return self.journal
 
     def fetch_orders(self) -> List[MarketOrder]:
@@ -265,19 +338,22 @@ class ESIWallet:
             return []
 
         print(f"Fetching orders for character {char_id}...")
-        data = self._make_request(f"/characters/{char_id}/orders/")
+        data, response = self._make_request(f"/characters/{char_id}/orders/")
         
         print(f"Orders response: {type(data)}, length: {len(data) if data else 'None'}")
-        
+
+        if data is not None and not isinstance(data, list):
+            print("Active orders response was not a list")
+            return self.orders
         if data is not None:
-            self.orders = []
-            for o in data:
-                try:
+            staged = []
+            try:
+                for o in data:
                     # ESI returns is_buy_order directly as a boolean
                     # Default to False (sell order) if not present
                     is_buy = o.get("is_buy_order", False)
                     
-                    self.orders.append(MarketOrder(
+                    staged.append(MarketOrder(
                         order_id=o["order_id"],
                         type_id=o["type_id"],
                         type_name="",
@@ -290,9 +366,12 @@ class ESIWallet:
                         location_id=o["location_id"],
                         escrow=o.get("escrow", 0)
                     ))
-                except KeyError as e:
-                    print(f"Order parse error, missing key: {e}")
-                    print(f"Order data: {o}")
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"Order parse error: {e}")
+                print(f"Order data: {o}")
+                return self.orders
+            self.orders = staged
+            self._record_resource_success("orders", response)
         
         buy_count = len([o for o in self.orders if o.is_buy_order])
         sell_count = len([o for o in self.orders if not o.is_buy_order])
@@ -300,74 +379,140 @@ class ESIWallet:
         return self.orders
 
     def fetch_order_history(self, page: int = 1) -> List[MarketOrder]:
-        """Fetch historical (completed/cancelled) orders."""
+        """Fetch a complete, validator-consistent historical order snapshot."""
         char_id = self.auth.character_id
         if not char_id:
             return []
 
-        params = {"datasource": "tranquility", "page": page}
-        data = self._make_request(f"/characters/{char_id}/orders/history/", params)
-        
-        if data is not None:
-            if page == 1:
-                self.order_history = []
-            
-            for o in data:
+        headers = self.auth.get_auth_headers()
+        if not headers:
+            return self.order_history
+
+        prior_history = self.order_history
+        staged: List[MarketOrder] = []
+        first_response = None
+        first_validator = None
+        total_pages = page
+
+        for current_page in range(page, 10_000):
+            try:
+                response = esi_request(
+                    "GET",
+                    f"{BASE_URL}/characters/{char_id}/orders/history/",
+                    headers=headers,
+                    params={"datasource": "tranquility", "page": current_page},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except (requests.RequestException, TypeError, ValueError) as e:
+                print(f"Order history page {current_page} fetch error: {e}")
+                return prior_history
+
+            validator = response.headers.get("Last-Modified")
+            if first_response is None:
+                first_response = response
+                first_validator = validator
                 try:
-                    # ESI returns is_buy_order directly as a boolean
-                    is_buy = o.get("is_buy_order", False)
-                    
-                    self.order_history.append(MarketOrder(
-                        order_id=o["order_id"],
-                        type_id=o["type_id"],
+                    total_pages = int(response.headers.get("X-Pages", "1"))
+                except (TypeError, ValueError):
+                    print("Order history invalid X-Pages header")
+                    return prior_history
+            elif validator != first_validator:
+                print(
+                    "[ESI-Timing] resource=order_history "
+                    "trigger=page_validation decision=REJECT "
+                    f"reason=representation_changed page={current_page}"
+                )
+                return prior_history
+
+            if not isinstance(data, list):
+                print("Order history response was not a list")
+                return prior_history
+
+            for order in data:
+                try:
+                    staged.append(MarketOrder(
+                        order_id=order["order_id"],
+                        type_id=order["type_id"],
                         type_name="",
-                        is_buy_order=is_buy,
-                        price=o["price"],
-                        volume_total=o["volume_total"],
-                        volume_remain=o["volume_remain"],
-                        issued=datetime.fromisoformat(o["issued"].replace("Z", "+00:00")),
-                        duration=o["duration"],
-                        location_id=o["location_id"],
-                        state=o.get("state", "expired")
+                        is_buy_order=order.get("is_buy_order", False),
+                        price=order["price"],
+                        volume_total=order["volume_total"],
+                        volume_remain=order["volume_remain"],
+                        issued=datetime.fromisoformat(
+                            order["issued"].replace("Z", "+00:00")
+                        ),
+                        duration=order["duration"],
+                        location_id=order["location_id"],
+                        state=order.get("state", "expired"),
                     ))
-                except KeyError as e:
-                    print(f"Order history parse error, missing key: {e}")
-                    print(f"Order data: {o}")
-        
+                except (KeyError, TypeError, ValueError) as e:
+                    print(f"Order history parse error: {e}")
+                    print(f"Order data: {order}")
+                    return prior_history
+
+            if current_page >= total_pages:
+                break
+
+        self.order_history = staged
+        self._record_resource_success("order_history", first_response)
         return self.order_history
 
-    def refresh_all(self, progress_callback=None) -> bool:
-        """Refresh all wallet data."""
+    def refresh_all(self, progress_callback=None, trigger: str = "manual") -> bool:
+        """Refresh only due wallet resources, then reuse all cached results."""
         if not self.auth.is_authenticated:
             return False
 
         try:
-            if progress_callback:
-                progress_callback("Fetching balance...", 0)
-            self.fetch_balance()
+            resources = (
+                ("balance", "balance", self.fetch_balance, lambda: 1),
+                ("transactions", "transactions", self.fetch_transactions,
+                 lambda: len(self.transactions)),
+                ("journal", "journal", self.fetch_journal,
+                 lambda: len(self.journal)),
+                ("orders", "active orders", self.fetch_orders,
+                 lambda: len(self.orders)),
+                ("order_history", "order history", self.fetch_order_history,
+                 lambda: len(self.order_history)),
+            )
+            success = True
+            for index, (resource, label, fetcher, count) in enumerate(resources):
+                next_in = self._seconds_until_resource_due(resource)
+                progress = index * 20
+                if next_in > 0:
+                    print(
+                        f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
+                        f"decision=CACHE next_in={next_in:.0f}s "
+                        f"items={count()}"
+                    )
+                    if progress_callback:
+                        progress_callback(f"Using cached {label}...", progress)
+                    continue
 
-            if progress_callback:
-                progress_callback("Fetching transactions...", 20)
-            self.fetch_transactions()
-
-            if progress_callback:
-                progress_callback("Fetching journal...", 40)
-            self.fetch_journal()
-
-            if progress_callback:
-                progress_callback("Fetching active orders...", 60)
-            self.fetch_orders()
-
-            if progress_callback:
-                progress_callback("Fetching order history...", 80)
-            self.fetch_order_history()
+                print(
+                    f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
+                    "decision=FETCH reason=due"
+                )
+                if progress_callback:
+                    progress_callback(f"Fetching {label}...", progress)
+                prior_generation = self.resource_generations.get(resource, 0)
+                try:
+                    fetcher()
+                except Exception as e:
+                    print(
+                        f"[ESI-Timing] resource={resource} decision=FAILED "
+                        f"error_type={type(e).__name__}"
+                    )
+                if self.resource_generations.get(resource, 0) == prior_generation:
+                    success = False
 
             self.last_update = datetime.now()
             
             if progress_callback:
                 progress_callback("Complete!", 100)
             
-            return True
+            return success
             
         except Exception as e:
             print(f"Error refreshing wallet data: {e}")

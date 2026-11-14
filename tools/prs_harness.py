@@ -63,6 +63,7 @@ def cmd_list(auth: "ESIAuth", slot: str) -> int:
         # Tiny shim: ESIWallet reads auth.character_id (a property pointing at
         # seller). For buyer enumeration, query the orders endpoint directly.
         import requests
+        from core.esi_rate_limit import esi_request
         from esi.esi_wallet import BASE_URL
         headers = auth.get_buyer_headers()
         char_id = auth.buyer_id
@@ -70,7 +71,10 @@ def cmd_list(auth: "ESIAuth", slot: str) -> int:
             print(f"[FAIL] buyer not authenticated")
             return 1
         try:
-            resp = requests.get(f"{BASE_URL}/characters/{char_id}/orders/", headers=headers, timeout=30)
+            resp = esi_request(
+                "GET", f"{BASE_URL}/characters/{char_id}/orders/",
+                headers=headers, timeout=30,
+            )
             resp.raise_for_status()
         except requests.RequestException as e:
             print(f"[FAIL] could not fetch buyer orders: {e}")

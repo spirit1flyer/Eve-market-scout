@@ -85,9 +85,13 @@ class TypeNameMixin:
         for i in range(0, len(type_ids), BATCH_SIZE):
             batch = type_ids[i:i + BATCH_SIZE]
             try:
+                await self._await_rate_limit_pause()
                 async with self.semaphore:
                     url = f"{ESI_BASE_URL}/universe/names/"
                     async with self.session.post(url, json=batch) as response:
+                        self._record_response_headers(
+                            response, "/universe/names/"
+                        )
                         if response.status == 200:
                             data = await response.json()
                             for item in data:
@@ -114,9 +118,11 @@ class TypeNameMixin:
         results = []
 
         try:
+            await self._await_rate_limit_pause()
             async with self.semaphore:
                 url = f"{ESI_BASE_URL}/universe/ids/"
                 async with self.session.post(url, json=[search_term]) as response:
+                    self._record_response_headers(response, "/universe/ids/")
                     if response.status == 200:
                         data = await response.json()
                         for item in data.get("inventory_types", []):

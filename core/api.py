@@ -10,8 +10,9 @@ from core.config import (
     ESI_BASE_URL, MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT,
     JITA_SYSTEM_ID, MIN_SECURITY_STATUS,
     JITA_REGION_ID,
-    ESI_USER_AGENT, ERROR_LIMIT_PAUSE_THRESHOLD,
+    get_esi_headers,
 )
+from core.esi_rate_limit import record_response, wait_async
 from esi.esi_supplement import ESISupplementCache
 from history.market_history import MarketHistoryDB
 from core.ssl_context import make_connector
@@ -75,14 +76,6 @@ class ESIClient(TypeNameMixin):
 
         # Shared per-region order cache (scanner <-> stock market)
         self.order_cache = OrderCacheStore()
-
-        # Error-budget pause. Set when X-ESI-Error-Limit-Remain dips below
-        # ERROR_LIMIT_PAUSE_THRESHOLD; we sleep until the window resets so
-        # we don't trigger a 420 (which would block ALL our requests for the
-        # remainder of the window and put us on CCP's radar for bans).
-        # Plain attribute — write contention across loops is harmless here,
-        # extending the pause is always safe.
-        self._error_limit_pause_until: Optional[datetime] = None
 
         # Backfill legacy Jita fields from disk-loaded cache so has_jita_cache()
         # returns True on startup without forcing a fresh ESI fetch.
@@ -309,7 +302,7 @@ class ESIClient(TypeNameMixin):
             state["session"] = aiohttp.ClientSession(
                 connector=make_connector(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                headers={"User-Agent": ESI_USER_AGENT},
+                headers=get_esi_headers(),
             )
         return state["session"]
 
@@ -446,7 +439,7 @@ class ESIClient(TypeNameMixin):
         self.session = aiohttp.ClientSession(
             connector=make_connector(),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            headers={"User-Agent": ESI_USER_AGENT},
+            headers=get_esi_headers(),
         )
         return self
 
@@ -458,78 +451,12 @@ class ESIClient(TypeNameMixin):
 
     def _record_response_headers(self, response: aiohttp.ClientResponse,
                                  endpoint: str = ""):
-        """Inspect ESI's error-budget headers and arm a pause if we're close.
-
-        `X-ESI-Error-Limit-Remain` counts non-2xx/3xx responses left in the
-        current 60s window (limit is 100). When it dips low we set
-        `_error_limit_pause_until` to the window's reset time so subsequent
-        requests park themselves instead of triggering a 420.
-
-        Logs (every line carries a logger timestamp from main.py's
-        basicConfig, so the times line up with the rest of eve_scout.log):
-          [ESI-RL] error budget X remaining on <endpoint>           (warn zone)
-          [ESI-RL] pausing N s until window resets at <UTC ISO>     (gate arm)
-        """
-        remain_raw = response.headers.get("X-Esi-Error-Limit-Remain")
-        reset_raw = response.headers.get("X-Esi-Error-Limit-Reset")
-        if not remain_raw or not reset_raw:
-            return
-        try:
-            remain = int(remain_raw)
-            reset = int(reset_raw)
-        except (ValueError, TypeError):
-            return
-
-        # Warning zone — budget is dipping but we're not throttling yet. Lets
-        # the user see WHICH endpoint started eating the budget before the
-        # pause-armed line ever fires.
-        if (
-            remain <= ERROR_LIMIT_PAUSE_THRESHOLD * 3
-            and remain > ERROR_LIMIT_PAUSE_THRESHOLD
-            and response.status >= 400
-        ):
-            print(
-                f"[ESI-RL] error budget low: {remain}/100 remaining after "
-                f"HTTP {response.status} on {endpoint or '?'} (resets in {reset}s)"
-            )
-
-        if remain > ERROR_LIMIT_PAUSE_THRESHOLD:
-            return
-
-        pause_until = datetime.now(timezone.utc) + timedelta(seconds=reset + 1)
-        prior = self._error_limit_pause_until
-        if prior is None or pause_until > prior:
-            self._error_limit_pause_until = pause_until
-            print(
-                f"[ESI-RL] THROTTLE ARMED: budget {remain}/100 after HTTP "
-                f"{response.status} on {endpoint or '?'} — pausing all ESI "
-                f"requests for {reset + 1}s, resumes at "
-                f"{pause_until.isoformat(timespec='seconds')}"
-            )
+        """Feed ESI rate headers into the process-wide pacing gate."""
+        record_response(response.headers, response.status, endpoint)
 
     async def _await_rate_limit_pause(self):
-        """If a pause is armed, sleep until it expires before proceeding.
-
-        First waiter to wake clears the pause and logs THROTTLE RELEASED so
-        the log shows a clean start/end pair per throttle event. Concurrent
-        waiters that lose the race just see pause_until cleared and proceed
-        silently.
-        """
-        pause_until = self._error_limit_pause_until
-        if pause_until is None:
-            return
-        delay = (pause_until - datetime.now(timezone.utc)).total_seconds()
-        if delay <= 0:
-            return
-        await asyncio.sleep(delay)
-        # GIL-atomic check-and-clear — only the first waker logs the release.
-        if self._error_limit_pause_until == pause_until:
-            self._error_limit_pause_until = None
-            print(
-                f"[ESI-RL] THROTTLE RELEASED at "
-                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
-                f"— resuming ESI requests"
-            )
+        """Wait for the process-wide legacy/bucket rate gate."""
+        await wait_async()
 
     async def _get_with_headers(self, endpoint: str,
                                 params: dict = None) -> tuple[dict | list, dict]:
@@ -544,6 +471,7 @@ class ESIClient(TypeNameMixin):
         await self._await_rate_limit_pause()
         async with self.semaphore:
             for attempt in range(2):
+                await self._await_rate_limit_pause()
                 async with self.session.get(url, params=params) as response:
                     self._record_response_headers(response, endpoint)
                     if response.status == 429 and attempt == 0:
@@ -668,7 +596,11 @@ class ESIClient(TypeNameMixin):
                 return cached
 
         from esi.esi_auth import ESIAuth
-        from esi.esi_structures import fetch_structure_orders, StructureAccessError
+        from esi.esi_structures import (
+            fetch_structure_orders,
+            StructureAccessError,
+            StructureSnapshotError,
+        )
 
         auth = ESIAuth.singleton()
         loop = asyncio.get_event_loop()
@@ -681,6 +613,14 @@ class ESIClient(TypeNameMixin):
         except StructureAccessError as e:
             print(f"[Structure] {hub_key} fetch failed: {e}")
             return []
+        except StructureSnapshotError as e:
+            existing = self.order_cache._order_cache.get(structure_id, {})
+            stale_orders = existing.get("orders") or []
+            print(
+                f"[Structure] {hub_key} snapshot rejected: {e}; "
+                f"kept {len(stale_orders)} prior orders"
+            )
+            return stale_orders
 
         self._apply_earliest_expires(expires)
         self.order_cache.cache_orders_for_region(structure_id, orders, expires=expires)

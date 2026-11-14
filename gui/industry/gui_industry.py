@@ -196,9 +196,6 @@ class IndustryTabManager:
         self._filter_diag_after = None
         self._last_detail_diag = None
         self._pending_sde_recompute = False
-        self._skill_warm_attempts: Dict[int, int] = {}
-        self._skill_login_waiting: Dict[int, int] = {}
-
         self.sort_col = "profit"
         self.sort_reverse = True
 
@@ -438,8 +435,7 @@ class IndustryTabManager:
             chars_frame, self.roster, self.char_skills, self.char_standings,
             self.set_status, root=self.root,
             bp_puller=self.bp_puller, bp_db=self.bp_db,
-            on_blueprints_pulled=self._on_blueprints_pulled,
-            on_authenticated=self._on_industry_character_authenticated)
+            on_blueprints_pulled=self._on_blueprints_pulled)
 
     def build_calc_context(self):
         """Snapshot a calc context (calc, facility, fees, params) from the current
@@ -1207,9 +1203,8 @@ class IndustryTabManager:
     def _build_time_params(self, tid: int, te: float):
         """(BuildTimeParams, char_id, skills_state) for an item's build time.
 
-        Skills come from the 'Built by' character's cached pull (peek only — no
-        UI-thread ESI). If a char is selected but skills aren't cached, kicks a
-        background warm and reports 'warming' so the panel shows a placeholder.
+        Skills come from the 'Built by' character's cached manual pull. Missing
+        skills stay at zero until the user opens Characters > Skills.
         """
         char_id = self._built_by.get(tid)
         ind = adv = 0
@@ -1222,8 +1217,7 @@ class IndustryTabManager:
                 adv = levels.get("advanced_industry", 0)
                 state = "cached"
             else:
-                state = "warming"
-                self._warm_skills(char_id, tid)
+                state = "not_pulled"
             rc = self.roster.get(char_id)
             if rc:
                 implant = rc.implant_mfg_pct
@@ -1231,65 +1225,6 @@ class IndustryTabManager:
                                  facility_time_bonus_pct=self._time_bonus(),
                                  implant_time_pct=implant)
         return params, char_id, state
-
-    def _warm_skills(self, char_id: int, tid: int):
-        if char_id in self._skill_login_waiting:
-            return
-        if getattr(self, "_warming_skill_id", None) == char_id:
-            return
-        self._warming_skill_id = char_id
-
-        def work():
-            try:
-                success = self.char_skills.fetch(char_id) is not None
-            except Exception as e:
-                _print(f"skill_warm_failed character_id={char_id} error={e}")
-                success = False
-            submit(lambda: self._skill_warm_done(char_id, tid, success))
-
-        threading.Thread(target=work, daemon=True, name="IndustrySkillWarm").start()
-
-    def _skill_warm_done(self, char_id: int, tid: int, success: bool):
-        self._warming_skill_id = None
-        if success:
-            self._skill_warm_attempts.pop(char_id, None)
-            self._skill_login_waiting.pop(char_id, None)
-            if self.selected == tid:
-                self._refresh_detail_if_selected()
-            return
-
-        attempts = self._skill_warm_attempts.get(char_id, 0) + 1
-        self._skill_warm_attempts[char_id] = attempts
-        if attempts < 2:
-            _print(f"skill_warm_retry character_id={char_id} attempt=2")
-            self.frame.after(500, lambda: self._warm_skills(char_id, tid))
-            return
-
-        self._skill_login_waiting[char_id] = tid
-        char = self.roster.get(char_id)
-        name = char.character_name if char and char.character_name else str(char_id)
-        _print(f"skill_login_required character_id={char_id} attempts={attempts}")
-        self.set_status(f"Industry: relog in character {name}")
-        messagebox.showwarning(
-            "Character Login Required",
-            f"Relog in character {name}\n\n"
-            f"Open Industry > Characters and use Refresh login beside {name}.",
-            parent=self.frame,
-        )
-
-    def _on_industry_character_authenticated(self, authenticated_id=None):
-        """Retry skill warms that were paused pending an Industry SSO login."""
-        waiting = list(self._skill_login_waiting.items())
-        for char_id, tid in waiting:
-            if authenticated_id is not None and char_id != authenticated_id:
-                continue
-            self._skill_login_waiting.pop(char_id, None)
-            self._skill_warm_attempts.pop(char_id, None)
-            if self._built_by.get(tid) != char_id:
-                continue
-            self.char_skills.clear(char_id)
-            _print(f"skill_warm_after_login character_id={char_id}")
-            self._warm_skills(char_id, tid)
 
     def _build_time_section(self, r, tid: int):
         frame = ttk.LabelFrame(self.detail, text="Build time (Phase 4)", padding=4)
@@ -1324,13 +1259,13 @@ class IndustryTabManager:
                    command=lambda: self.open_research(tid, r["eiv"], 0, 0)
                    ).pack(side=tk.RIGHT)
 
-        # Provenance: which character's skills, TE used, warming state.
+        # Provenance: which character's manually pulled skills and TE were used.
         if char_id and state == "cached":
             rc = self.roster.get(char_id)
             who = (rc.character_name if rc else str(char_id))
             note = f"TE {te:.0f}, skills from {who}"
-        elif state == "warming":
-            note = f"TE {te:.0f}, loading skills…"
+        elif state == "not_pulled":
+            note = f"TE {te:.0f}, skills not pulled (Characters > Skills)"
         else:
             note = f"TE {te:.0f}, no 'Built by' char (skills = 0)"
         ttk.Label(frame, text="    " + note,

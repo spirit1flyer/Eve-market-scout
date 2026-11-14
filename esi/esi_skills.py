@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from core.calculate import TradingSkills
+from core.esi_rate_limit import esi_request
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -96,7 +97,7 @@ class ESISkills:
         
         url = f"{BASE_URL}{endpoint}"
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = esi_request("GET", url, headers=headers, timeout=30)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
@@ -166,21 +167,11 @@ class ESISkills:
         return trading_skills
     
     def get_skills(self, slot: str = "seller") -> TradingSkills:
-        """
-        Get trading skills for specified slot, fetching if needed.
-        
-        Returns cached skills if available, otherwise fetches.
-        Returns DEFAULT_SKILLS if not authenticated or fetch fails.
-        """
+        """Return cached trading skills without initiating an ESI request."""
         cache = self._get_cache(slot)
         if cache and not cache.is_expired:
             return cache.skills
-        
-        result = self.fetch_skills(slot=slot)
-        if result:
-            return result
-        
-        # Fallback to defaults
+
         from core.calculate import DEFAULT_SKILLS
         return DEFAULT_SKILLS
     
@@ -204,11 +195,7 @@ class ESISkills:
             Trained level (0-5), or 0 if unknown/not trained
         """
         cache = self._get_cache(slot)
-        if not cache:
-            self.fetch_skills(slot=slot)
-            cache = self._get_cache(slot)
-        
-        if not cache:
+        if not cache or cache.is_expired:
             return 0
         
         type_id = SKILL_IDS.get(skill_name.lower())
@@ -225,11 +212,7 @@ class ESISkills:
             Dict of skill_name -> level
         """
         cache = self._get_cache(slot)
-        if not cache:
-            self.fetch_skills(slot=slot)
-            cache = self._get_cache(slot)
-        
-        if not cache:
+        if not cache or cache.is_expired:
             return {name: 0 for name in SKILL_IDS.keys()}
         
         return {
@@ -368,6 +351,20 @@ class ESIStandings:
             modifier = (10.0 + base_standing) * 0.04 * diplomacy
             return base_standing + modifier
         return base_standing
+
+    def _get_cached_standings(self, slot: str) -> Optional[dict]:
+        """Return a fresh in-memory snapshot without fetching from ESI."""
+        if slot == "buyer":
+            cache = self._buyer_standings_cache
+            cache_time = self._buyer_cache_time
+        else:
+            cache = self._seller_standings_cache
+            cache_time = self._seller_cache_time
+        if not cache or not cache_time:
+            return None
+        if datetime.now() >= cache_time + self.cache_duration:
+            return None
+        return cache
     
     def _make_request(self, endpoint: str, slot: str = "seller") -> Optional[dict]:
         """Make authenticated ESI request."""
@@ -377,7 +374,7 @@ class ESIStandings:
         
         url = f"{BASE_URL}{endpoint}"
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = esi_request("GET", url, headers=headers, timeout=30)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
@@ -501,7 +498,7 @@ class ESIStandings:
         base=True returns the raw ESI standing (no Connections/Diplomacy) —
         required for broker fee math; the in-game fee ignores social skills.
         """
-        standings = self.fetch_standings(slot=slot)
+        standings = self._get_cached_standings(slot)
         if not standings:
             return 0.0
         key = 'factions_base' if base else 'factions'
@@ -510,7 +507,7 @@ class ESIStandings:
     def get_corp_standing(self, corp_id: int, slot: str = "seller",
                           base: bool = False) -> float:
         """Get standing with a specific NPC corp (base=True: see get_faction_standing)."""
-        standings = self.fetch_standings(slot=slot)
+        standings = self._get_cached_standings(slot)
         if not standings:
             return 0.0
         key = 'npc_corps_base' if base else 'npc_corps'
@@ -532,7 +529,7 @@ class ESIStandings:
         """
         from core.config import TRADE_HUBS
 
-        standings = self.fetch_standings(slot=slot)
+        standings = self._get_cached_standings(slot)
         if not standings:
             return (0.0, 0.0)
 

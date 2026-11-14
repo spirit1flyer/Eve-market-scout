@@ -21,6 +21,7 @@ async def fetch_market_snapshot(
 
     async with client.semaphore:
         for attempt in range(2):
+            await client._await_rate_limit_pause()
             async with client.session.get(url, params={"page": 1}) as response:
                 client._record_response_headers(response, endpoint)
                 if response.status == 429 and attempt == 0:
@@ -51,7 +52,7 @@ async def fetch_market_snapshot(
         )
         changed_pages = sorted(
             page for page, validator in validators.items()
-            if page_one_validator and validator and validator != page_one_validator
+            if validator != page_one_validator
         )
         if stale_pages or changed_pages:
             details = []

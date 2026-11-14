@@ -426,7 +426,7 @@ async def run_scan(
     """
     global _client
     import aiohttp
-    from core.config import REQUEST_TIMEOUT, get_hub_config, ESI_USER_AGENT
+    from core.config import REQUEST_TIMEOUT, get_hub_config, get_esi_headers
     from core.ssl_context import make_connector
 
     # Use default hub if none provided
@@ -448,7 +448,7 @@ async def run_scan(
     
     session = aiohttp.ClientSession(
         connector=make_connector(),
-        headers={"User-Agent": ESI_USER_AGENT},
+        headers=get_esi_headers(),
         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     )
     _client.session = session

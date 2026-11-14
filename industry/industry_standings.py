@@ -15,7 +15,8 @@ import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 
-from core.config import ESI_USER_AGENT
+from core.config import get_esi_headers
+from core.esi_rate_limit import esi_request
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -70,7 +71,8 @@ class IndustryStandings:
             diplomacy = self.skills.get_level(character_id, "diplomacy")
 
         try:
-            resp = requests.get(
+            resp = esi_request(
+                "GET",
                 f"{BASE_URL}/characters/{character_id}/standings/",
                 headers=headers, timeout=30,
             )
@@ -98,12 +100,9 @@ class IndustryStandings:
         return standings
 
     def get(self, character_id: int) -> dict:
-        """Categorized standings (fetches if needed; empty on failure)."""
+        """Categorized cached standings; never initiates a network request."""
         cache = self._cache.get(character_id)
         if not cache or cache.is_expired:
-            self.fetch(character_id)
-            cache = self._cache.get(character_id)
-        if not cache:
             return {"agents": {}, "npc_corps": {}, "factions": {}}
         return cache.standings
 
@@ -116,9 +115,9 @@ class IndustryStandings:
             if not chunk:
                 continue
             try:
-                resp = requests.post(f"{BASE_URL}/universe/names/",
+                resp = esi_request("POST", f"{BASE_URL}/universe/names/",
                                      json=chunk,
-                                     headers={"User-Agent": ESI_USER_AGENT},
+                                     headers=get_esi_headers(),
                                      timeout=30)
                 resp.raise_for_status()
                 for entry in resp.json():
@@ -129,6 +128,14 @@ class IndustryStandings:
 
     def name_for(self, id_: int) -> Optional[str]:
         return self._names.get(int(id_)) if id_ is not None else None
+
+    def get_cache_status(self, character_id: int) -> tuple[bool, int]:
+        """Return (can_fetch, seconds_remaining) for manual UI diagnostics."""
+        cache = self._cache.get(character_id)
+        if not cache or cache.is_expired:
+            return True, 0
+        remaining = (cache.expires_at - datetime.now()).total_seconds()
+        return False, max(0, int(remaining))
 
     def clear(self, character_id: int = None):
         if character_id is None:

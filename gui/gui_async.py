@@ -21,7 +21,7 @@ import threading
 
 import aiohttp
 
-from core.config import REQUEST_TIMEOUT, ESI_USER_AGENT
+from core.config import REQUEST_TIMEOUT, get_esi_headers
 from core.ssl_context import make_connector
 
 
@@ -45,7 +45,7 @@ def run_coro_blocking(client, coro_fn):
             # run_until_complete, not before it.
             session = aiohttp.ClientSession(
                 connector=make_connector(),
-                headers={"User-Agent": ESI_USER_AGENT},
+                headers=get_esi_headers(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             )
             client.session = session

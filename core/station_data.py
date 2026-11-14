@@ -57,9 +57,11 @@ async def _batch_names(client, ids: list[int]) -> dict[int, str]:
     for i in range(0, len(ids), BATCH):
         batch = ids[i:i + BATCH]
         try:
+            await client._await_rate_limit_pause()
             async with client.semaphore:
                 url = f"{ESI_BASE_URL}/universe/names/"
                 async with client.session.post(url, json=batch) as resp:
+                    client._record_response_headers(resp, "/universe/names/")
                     if resp.status == 200:
                         for item in await resp.json():
                             result[item["id"]] = item["name"]

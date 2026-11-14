@@ -213,6 +213,7 @@ class CharactersPanel:
         """Pull this character's owned blueprints via ESI (worker thread)."""
         if not self.bp_puller or char.character_id in self._pulling:
             return
+        print("[ESI-Timing] resource=blueprints trigger=manual decision=FETCH")
         self._pulling.add(char.character_id)
         self.set_status(f"Industry: pulling blueprints for {char.character_name}…")
         self.refresh_cards()  # reflect the disabled "Pulling…" state
@@ -304,6 +305,9 @@ class CharactersPanel:
         loading.pack(anchor="w")
 
         def work():
+            can_fetch, next_in = self.skills.get_cache_status(char.character_id)
+            decision = "FETCH" if force or can_fetch else "CACHE"
+            print(f"[ESI-Timing] resource=industry_skills trigger=manual decision={decision} next_in={next_in}s")
             self.skills.fetch(char.character_id, force_refresh=force)
             levels = self.skills.get_levels(char.character_id)
             submit(lambda: self._fill_skills(container, levels))
@@ -362,6 +366,10 @@ class CharactersPanel:
             tree.column(c, width=w, anchor="w" if c != "standing" else "e")
 
         def work():
+            can_fetch, next_in = self.standings.get_cache_status(char.character_id)
+            decision = "FETCH" if can_fetch else "CACHE"
+            print(f"[ESI-Timing] resource=industry_standings trigger=manual decision={decision} next_in={next_in}s")
+            self.standings.fetch(char.character_id)
             data = self.standings.get(char.character_id)
             # Only factions + corps are relevant; agents are dropped.
             ids = [i for kind in ("factions", "npc_corps")

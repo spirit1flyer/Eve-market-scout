@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from typing import Optional, Dict, Callable
 from datetime import datetime, timedelta
 
-from core.config import ESI_USER_AGENT
+from core.config import ESI_USER_AGENT, get_esi_headers
 from core.sound_manager import get_data_dir
 
 # File paths - use centralized data directory
@@ -873,11 +873,10 @@ class ESIAuth:
         token = self.get_valid_token(slot)
         if not token:
             return {}
-        return {
+        return get_esi_headers({
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": ESI_USER_AGENT,
-        }
+        })
 
     def get_seller_headers(self) -> Dict[str, str]:
         """Get auth headers for seller character."""

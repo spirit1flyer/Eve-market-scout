@@ -25,7 +25,7 @@ from typing import Optional, List, Callable
 import requests
 
 from core.sound_manager import get_data_dir
-from core.config import ESI_USER_AGENT
+from core.config import ESI_USER_AGENT, get_esi_headers
 from esi.esi_auth import (
     CharacterAuth,
     create_sso_login_attempt,
@@ -81,6 +81,9 @@ class IndustryRoster:
 
     def __init__(self):
         self.characters: List[RosterCharacter] = []
+        self._save_lock = threading.RLock()
+        self._refresh_locks: dict[int, threading.Lock] = {}
+        self._refresh_locks_guard = threading.Lock()
         self._load()
 
     @classmethod
@@ -107,12 +110,17 @@ class IndustryRoster:
             print(f"[IndustryRoster] Error loading roster: {e}")
 
     def _save(self):
-        try:
-            data = {"characters": [c.to_dict() for c in self.characters]}
-            with open(ROSTER_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-        except IOError as e:
-            print(f"[IndustryRoster] Error saving roster: {e}")
+        with self._save_lock:
+            try:
+                data = {"characters": [c.to_dict() for c in self.characters]}
+                with open(ROSTER_FILE, "w") as f:
+                    json.dump(data, f, indent=2)
+            except IOError as e:
+                print(f"[IndustryRoster] Error saving roster: {e}")
+
+    def _refresh_lock_for(self, character_id: int) -> threading.Lock:
+        with self._refresh_locks_guard:
+            return self._refresh_locks.setdefault(character_id, threading.Lock())
 
     # =========================================================================
     # ROSTER MANAGEMENT
@@ -300,33 +308,36 @@ class IndustryRoster:
     def _refresh_token_for(self, char: RosterCharacter) -> bool:
         if not char or not char.refresh_token:
             return False
-        try:
-            response = requests.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": char.refresh_token,
-                    "client_id": CLIENT_ID,
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": ESI_USER_AGENT,
-                },
-                timeout=30,
-            )
-            if response.status_code != 200:
-                print(f"[IndustryRoster] Token refresh HTTP {response.status_code}: {response.text[:200]}")
+        with self._refresh_lock_for(char.character_id):
+            if char.access_token and not char.is_expired:
+                return True
+            try:
+                response = requests.post(
+                    TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": char.refresh_token,
+                        "client_id": CLIENT_ID,
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": ESI_USER_AGENT,
+                    },
+                    timeout=30,
+                )
+                if response.status_code != 200:
+                    print(f"[IndustryRoster] Token refresh HTTP {response.status_code}: {response.text[:200]}")
+                    return False
+                data = response.json()
+                char.access_token = data["access_token"]
+                char.refresh_token = data.get("refresh_token", char.refresh_token)
+                expires_in = data.get("expires_in", 1200)
+                char.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+                self._save()
+                return True
+            except requests.RequestException as e:
+                print(f"[IndustryRoster] Error refreshing token: {e}")
                 return False
-            data = response.json()
-            char.access_token = data["access_token"]
-            char.refresh_token = data.get("refresh_token", char.refresh_token)
-            expires_in = data.get("expires_in", 1200)
-            char.token_expiry = datetime.now() + timedelta(seconds=expires_in)
-            self._save()
-            return True
-        except requests.RequestException as e:
-            print(f"[IndustryRoster] Error refreshing token: {e}")
-            return False
 
     # =========================================================================
     # TOKEN ACCESS
@@ -346,5 +357,7 @@ class IndustryRoster:
         token = self.get_valid_token(character_id)
         if not token:
             return {}
-        return {"Authorization": f"Bearer {token}", "Accept": "application/json",
-                "User-Agent": ESI_USER_AGENT}
+        return get_esi_headers({
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        })

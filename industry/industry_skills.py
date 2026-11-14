@@ -13,6 +13,7 @@ scope set already includes `esi-skills.read_skills.v1`. Parse math mirrors
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict
+from core.esi_rate_limit import esi_request
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -60,7 +61,8 @@ class IndustrySkills:
             return None
 
         try:
-            resp = requests.get(
+            resp = esi_request(
+                "GET",
                 f"{BASE_URL}/characters/{character_id}/skills/",
                 headers=headers, timeout=30,
             )
@@ -82,14 +84,11 @@ class IndustrySkills:
     def get_levels(self, character_id: int) -> Dict[str, int]:
         """Return the named industry skill levels for a character.
 
-        Fetches if not cached. Missing/unauthenticated → all zeros.
+        Cache-only: missing/expired data returns all zeros. Network acquisition
+        is deliberately limited to an explicit Characters > Skills action.
         """
         cache = self._cache.get(character_id)
         if not cache or cache.is_expired:
-            self.fetch(character_id)
-            cache = self._cache.get(character_id)
-
-        if not cache:
             return {name: 0 for name in INDUSTRY_SKILL_IDS}
 
         return {
