@@ -337,10 +337,7 @@ class ESIWallet:
             print("fetch_orders: No character_id")
             return []
 
-        print(f"Fetching orders for character {char_id}...")
         data, response = self._make_request(f"/characters/{char_id}/orders/")
-        
-        print(f"Orders response: {type(data)}, length: {len(data) if data else 'None'}")
 
         if data is not None and not isinstance(data, list):
             print("Active orders response was not a list")
@@ -375,7 +372,10 @@ class ESIWallet:
         
         buy_count = len([o for o in self.orders if o.is_buy_order])
         sell_count = len([o for o in self.orders if not o.is_buy_order])
-        print(f"Parsed {len(self.orders)} orders ({buy_count} buy, {sell_count} sell)")
+        print(
+            "[ESI-Parse] resource=orders "
+            f"items={len(self.orders)} buy={buy_count} sell={sell_count}"
+        )
         return self.orders
 
     def fetch_order_history(self, page: int = 1) -> List[MarketOrder]:
@@ -483,7 +483,7 @@ class ESIWallet:
                 if next_in > 0:
                     print(
                         f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
-                        f"decision=CACHE next_in={next_in:.0f}s "
+                        f"decision=REUSE reason=not_due next_in={next_in:.0f}s "
                         f"items={count()}"
                     )
                     if progress_callback:
@@ -497,15 +497,30 @@ class ESIWallet:
                 if progress_callback:
                     progress_callback(f"Fetching {label}...", progress)
                 prior_generation = self.resource_generations.get(resource, 0)
+                fetch_error = None
                 try:
                     fetcher()
                 except Exception as e:
+                    fetch_error = e
                     print(
-                        f"[ESI-Timing] resource={resource} decision=FAILED "
+                        f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
+                        "decision=FAILED phase=fetch "
                         f"error_type={type(e).__name__}"
                     )
                 if self.resource_generations.get(resource, 0) == prior_generation:
                     success = False
+                    if fetch_error is None:
+                        print(
+                            f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
+                            "decision=FAILED phase=validate reason=no_new_snapshot"
+                        )
+                else:
+                    next_due = self._seconds_until_resource_due(resource)
+                    print(
+                        f"[ESI-Timing] resource={resource} trigger=trade_{trigger} "
+                        f"decision=FETCHED next_in={next_due:.0f}s "
+                        f"items={count()}"
+                    )
 
             self.last_update = datetime.now()
             
@@ -515,7 +530,11 @@ class ESIWallet:
             return success
             
         except Exception as e:
-            print(f"Error refreshing wallet data: {e}")
+            print(
+                "[ESI-Timing] resource=trade_bundle "
+                f"trigger={trigger} decision=FAILED phase=orchestration "
+                f"error_type={type(e).__name__}"
+            )
             return False
 
     # === Analysis helpers ===

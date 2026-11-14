@@ -43,15 +43,6 @@ from core.config import AUTO_REFRESH_INTERVAL, get_hub_config
 from core.sound_manager import play_alert
 
 
-def _check_thread(context: str):
-    """Debug helper - warn if not on main thread."""
-    current = threading.current_thread()
-    if current is not threading.main_thread():
-        print(f"[THREAD WARNING] {context} called from {current.name}")
-        import traceback
-        traceback.print_stack(limit=8)
-
-
 class MainScanMixin:
     """Mixin providing scan execution and results display."""
 
@@ -161,7 +152,11 @@ class MainScanMixin:
 
     def _run_scan_thread(self, is_auto, filter_values, refresh_jita):
         """Thread target that runs the async scan."""
-        print(f"[THREAD DEBUG] _run_scan_thread starting on {threading.current_thread().name}")
+        trigger = "auto" if is_auto else "manual"
+        print(
+            "[ScanFlow] stage=worker_start "
+            f"trigger={trigger} thread={threading.current_thread().name}"
+        )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         error_msg = None
@@ -174,11 +169,13 @@ class MainScanMixin:
         seller_skills = None
         buyer_skills = None
         if self.tracking_manager:
-            _check_thread("_run_scan_thread -> tracking_manager.get_skills()")
             seller_skills = self.tracking_manager.get_skills()
+            print("[ScanFlow] stage=skills_snapshot source=tracking_memory")
             # For cross-hub, we'd need buyer skills too
             # TODO: Get buyer skills when second character is implemented
             buyer_skills = seller_skills  # For now, use same skills
+        else:
+            print("[ScanFlow] stage=skills_snapshot source=scanner_defaults")
 
         # Reconciler maintenance (backfill/prune) finishes its current
         # chunk and pauses while this is set.
@@ -231,6 +228,12 @@ class MainScanMixin:
         finally:
             loop.close()
             set_scan_active(False)
+            status = "failed" if error_msg else "complete"
+            print(
+                "[ScanFlow] stage=worker_end "
+                f"trigger={trigger} status={status} "
+                f"next_scan_in={int(refresh_seconds) if refresh_seconds > 0 else 0}s"
+            )
 
         # Schedule UI updates on main thread
         if error_msg:

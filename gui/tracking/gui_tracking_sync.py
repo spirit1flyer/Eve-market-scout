@@ -25,15 +25,28 @@ def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = Non
         peeked = order_cache.peek_cached_orders(region_id, max_age_seconds=300)
         if peeked is not None:
             orders, age = peeked
-            print(f"[Underbid] Using shared order dump for region {region_id} "
-                  f"(age: {age:.0f}s, {len(orders)} orders)")
+            print(
+                "[TradeSync] stage=underbid_snapshot decision=REUSE "
+                f"source=shared_region_cache region={region_id} "
+                f"age={age:.0f}s orders={len(orders)}"
+            )
             return orders
 
     if not type_ids:
+        print(
+            "[TradeSync] stage=underbid_snapshot decision=SKIP "
+            f"region={region_id} reason=no_active_sell_types"
+        )
         return []
 
     all_orders = []
+    failed_types = 0
     base_url = "https://esi.evetech.net/latest"
+    print(
+        "[ESI-Timing] resource=regional_orders trigger=underbid_fallback "
+        f"decision=FETCH reason=shared_cache_miss region={region_id} "
+        f"types={len(type_ids)}"
+    )
 
     for type_id in type_ids:
         try:
@@ -65,8 +78,20 @@ def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = Non
                 page += 1
             all_orders.extend(type_orders)
         except Exception as e:
-            print(f"Error fetching market orders for type {type_id}: {e}")
+            failed_types += 1
+            print(
+                "[ESI-Timing] resource=regional_orders "
+                "trigger=underbid_fallback decision=FAILED "
+                f"region={region_id} type_id={type_id} "
+                f"error_type={type(e).__name__}"
+            )
 
+    print(
+        "[ESI-Timing] resource=regional_orders trigger=underbid_fallback "
+        f"decision=COMPLETE status={'ok' if failed_types == 0 else 'partial_failure'} "
+        f"region={region_id} types={len(type_ids)} failed_types={failed_types} "
+        f"orders={len(all_orders)}"
+    )
     return all_orders
 
 
@@ -255,7 +280,7 @@ class ESISyncManager:
         expires_in = self.wallet.get_seconds_until_refresh()
         print(
             "[ESI-Timing] resource=trade_bundle "
-            f"trigger={trigger} decision=FETCH "
+            f"trigger={trigger} decision=CHECK "
             f"orders_expires_in={expires_in:.0f}s"
         )
         
@@ -269,7 +294,8 @@ class ESISyncManager:
             next_orders = self.wallet.get_seconds_until_refresh()
             print(
                 "[ESI-Timing] resource=trade_bundle "
-                f"trigger={trigger} decision={'FETCHED' if success else 'FAILED'} "
+                f"trigger={trigger} decision=COMPLETE "
+                f"status={'ok' if success else 'partial_failure'} "
                 f"orders_expires_in={next_orders:.0f}s "
                 f"transactions={len(self.wallet.transactions)} "
                 f"journal={len(self.wallet.journal)} "
@@ -277,29 +303,13 @@ class ESISyncManager:
                 f"order_history={len(self.wallet.order_history)}"
             )
             
-            # Debug: check what orders came back
-            print(f"Orders fetched: {len(self.wallet.orders)}")
-            for o in self.wallet.orders[:5]:
-                print(f"  {o.type_id} buy={o.is_buy_order} price={o.price}")
-
-            # Debug: check pending trades vs orders
             pending = [t for t in self.tracker.trades.values() if t.status == "pending"]
-            print(f"Pending trades: {len(pending)}")
-            for t in pending:
-                print(f"  {t.type_name} (type_id={t.type_id})")
-                matching_orders = [o for o in self.wallet.orders if o.type_id == t.type_id and not o.is_buy_order]
-                print(f"    Matching sell orders: {len(matching_orders)}")
-            
-            # Debug: check transactions
-            print(f"Transactions fetched: {len(self.wallet.transactions)}")
-            for tx in self.wallet.transactions[:10]:
-                print(f"  {tx.type_id} buy={tx.is_buy} qty={tx.quantity} price={tx.unit_price}")
-            
-            # Debug: check buy matching for pending trades
-            print("Checking buy transaction matches:")
-            for t in pending:
-                matching_buys = [tx for tx in self.wallet.transactions if tx.type_id == t.type_id and tx.is_buy]
-                print(f"  {t.type_name}: {len(matching_buys)} buy transaction(s)")
+            print(
+                "[TradeSync] stage=wallet_snapshot "
+                f"pending_trades={len(pending)} orders={len(self.wallet.orders)} "
+                f"transactions={len(self.wallet.transactions)} "
+                f"journal={len(self.wallet.journal)}"
+            )
             
             # Fetch market orders so _on_esi_refresh can run the underbid check
             # against inventory listings (the underbid check itself moved out of
@@ -312,11 +322,18 @@ class ESISyncManager:
                         o.type_id for o in self.wallet.orders if not o.is_buy_order
                     }) if self.wallet else []
                     order_cache = self.get_client().order_cache if self.get_client else None
-                    print(f"Fetching market orders ({self.hub_key})...")
+                    print(
+                        "[TradeSync] stage=underbid_snapshot decision=LOAD "
+                        f"hub={self.hub_key} region={region_id} "
+                        f"active_sell_types={len(listed_type_ids)}"
+                    )
                     self.market_orders_cache = fetch_market_orders_sync(
                         region_id, listed_type_ids, order_cache
                     )
-                    print(f"  Got {len(self.market_orders_cache)} orders")
+                    print(
+                        "[TradeSync] stage=underbid_snapshot decision=READY "
+                        f"hub={self.hub_key} orders={len(self.market_orders_cache)}"
+                    )
             
             def update():
                 import time as _pt
