@@ -4,6 +4,10 @@ EVE Market Scout is an independent, open-source desktop application. It uses
 CCP's EVE Swagger Interface (ESI) and EVE Online SSO. It is not affiliated with
 or endorsed by CCP Games.
 
+The application is provided for use at your own risk. ESI data can be delayed,
+incomplete, unavailable, or inaccurate, and calculations may contain errors.
+Verify important market or industry decisions in EVE Online before acting.
+
 ## What the application reads
 
 The trading login requests read-only access for:
@@ -24,6 +28,10 @@ The separate Industry character roster requests read-only access for:
 The application also reads public ESI resources such as regional market
 orders, market history, routes, stations, systems, and type names. Public
 resources do not require a character login.
+
+Authentication uses the official EVE Online SSO page. EVE Market Scout never
+receives or stores your EVE Online password; that password should only be
+entered on the official EVE Online sign-in page.
 
 ## When data is acquired
 
@@ -46,8 +54,12 @@ paginated `Last-Modified` values, and share one process-wide rate-limit gate.
 Access and refresh tokens are stored only in the application's local data
 directory (`%APPDATA%\EVEMarketScout` on Windows). Character-derived caches,
 settings, and tracking data are stored there as well. The application does not
-operate an external account service and does not upload this data to the
-project author.
+operate an external account service, telemetry service, or automatic crash
+uploader, and it does not send character data back to the project author.
+
+Tokens are not separately encrypted by the application. They rely on the
+normal access controls of your Windows user profile, so anyone with access to
+that profile may be able to read them.
 
 Treat local token and character-data files as sensitive. Do not publish or
 attach them to bug reports.
@@ -59,5 +71,5 @@ the application's authorization from EVE Online account management. Deleting
 the corresponding local authorization file removes the locally stored tokens;
 revoking access through EVE Online invalidates the grant at CCP.
 
-EVE Online and the EVE logo are registered trademarks of CCP hf. All EVE data
-and imagery are property of CCP hf.
+© 2014 CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related
+logos and images are trademarks or registered trademarks of CCP hf.

@@ -556,12 +556,12 @@ class ESIWallet:
         if not candidates:
             print(f"[FeeDiag] get_broker_fee_for_order({order_id}) "
                   f"issued={issued.isoformat()}: NO brokers_fee within "
-                  f"±{tolerance_seconds}s")
+                  f"+/-{tolerance_seconds}s")
             return 0
         candidates.sort(key=lambda t: t[0])
         delta, best = candidates[0]
         print(f"[FeeDiag] get_broker_fee_for_order({order_id}) "
-              f"issued={issued.isoformat()}: DATE match Δ={delta:.2f}s "
+              f"issued={issued.isoformat()}: DATE match delta={delta:.2f}s "
               f"amount={abs(best.amount)} ({len(candidates)} candidate(s))")
         return abs(best.amount)
 
