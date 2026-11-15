@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Callable
 
+from core.item_filters import filter_expired_profiles
 from core.tk_queue import submit
 
 
@@ -51,7 +52,7 @@ def _fmt_until(dt_utc, now_utc=None) -> str:
 class HubPanelRefreshMixin:
     """Display-refresh cycle for a single hub panel.
 
-    Expects the host class to provide: hub_key, region_id, profiles,
+    Expects the host class to provide: hub_key, region_id, order_cache_key, profiles,
     risk_panels, holdings_panel, live_prices, _update_ticker().
     """
 
@@ -62,7 +63,7 @@ class HubPanelRefreshMixin:
         """
         import time as _pt
         _pt0 = _pt.perf_counter()
-        entry = order_cache._order_cache.get(self.region_id, {})
+        entry = order_cache._order_cache.get(self.order_cache_key, {})
         orders = entry.get("orders", [])
         if not orders:
             print(f"[PerfTimer] render_from_cache hub={getattr(self, 'hub_key', '?')} orders=0 total=0ms")
@@ -95,7 +96,7 @@ class HubPanelRefreshMixin:
     def update_refresh_labels(self, order_cache):
         """Update last_refreshed / next_refresh labels from the order cache."""
         now = datetime.now(timezone.utc)
-        entry = order_cache._order_cache.get(self.region_id, {})
+        entry = order_cache._order_cache.get(self.order_cache_key, {})
         ts = entry.get("timestamp")
         expires = entry.get("expires")
         self._last_refreshed_var.set(f"Updated: {_fmt_ago(ts, now)}")
@@ -131,6 +132,16 @@ class HubPanelRefreshMixin:
                     f"[StockMarket-{self.hub_key}] Found {len(region_profiles)} "
                     f"profiles for region {self.region_id}"
                 )
+
+                before_expired = len(region_profiles)
+                region_profiles = filter_expired_profiles(
+                    region_profiles, sde=sde
+                )
+                if len(region_profiles) != before_expired:
+                    print(
+                        f"[StockMarket-{self.hub_key}] Auto-ignore expired: "
+                        f"{before_expired - len(region_profiles)} profiles"
+                    )
 
                 # Volume gate — drop items below the configured min_daily_volume
                 # so they never reach the Low/Medium/High panels.

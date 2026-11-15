@@ -10,6 +10,7 @@ from typing import Callable, Union
 
 from scanning.scanner_common import Deal
 from core.config import MIN_PROFIT_PER_UNIT, MIN_TOTAL_PROFIT, MIN_MARGIN_PERCENT, MIN_DAILY_VOLUME, get_hub_config, DEFAULT_HUB
+from core.item_filters import is_expired_type_id
 from core.sound_manager import get_data_dir
 
 
@@ -558,15 +559,21 @@ class FilterManager:
         return removed_from
 
     def is_ignored(self, type_id: int) -> bool:
-        """Check if item is ignored (either session or always)."""
-        return type_id in self.ignored_type_ids or type_id in self.session_ignored_type_ids
+        """Check user ignores plus the global automatic expired-item rule."""
+        return (
+            type_id in self.ignored_type_ids
+            or type_id in self.session_ignored_type_ids
+            or is_expired_type_id(type_id)
+        )
 
     def get_ignore_type(self, type_id: int) -> str | None:
-        """Get the ignore type for an item: 'always', 'session', or None."""
+        """Get the ignore type: 'always', 'session', 'automatic', or None."""
         if type_id in self.ignored_type_ids:
             return "always"
         if type_id in self.session_ignored_type_ids:
             return "session"
+        if is_expired_type_id(type_id):
+            return "automatic"
         return None
 
     def clear_session_ignores(self):

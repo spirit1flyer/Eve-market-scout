@@ -19,6 +19,7 @@ from core.config import (
 )
 from core.api import ESIClient
 from core.calculate import TradingSkills, DEFAULT_SKILLS
+from core.item_filters import filter_expired_orders
 
 from scanning.scanner_common import Candidate, ScanResult, Deal
 from scanning.scanner_steals import process_steals
@@ -120,6 +121,9 @@ class MarketScanner:
         
         update(f"Fetching {hub_name} orders...", 5)
         local_orders = await self.client.get_orders_for_hub(self.hub_key)
+        local_orders = filter_expired_orders(
+            local_orders, context=f"scanner:{self.hub_key}"
+        )
         print(f"{hub_name} orders: {len(local_orders)}, unique types: {len(set(o['type_id'] for o in local_orders))}")
 
         update("Checking system security...", 15)
@@ -147,6 +151,9 @@ class MarketScanner:
             else:
                 update("Fetching Jita region orders...", 30)
                 jita_orders = await self.client.get_market_orders(JITA_REGION_ID, use_cache=False)
+            jita_orders = filter_expired_orders(
+                jita_orders, context=f"scanner:{self.hub_key}:jita-reference"
+            )
 
         # === PHASE 2: Process orders into candidates ===
         
@@ -360,10 +367,16 @@ class MarketScanner:
         buy_orders = await self.client.get_orders_for_hub(
             buy_station_key, use_cache=not refresh_data
         )
+        buy_orders = filter_expired_orders(
+            buy_orders, context=f"crosshub:{buy_station_key}:buy"
+        )
 
         update(f"Fetching {sell_config['name']} orders...", 15)
         sell_orders = await self.client.get_orders_for_hub(
             sell_station_key, use_cache=not refresh_data
+        )
+        sell_orders = filter_expired_orders(
+            sell_orders, context=f"crosshub:{sell_station_key}:sell"
         )
         
         # === PHASE 2: Check system security ===

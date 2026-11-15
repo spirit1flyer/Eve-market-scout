@@ -198,12 +198,12 @@ def search_structures_by_name(
 
 def fetch_structure_orders(
     structure_id: int, auth: ESIAuth, slot: str = "seller"
-) -> Tuple[list, Optional[datetime]]:
+) -> Tuple[list, Optional[datetime], dict]:
     """Fetch every page of a structure's market orders.
 
-    Returns (orders, expires_utc). Order dicts match the regional /markets/{id}/
-    orders/ shape so they slot straight into the existing scanner pipeline.
-    Raises StructureAccessError on 403/404.
+    Returns (orders, expires_utc, metadata). Order dicts match the regional
+    /markets/{id}/orders/ shape so they slot straight into the existing
+    scanner pipeline. Raises StructureAccessError on 403/404.
     """
     headers = auth.get_auth_headers(slot)
     if not headers:
@@ -222,6 +222,7 @@ def fetch_structure_orders(
         expires = _parse_expires(first)
         total_pages = int(first.headers.get("X-Pages", "1"))
         first_validator = first.headers.get("Last-Modified")
+        etag = first.headers.get("ETag")
         changed_page = None
 
         for page in range(2, total_pages + 1):
@@ -247,7 +248,12 @@ def fetch_structure_orders(
                 f"trigger=page_validation decision=ACCEPT pages={total_pages} "
                 f"validation={validation}"
             )
-            return orders, expires
+            return orders, expires, {
+                "etag": etag,
+                "last_modified": first_validator,
+                "complete": True,
+                "source": "esi_structure_orders",
+            }
 
         decision = "RETRY" if snapshot_attempt == 0 else "REJECT"
         print(

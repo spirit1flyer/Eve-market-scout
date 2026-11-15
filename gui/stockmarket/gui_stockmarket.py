@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional, Callable, List, Dict, TYPE_CHECKING
 
 from core.tk_queue import submit
-from core.config import TRADE_HUBS, get_hub_config
+from core.config import TRADE_HUBS, get_hub_config, is_stock_market_hub
 from analytics.historical_profiles import ProfileManager
 from gui.stockmarket.gui_stockmarket_settings import load_settings, save_settings
 from gui.stockmarket.gui_stockmarket_hub import StockMarketHubPanel
@@ -67,7 +67,7 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
         self._active_hub_key: Optional[str] = None
         # Last ESI-freshen timestamp per hub_key for holdings history.
         # Debounce repeated tab switches within _HOLDINGS_FRESHEN_MIN_INTERVAL.
-        self._holdings_freshen_ts: Dict[str, datetime] = {}
+        self._holdings_freshen_ts = self.settings.get_holdings_freshen_times()
         
         # Create main frame
         self.frame = ttk.Frame(notebook)
@@ -159,9 +159,7 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
         # Create a panel for each enabled hub.
         # Custom stations only appear here if in_stock_market is True.
         for hub_key, config in TRADE_HUBS.items():
-            if not config.get("enabled", True):
-                continue
-            if config.get("custom") and not config.get("in_stock_market"):
+            if not is_stock_market_hub(hub_key):
                 continue
 
             # Frame for this hub's tab
@@ -421,12 +419,18 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
                             break
                 return
     
-    def update_from_local_orders(self, orders: List[dict], region_id: Optional[int] = None):
+    def update_from_local_orders(
+        self,
+        orders: List[dict],
+        region_id: Optional[int] = None,
+        hub_key: Optional[str] = None,
+    ):
         """Update prices from scan results.
 
         Args:
             orders: List of market orders from scan
             region_id: Region the orders are from (if known)
+            hub_key: Exact scanner hub, preferred for custom stations/structures
         """
         if self._stock_market_off():
             return
@@ -457,30 +461,35 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
 
         print(f"[StockMarket] update_from_local_orders: {len(prices)} live prices from region {region_id}")
 
-        # If region specified, update that hub only
+        # Route to the exact scanner hub when available. Region fallback is
+        # retained for older callers, but an unmatched region must not leak
+        # prices into every Stock Market panel.
         _ts = _pt.perf_counter()
-        _hubs_updated = 0
-        if region_id:
-            for hub_key, panel in self.hub_panels.items():
-                config = get_hub_config(hub_key)
-                if config["region_id"] == region_id:
-                    print(f"[StockMarket] -> Updating {hub_key} hub")
-                    panel.update_live_prices(prices)
-                    _hubs_updated = 1
-                    _step_apply = _pt.perf_counter() - _ts
-                    _pt_total = _pt.perf_counter() - _pt0
-                    print(
-                        f"[PerfTimer] StockMarketTab.update_from_local_orders "
-                        f"total={_pt_total*1000:.0f}ms orders={len(orders)} prices={len(prices)} hubs_updated={_hubs_updated} "
-                        f"scan_orders={_step_scan*1000:.0f}ms apply_live_prices={_step_apply*1000:.0f}ms"
-                    )
-                    return
+        if hub_key is not None:
+            panel = self.hub_panels.get(hub_key)
+            target_panels = [(hub_key, panel)] if panel is not None else []
+        elif region_id is not None:
+            target_panels = [
+                (key, panel) for key, panel in self.hub_panels.items()
+                if get_hub_config(key)["region_id"] == region_id
+            ]
+        else:
+            target_panels = list(self.hub_panels.items())
 
-        # Otherwise update all hubs (legacy behavior)
-        print(f"[StockMarket] -> Updating all hubs (no region specified)")
-        for panel in self.hub_panels.values():
+        if not target_panels:
+            print(
+                "[StockMarket] -> Skipping local-order update: "
+                f"no panel for hub={hub_key} region={region_id}"
+            )
+            return
+
+        print(
+            "[StockMarket] -> Updating hubs: "
+            + ", ".join(key for key, _panel in target_panels)
+        )
+        for _key, panel in target_panels:
             panel.update_live_prices(prices)
-            _hubs_updated += 1
+        _hubs_updated = len(target_panels)
         _step_apply = _pt.perf_counter() - _ts
         _pt_total = _pt.perf_counter() - _pt0
         print(
@@ -805,22 +814,27 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
                 asyncio.set_event_loop(loop)
                 try:
                     async def do_burst():
-                        client.ensure_session()
                         client.reset_for_new_loop()
+                        client.ensure_session()
                         total = len(stale)
                         tracker = get_hub_burst_tracker()
-                        for i, (hub_key, region_id, hub_name) in enumerate(stale, 1):
+                        for i, (hub_key, cache_key, hub_name) in enumerate(stale, 1):
                             submit(lambda n=hub_name, idx=i, t=total:
                                    self._update_burst_overlay(n, idx, t))
                             try:
                                 print(f"[StockMarket] Startup pull: {hub_key}")
-                                await client.get_market_orders(region_id)
-                                tracker.mark_complete(hub_key)
+                                await client.get_orders_for_hub(hub_key)
+                                timing = client.order_cache.get_cache_timing(
+                                    cache_key, max_age_seconds=86400
+                                )
+                                if timing['complete']:
+                                    tracker.mark_complete(hub_key)
                             except Exception as e:
                                 print(f"[StockMarket] Startup pull failed "
                                       f"for {hub_key}: {e}")
                     loop.run_until_complete(do_burst())
                 finally:
+                    client.close_loop_state(loop)
                     loop.close()
                 submit(self._hide_burst_overlay)
                 submit(self._apply_material_filter_all)
@@ -902,30 +916,6 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
         """Hide the startup burst overlay."""
         if hasattr(self, '_burst_overlay_frame'):
             self._burst_overlay_frame.place_forget()
-
-    # =========================================================================
-    # Stale-hub helper (shared by startup and post-scanner burst)
-    # =========================================================================
-
-    def _get_stale_hubs(self, client) -> list:
-        """Return (hub_key, region_id, hub_name) for hubs with cache > 24h old."""
-        now = datetime.now(timezone.utc)
-        stale = []
-        for hub_key, config in TRADE_HUBS.items():
-            if not config.get("enabled", True):
-                continue
-            region_id = config["region_id"]
-            entry = client.order_cache._order_cache.get(region_id)
-            if entry and entry.get('timestamp'):
-                age = (now - entry['timestamp']).total_seconds()
-                if age < 86400:
-                    print(f"[StockMarket] {hub_key}: cache fresh ({age/3600:.1f}h old)")
-                    continue
-                print(f"[StockMarket] {hub_key}: cache stale ({age/3600:.1f}h old) - will pull")
-            else:
-                print(f"[StockMarket] {hub_key}: no cache entry - will pull")
-            stale.append((hub_key, region_id, config["name"]))
-        return stale
 
     # =========================================================================
     # Daily hub burst (called after each scanner tick)

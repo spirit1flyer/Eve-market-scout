@@ -656,16 +656,15 @@ class DailyHubBurstTracker:
         if hub_key in self._ran_this_session:
             return False
         if order_cache is not None:
-            from core.config import TRADE_HUBS
-            region_id = TRADE_HUBS.get(hub_key, {}).get("region_id")
-            if region_id:
-                entry = order_cache._order_cache.get(region_id, {})
-                ts = entry.get("timestamp")
-                if ts:
-                    age = (datetime.now(timezone.utc) - ts).total_seconds()
-                    if age < _BURST_MAX_AGE_SECONDS:
-                        self._ran_this_session.add(hub_key)
-                        return False
+            from core.config import get_hub_order_cache_key, is_stock_market_hub
+            if is_stock_market_hub(hub_key):
+                cache_key = get_hub_order_cache_key(hub_key)
+                snapshot = order_cache.peek_cached_orders(
+                    cache_key, max_age_seconds=_BURST_MAX_AGE_SECONDS
+                )
+                if snapshot is not None:
+                    self._ran_this_session.add(hub_key)
+                    return False
         return True
 
     def mark_complete(self, hub_key: str):
@@ -673,11 +672,11 @@ class DailyHubBurstTracker:
 
     def all_complete(self, order_cache=None) -> bool:
         """Return True if every enabled hub has been pulled within 24h."""
-        from core.config import TRADE_HUBS
+        from core.config import TRADE_HUBS, is_stock_market_hub
         return not any(
             self.should_run(hk, order_cache)
-            for hk, cfg in TRADE_HUBS.items()
-            if cfg.get("enabled", True)
+            for hk in TRADE_HUBS
+            if is_stock_market_hub(hk)
         )
 
 

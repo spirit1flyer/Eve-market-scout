@@ -33,6 +33,8 @@ marshalling onto the main thread if it touches Tk widgets.
 import time
 from typing import Callable, Dict, Optional
 
+from core.item_filters import filter_expired_profiles
+
 
 # =============================================================================
 # Pure floor-trend classifier — duplicate of
@@ -109,6 +111,7 @@ def run_material_filter_compute(
     clear_material_risk_cache_for_region(region_id, hub_key=hub_key)
 
     region_profiles = profiles_manager.get_profiles_for_region(region_id)
+    region_profiles = filter_expired_profiles(region_profiles)
 
     if min_volume > 0:
         before = len(region_profiles)
@@ -236,6 +239,7 @@ def run_leading_indicators_compute(
     from analytics import leading_indicators_storage
 
     region_profiles = profiles_manager.get_profiles_for_region(region_id)
+    region_profiles = filter_expired_profiles(region_profiles)
 
     if min_volume > 0:
         before = len(region_profiles)

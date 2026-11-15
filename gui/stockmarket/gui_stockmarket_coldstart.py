@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.config import TRADE_HUBS
+from core.config import TRADE_HUBS, is_stock_market_hub
 
 
 class _ColdStartCancelled(Exception):
@@ -63,7 +63,7 @@ class DetectedState:
     db_row_count: int = 0
     db_items_per_region: dict = field(default_factory=dict)      # {region_id: count}
     profiles_per_region: dict = field(default_factory=dict)      # {region_id: count}
-    stale_hubs: list = field(default_factory=list)               # [(hub_key, region_id, name)]
+    stale_hubs: list = field(default_factory=list)               # [(hub_key, cache_key, name)]
     mf_pending_hubs: list = field(default_factory=list)          # [hub_key]
     li_pending_hubs: list = field(default_factory=list)          # [hub_key]
     sde_industry_available: bool = True                          # blueprint DB present?
@@ -185,7 +185,7 @@ class StockMarketColdStartMixin:
             stats = db.get_stats()
             state.db_row_count = stats.get("row_count", 0)
             for hub_key, config in TRADE_HUBS.items():
-                if not config.get("enabled", True):
+                if not is_stock_market_hub(hub_key):
                     continue
                 region_id = config["region_id"]
                 items = db.get_items_in_region(region_id)
@@ -196,7 +196,7 @@ class StockMarketColdStartMixin:
         # --- profiles per region ---
         try:
             for hub_key, config in TRADE_HUBS.items():
-                if not config.get("enabled", True):
+                if not is_stock_market_hub(hub_key):
                     continue
                 region_id = config["region_id"]
                 profiles = self.profiles.get_profiles_for_region(region_id)
@@ -227,7 +227,7 @@ class StockMarketColdStartMixin:
             mf = MaterialFilterTracker()
             li = LeadingIndicatorsTracker()
             for hub_key, config in TRADE_HUBS.items():
-                if not config.get("enabled", True):
+                if not is_stock_market_hub(hub_key):
                     continue
                 if mf.should_run(hub_key):
                     state.mf_pending_hubs.append(hub_key)
@@ -351,7 +351,7 @@ class StockMarketColdStartMixin:
         """
         regions_to_build = []
         for hub_key, config in TRADE_HUBS.items():
-            if not config.get("enabled", True):
+            if not is_stock_market_hub(hub_key):
                 continue
             region_id = config["region_id"]
             existing = detected.profiles_per_region.get(region_id, 0)
@@ -474,9 +474,9 @@ class StockMarketColdStartMixin:
             tracker = get_hub_burst_tracker()
 
             async def pull_all():
-                client.ensure_session()
                 client.reset_for_new_loop()
-                for idx, (hub_key, region_id, hub_name) in enumerate(
+                client.ensure_session()
+                for idx, (hub_key, cache_key, hub_name) in enumerate(
                     stale, start=1
                 ):
                     self._cold_start_check_cancel()
@@ -487,11 +487,31 @@ class StockMarketColdStartMixin:
                         f"hub {idx} of {total_hubs}"
                     )
                     print(f"[ColdStart] phase 4 [{idx}/{total_hubs}]: "
-                          f"{hub_name} (region {region_id})")
+                          f"{hub_name} (cache key {cache_key})")
                     try:
-                        await client.get_market_orders(region_id)
-                        tracker.mark_complete(hub_key)
-                        print(f"[ColdStart] phase 4: {hub_name} done")
+                        current = client.order_cache.peek_cached_orders(
+                            cache_key, max_age_seconds=86400
+                        )
+                        if current is not None:
+                            tracker.mark_complete(hub_key)
+                            print(
+                                f"[ColdStart] phase 4: {hub_name} was "
+                                "refreshed by another consumer; skipping"
+                            )
+                            self.phase_state.current = idx
+                            continue
+                        await client.get_orders_for_hub(hub_key)
+                        timing = client.order_cache.get_cache_timing(
+                            cache_key, max_age_seconds=86400
+                        )
+                        if timing['complete']:
+                            tracker.mark_complete(hub_key)
+                            print(f"[ColdStart] phase 4: {hub_name} done")
+                        else:
+                            print(
+                                f"[ColdStart] phase 4: {hub_name} returned "
+                                "no complete snapshot; leaving it due"
+                            )
                     except _ColdStartCancelled:
                         raise
                     except Exception as e:
@@ -500,6 +520,7 @@ class StockMarketColdStartMixin:
 
             loop.run_until_complete(pull_all())
         finally:
+            client.close_loop_state(loop)
             loop.close()
 
         print("[ColdStart] === Phase 4 complete ===")

@@ -336,13 +336,20 @@ class SDEIndustryDB:
         return self.get_activity_time(bp, ACTIVITY_MANUFACTURING)
 
     def get_all_manufacturable_items(self) -> List[int]:
-        """Get list of all type_ids that have blueprints (can be manufactured)."""
+        """Get non-expired type_ids that have manufacturing blueprints."""
         try:
             conn = self._get_conn()
             cursor = conn.execute("SELECT DISTINCT product_type_id FROM industry_products")
             result = [row[0] for row in cursor.fetchall()]
             conn.close()
-            return result
+            from core.item_filters import get_expired_type_ids
+            expired_ids = get_expired_type_ids(result)
+            if expired_ids:
+                print(
+                    "[AutoIgnore] context=industry-products "
+                    f"expired_types={len(expired_ids)}"
+                )
+            return [type_id for type_id in result if type_id not in expired_ids]
         except Exception:
             return []
     

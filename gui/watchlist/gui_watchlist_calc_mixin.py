@@ -186,6 +186,7 @@ class MaxBuyCalcMixin:
             asyncio.set_event_loop(loop)
             payload = None
             error_msg = None
+            client = None
 
             try:
                 client = self.get_client() if self.get_client else None
@@ -199,6 +200,8 @@ class MaxBuyCalcMixin:
                 error_msg = str(e)
                 print(f"Max buy calc error: {e}")
             finally:
+                if client is not None:
+                    client.close_loop_state(loop)
                 loop.close()
 
             if error_msg:
@@ -225,39 +228,29 @@ class MaxBuyCalcMixin:
         from gui.gui_station_lookup import StationLookup, PLAYER_STRUCTURE_ID_THRESHOLD
 
         client.reset_for_new_loop()
+        client.ensure_session()
+        regional_orders = await client.get_market_orders(self.region_id)
+        all_orders = [
+            order for order in regional_orders
+            if order.get("type_id") == type_id and order.get("is_buy_order")
+        ]
+        print(
+            "[ESI-Timing] resource=regional_orders trigger=watchlist_max_buy "
+            f"decision=READY source=shared_snapshot region={self.region_id} "
+            f"matches={len(all_orders)}"
+        )
+
+        if not all_orders:
+            return (None, "No buy orders found")
+
+        if not self.nearest_station_mode:
+            return ({"best_buy": max(o["price"] for o in all_orders)}, None)
+
         async with aiohttp.ClientSession(
             headers=get_esi_headers(),
             trace_configs=[make_trace_config()],
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         ) as session:
-            client.session = session
-
-            # Paginate buy orders for this type in the configured region.
-            url = f"https://esi.evetech.net/latest/markets/{self.region_id}/orders/"
-            all_orders = []
-            page = 1
-            while True:
-                async with session.get(url, params={
-                    "type_id": type_id,
-                    "order_type": "buy",
-                    "page": page,
-                }) as resp:
-                    if resp.status != 200:
-                        break
-                    data = await resp.json()
-                    if not data:
-                        break
-                    all_orders.extend(data)
-                    total_pages = int(resp.headers.get("X-Pages", 1))
-                    if page >= total_pages:
-                        break
-                    page += 1
-
-            if not all_orders:
-                return (None, "No buy orders found")
-
-            if not self.nearest_station_mode:
-                return ({"best_buy": max(o["price"] for o in all_orders)}, None)
 
             # --- Nearest-station mode -------------------------------------
             # NPC sales tax doesn't apply the same way at player structures

@@ -7,7 +7,7 @@ The values below are kept for reference/documentation only.
 # =============================================================================
 # APP VERSION - Update this single line to change version everywhere
 # =============================================================================
-APP_VERSION = "3.65 live"
+APP_VERSION = "3.67 live"
 
 # Region IDs
 JITA_REGION_ID = 10000002  # The Forge
@@ -79,6 +79,22 @@ DEFAULT_HUB = "amarr"
 def get_hub_config(hub_key: str) -> dict:
     """Get configuration for a specific hub."""
     return TRADE_HUBS.get(hub_key, TRADE_HUBS[DEFAULT_HUB])
+
+
+def get_hub_order_cache_key(hub_key: str) -> int:
+    """Return the shared order-cache key for a region or player structure."""
+    config = get_hub_config(hub_key)
+    if config.get("type") == "structure":
+        return config["station_id"]
+    return config["region_id"]
+
+
+def is_stock_market_hub(hub_key: str) -> bool:
+    """Whether an enabled hub should participate in Stock Market processing."""
+    config = TRADE_HUBS.get(hub_key)
+    if not config or not config.get("enabled", True):
+        return False
+    return not config.get("custom") or bool(config.get("in_stock_market"))
 
 
 def get_enabled_hubs() -> list[tuple[str, str]]:

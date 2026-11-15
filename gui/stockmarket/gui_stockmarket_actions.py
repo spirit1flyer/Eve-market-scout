@@ -11,9 +11,13 @@ from datetime import datetime, timezone
 from typing import Dict, List, TYPE_CHECKING
 
 from core.tk_queue import submit
-from core.config import get_hub_config
+from core.config import get_hub_config, get_hub_order_cache_key
 from gui.stockmarket.gui_stockmarket_dialogs import AddStockItemDialog
-from gui.stockmarket.gui_stockmarket_settings import StockMarketSettings, StockMarketSettingsDialog
+from gui.stockmarket.gui_stockmarket_settings import (
+    StockMarketSettings,
+    StockMarketSettingsDialog,
+    save_settings,
+)
 from gui.gui_window_utils import fit_window
 
 if TYPE_CHECKING:
@@ -36,6 +40,7 @@ class StockMarketActionsMixin:
     """
 
     _HOLDINGS_FRESHEN_MIN_INTERVAL = 60 * 60
+    _STOCK_ORDER_REUSE_SECONDS = 20 * 60
     
     # =========================================================================
     # Add Item
@@ -148,7 +153,7 @@ class StockMarketActionsMixin:
     # =========================================================================
     
     def _on_refresh_prices(self):
-        """Refresh live prices for current hub tab via independent ESI fetch."""
+        """Recalculate the current hub, acquiring regional orders at most every 20 minutes."""
         hub_key = self._get_current_hub_key()
         if not hub_key:
             self.set_status("No hub selected")
@@ -164,6 +169,7 @@ class StockMarketActionsMixin:
         
         config = get_hub_config(hub_key)
         region_id = config["region_id"]
+        cache_key = get_hub_order_cache_key(hub_key)
         
         self.set_status(f"Fetching {config['name']} market orders...")
         
@@ -179,9 +185,16 @@ class StockMarketActionsMixin:
                     return
                 
                 async def do_fetch():
-                    client.ensure_session()
                     client.reset_for_new_loop()
-                    timing = client.order_cache.get_cache_timing(region_id)
+                    client.ensure_session()
+                    cached = client.order_cache.peek_cached_orders(
+                        cache_key,
+                        max_age_seconds=self._STOCK_ORDER_REUSE_SECONDS,
+                    )
+                    timing = client.order_cache.get_cache_timing(
+                        cache_key,
+                        max_age_seconds=self._STOCK_ORDER_REUSE_SECONDS,
+                    )
                     age = timing['age_seconds']
                     expires_in = timing['expires_in_seconds']
                     age_text = f"{age:.0f}s" if age is not None else "none"
@@ -189,21 +202,28 @@ class StockMarketActionsMixin:
                         f"{expires_in:.0f}s"
                         if expires_in is not None else "unknown"
                     )
-                    decision = 'CACHE' if timing['reusable'] else 'FETCH'
+                    decision = 'CACHE' if cached is not None else 'FETCH'
+                    reason = (
+                        'stock_20m_window'
+                        if cached is not None else timing['reason']
+                    )
                     print(
                         "[ESI-Timing] resource=regional_orders "
-                        f"trigger=stock_manual region={region_id} "
+                        f"trigger=stock_manual hub={hub_key} key={cache_key} "
                         f"decision={decision} "
-                        f"reason={timing['reason']} "
+                        f"reason={reason} "
                         f"age={age_text} expires_in={expires_text} "
                         f"orders={timing['order_count']}"
                     )
-                    # Re-run the Stock Market update on every click, but let
-                    # the shared order cache enforce ESI's expiry window.  A
-                    # missing/expired snapshot still pulls the full region;
-                    # a fresh snapshot is reapplied to panels without asking
-                    # ESI for the same cached representation again.
-                    return await client.get_market_orders(region_id)
+                    # Every click reapplies the current snapshot so derived
+                    # Stock Market values recalculate immediately.  This
+                    # consumer reacquires only when its 20-minute window is
+                    # due; other consumers may refresh the shared snapshot
+                    # sooner and Stock Market will reuse their newer data.
+                    if cached is not None:
+                        orders, _cache_age = cached
+                        return orders
+                    return await client.get_orders_for_hub(hub_key)
                 
                 orders = loop.run_until_complete(do_fetch())
                 
@@ -257,17 +277,26 @@ class StockMarketActionsMixin:
             asyncio.set_event_loop(loop)
             try:
                 async def do_freshen():
-                    client.ensure_session()
                     client.reset_for_new_loop()
+                    client.ensure_session()
                     await client.freshen_history_for_items(region_id, type_ids)
                 loop.run_until_complete(do_freshen())
-                self._holdings_freshen_ts[hub_key] = datetime.now(timezone.utc)
+                completed_at = datetime.now(timezone.utc)
                 print(
                     "[ESI-Timing] resource=market_history "
                     f"trigger=holdings_tab hub={hub_key} decision=FETCHED "
                     f"items={len(type_ids)}"
                 )
-                submit(holdings_panel._schedule_refresh)
+
+                def record_success():
+                    self._holdings_freshen_ts[hub_key] = completed_at
+                    self.settings.holdings_last_freshened[hub_key] = (
+                        completed_at.isoformat()
+                    )
+                    save_settings(self.settings)
+                    holdings_panel._schedule_refresh()
+
+                submit(record_success)
             except Exception as e:
                 if self._holdings_freshen_ts.get(hub_key) == now:
                     self._holdings_freshen_ts.pop(hub_key, None)
@@ -420,12 +449,10 @@ class StockMarketActionsMixin:
             self.set_status("No orders received")
             return
         
-        # Update Stock Market hub panel
-        self.update_from_local_orders(orders, region_id)
-        
         # Count sell orders for status
         sell_count = sum(1 for o in orders if not o.get("is_buy_order"))
         config = get_hub_config(hub_key)
+        self.update_from_local_orders(orders, region_id, hub_key=hub_key)
         self.set_status(f"Updated {config['name']}: {sell_count} sell orders")
     
     def _on_prices_fetched(self, prices: Dict[int, float]):

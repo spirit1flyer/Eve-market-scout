@@ -35,6 +35,7 @@ from tkinter import ttk
 import threading
 from typing import Dict, Optional
 
+from core.item_filters import filter_expired_profiles
 from core.tk_queue import submit
 
 
@@ -242,6 +243,7 @@ class HubFilterPhaseMixin:
 
             # Walk profiles to find stable-floor candidates
             region_profiles = self.profiles.get_profiles_for_region(self.region_id)
+            region_profiles = filter_expired_profiles(region_profiles)
 
             # Compute-time volume gate: skip low-volume items entirely.
             min_volume = getattr(self.settings, "min_daily_volume", 0)
@@ -443,6 +445,7 @@ class HubFilterPhaseMixin:
         try:
             from history.market_history import get_market_history_db
             region_profiles = self.profiles.get_profiles_for_region(self.region_id)
+            region_profiles = filter_expired_profiles(region_profiles)
 
             # Compute-time volume gate: skip low-volume items entirely.
             min_volume = getattr(self.settings, "min_daily_volume", 0)

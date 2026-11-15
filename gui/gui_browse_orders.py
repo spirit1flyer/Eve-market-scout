@@ -214,7 +214,7 @@ class BrowseStructureOrdersDialog(BrowseOrdersFilterMixin, tk.Toplevel):
 
         def worker():
             try:
-                orders, _expires = fetch_structure_orders(
+                orders, _expires, _metadata = fetch_structure_orders(
                     self.structure_id, self.auth, slot=self.slot
                 )
                 err = None

@@ -498,6 +498,8 @@ class RiskCategoryPanel:
         _ts = _pt.perf_counter()
         all_profiles = self.profiles.get_all_profiles()
         region_profiles = [p for p in all_profiles if p.region_id == self.region_id]
+        from core.item_filters import filter_expired_profiles
+        region_profiles = filter_expired_profiles(region_profiles)
         _step_profiles_filter = _pt.perf_counter() - _ts
 
         # Volume gate — drop items below the configured min_daily_volume.

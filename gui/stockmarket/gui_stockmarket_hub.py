@@ -15,7 +15,7 @@ from typing import Optional, Callable, List, Dict, TYPE_CHECKING
 
 from core.tk_queue import submit
 
-from core.config import TRADE_HUBS, get_hub_config
+from core.config import TRADE_HUBS, get_hub_config, get_hub_order_cache_key
 from analytics.historical_profiles import ProfileManager, YearlyStats
 from gui.stockmarket.gui_stockmarket_ticker import ScrollingTicker
 from gui.stockmarket.gui_stockmarket_risk import RiskCategoryPanel, format_isk
@@ -72,6 +72,7 @@ class StockMarketHubPanel(HubPanelRefreshMixin, HubFilterPhaseMixin):
         
         self.region_id = self.hub_config["region_id"]
         self.station_id = self.hub_config["station_id"]
+        self.order_cache_key = get_hub_order_cache_key(hub_key)
         
         # Live prices cache (shared across sub-tabs)
         self.live_prices: Dict[int, float] = {}
@@ -226,6 +227,7 @@ class StockMarketHubPanel(HubPanelRefreshMixin, HubFilterPhaseMixin):
         
         def compute_ticker():
             """Background thread: compute ticker items (DB queries here)."""
+            from core.item_filters import filter_expired_profiles
             from sde.sde_manager import get_sde_manager
             sde = get_sde_manager()
             
@@ -243,6 +245,7 @@ class StockMarketHubPanel(HubPanelRefreshMixin, HubFilterPhaseMixin):
                 risk_level = risk_map.get(current_tab, "low")
                 
                 all_profiles = self.profiles.get_all_profiles()
+                all_profiles = filter_expired_profiles(all_profiles, sde=sde)
                 profiles_to_show = []
                 
                 for profile in all_profiles:

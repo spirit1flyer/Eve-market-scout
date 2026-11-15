@@ -379,8 +379,8 @@ class ESIClient(TypeNameMixin):
     # =========================================================================
 
     def cache_orders_for_region(self, region_id: int, orders: list,
-                                 expires: Optional[datetime] = None):
-        self.order_cache.cache_orders_for_region(region_id, orders, expires)
+                                 expires: Optional[datetime] = None, **metadata):
+        self.order_cache.cache_orders_for_region(region_id, orders, expires, **metadata)
 
     def get_cached_orders(self, region_id: int, max_age_seconds: int = 300) -> Optional[list]:
         return self.order_cache.get_cached_orders(region_id, max_age_seconds)
@@ -588,53 +588,57 @@ class ESIClient(TypeNameMixin):
 
         structure_id = hub_config["station_id"]
 
-        if not force_refresh:
-            cached = self.order_cache.get_cached_orders(structure_id)
-            if cached is not None:
-                cache_entry = self.order_cache._order_cache.get(structure_id, {})
-                self._apply_earliest_expires(cache_entry.get('expires'))
-                return cached
+        async with self.order_cache.fetch_guard(structure_id):
+            if not force_refresh:
+                cached = self.order_cache.get_cached_orders(structure_id)
+                if cached is not None:
+                    entry = self.order_cache._order_cache.get(structure_id, {})
+                    self._apply_earliest_expires(entry.get('expires'))
+                    return cached
 
-        from esi.esi_auth import ESIAuth
-        from esi.esi_structures import (
-            fetch_structure_orders,
-            StructureAccessError,
-            StructureSnapshotError,
-        )
-
-        auth = ESIAuth.singleton()
-        loop = asyncio.get_event_loop()
-
-        def _blocking():
-            return fetch_structure_orders(structure_id, auth, slot="seller")
-
-        try:
-            orders, expires = await loop.run_in_executor(None, _blocking)
-        except StructureAccessError as e:
-            print(f"[Structure] {hub_key} fetch failed: {e}")
-            return []
-        except StructureSnapshotError as e:
-            existing = self.order_cache._order_cache.get(structure_id, {})
-            stale_orders = existing.get("orders") or []
-            print(
-                f"[Structure] {hub_key} snapshot rejected: {e}; "
-                f"kept {len(stale_orders)} prior orders"
+            from esi.esi_auth import ESIAuth
+            from esi.esi_structures import (
+                fetch_structure_orders,
+                StructureAccessError,
+                StructureSnapshotError,
             )
-            return stale_orders
 
-        self._apply_earliest_expires(expires)
-        self.order_cache.cache_orders_for_region(structure_id, orders, expires=expires)
+            auth = ESIAuth.singleton()
+            loop = asyncio.get_event_loop()
 
-        # Phase 1: silent observed-history collection. record_snapshot
-        # swallows its own exceptions; the outer try guards the import path
-        # so a broken module can never block the scanner.
-        try:
-            from history.structure_history import StructureHistoryDB
-            StructureHistoryDB.singleton().record_snapshot(structure_id, orders)
-        except Exception as e:
-            print(f"[StructHist] hook skipped for {structure_id}: {e}")
+            def _blocking():
+                return fetch_structure_orders(structure_id, auth, slot="seller")
 
-        return orders
+            try:
+                result = await loop.run_in_executor(None, _blocking)
+                orders, expires, metadata = result
+            except StructureAccessError as e:
+                print(f"[Structure] {hub_key} fetch failed: {e}")
+                return []
+            except StructureSnapshotError as e:
+                existing = self.order_cache._order_cache.get(structure_id, {})
+                stale_orders = existing.get("orders") or []
+                print(
+                    f"[Structure] {hub_key} snapshot rejected: {e}; "
+                    f"kept {len(stale_orders)} prior orders"
+                )
+                return stale_orders
+
+            self._apply_earliest_expires(expires)
+            self.order_cache.cache_orders_for_region(
+                structure_id, orders, expires, **metadata
+            )
+
+            # Browsing this complete snapshot also advances observed history.
+            try:
+                from history.structure_history import StructureHistoryDB
+                StructureHistoryDB.singleton().record_snapshot(
+                    structure_id, orders
+                )
+            except Exception as e:
+                print(f"[StructHist] hook skipped for {structure_id}: {e}")
+
+            return orders
 
     async def get_market_orders(self, region_id: int, use_cache: bool = False,
                                  force_refresh: bool = False) -> list[dict]:
@@ -659,29 +663,7 @@ class ESIClient(TypeNameMixin):
             if use_cache and region_id == JITA_REGION_ID and self.jita_orders_cache:
                 return self.jita_orders_cache
 
-        fetch_lock = self.order_cache._get_region_fetch_lock(region_id)
-        # This is a threading.Lock (shared process-wide so it serializes
-        # across worker-thread loops too — an asyncio.Lock could not). Acquiring
-        # it directly would BLOCK the event-loop thread across every await in
-        # the locked section, so a second same-loop coroutine racing for the
-        # same region would wedge the whole loop. Acquire off-thread via the
-        # executor so only this coroutine parks. (threading.Lock may be released
-        # from a different thread than acquired it — an RLock could not.)
-        acquire_fut = asyncio.get_running_loop().run_in_executor(
-            None, fetch_lock.acquire)
-        try:
-            await acquire_fut
-        except asyncio.CancelledError:
-            # Cancelled while parked on the acquire (e.g. a wait_for timeout):
-            # the executor thread still completes the acquire eventually, and
-            # nobody below us would release it — the region would wedge
-            # forever. Release it the moment it lands.
-            def _release_orphaned_acquire(f):
-                if not f.cancelled() and f.exception() is None:
-                    fetch_lock.release()
-            acquire_fut.add_done_callback(_release_orphaned_acquire)
-            raise
-        try:
+        async with self.order_cache.fetch_guard(region_id):
             # Re-check after acquiring lock — another thread may have populated cache
             if not force_refresh:
                 cached = self.order_cache.get_cached_orders(region_id)
@@ -693,7 +675,7 @@ class ESIClient(TypeNameMixin):
             self._check_halted()
             for snapshot_attempt in range(2):
                 try:
-                    all_orders, expires, total_pages = (
+                    all_orders, expires, total_pages, metadata = (
                         await fetch_market_snapshot(self, region_id)
                     )
                     break
@@ -715,7 +697,7 @@ class ESIClient(TypeNameMixin):
                 f"orders={len(all_orders)}"
             )
 
-            self.order_cache.cache_orders_for_region(region_id, all_orders, expires=expires)
+            self.order_cache.cache_orders_for_region(region_id, all_orders, expires, **metadata)
 
             # Legacy Jita cache (preserve existing behavior)
             if region_id == JITA_REGION_ID:
@@ -723,8 +705,6 @@ class ESIClient(TypeNameMixin):
                 self.jita_orders_timestamp = datetime.now(timezone.utc)
 
             return all_orders
-        finally:
-            fetch_lock.release()
 
     async def _get_page_safe(self, endpoint: str, page: int) -> list | None:
         """Fetch a page, returning None on 404 (stale pagination). Retries once on timeout."""

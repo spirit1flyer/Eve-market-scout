@@ -6,7 +6,8 @@ Settings are stored in the user's Roaming/AppData folder.
 
 import json
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 import tkinter as tk
@@ -59,11 +60,31 @@ class StockMarketSettings:
     # unaffected. Default True = current behavior.
     stock_market_enabled: bool = True
 
+    # Successful Holdings history acquisitions, keyed by hub. ISO timestamps
+    # make the one-hour consumer gate survive application restarts.
+    holdings_last_freshened: dict[str, str] = field(default_factory=dict)
+
     def get_archive_path(self) -> Path:
         """Get archive path, using default if not set."""
         if self.archive_path:
             return Path(self.archive_path)
         return get_data_dir() / "history-archive"
+
+    def get_holdings_freshen_times(self) -> dict[str, datetime]:
+        """Return valid persisted Holdings acquisition times in UTC."""
+        restored = {}
+        for hub_key, raw_timestamp in self.holdings_last_freshened.items():
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp)
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                restored[hub_key] = timestamp.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                print(
+                    "[StockMarket] Ignored invalid Holdings freshen time "
+                    f"for {hub_key}: {raw_timestamp!r}"
+                )
+        return restored
     
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -72,6 +93,9 @@ class StockMarketSettings:
     @classmethod
     def from_dict(cls, data: dict) -> "StockMarketSettings":
         """Create from dictionary."""
+        holdings_last_freshened = data.get("holdings_last_freshened")
+        if not isinstance(holdings_last_freshened, dict):
+            holdings_last_freshened = {}
         return cls(
             archive_path=data.get("archive_path"),
             buy_percentile=data.get("buy_percentile", DEFAULT_BUY_PERCENTILE),
@@ -81,6 +105,7 @@ class StockMarketSettings:
             min_daily_volume=data.get("min_daily_volume", DEFAULT_MIN_DAILY_VOLUME),
             active_hub_key=data.get("active_hub_key"),
             stock_market_enabled=data.get("stock_market_enabled", True),
+            holdings_last_freshened=dict(holdings_last_freshened),
         )
 
 
@@ -426,6 +451,9 @@ class StockMarketSettingsDialog(tk.Toplevel):
             min_daily_volume=min_volume,
             active_hub_key=self.settings.active_hub_key,
             stock_market_enabled=self.settings.stock_market_enabled,
+            holdings_last_freshened=dict(
+                self.settings.holdings_last_freshened
+            ),
         )
 
         # Save to disk

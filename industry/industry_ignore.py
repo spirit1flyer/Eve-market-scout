@@ -21,15 +21,12 @@ import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from core.item_filters import is_expired_item_name
 from core.sound_manager import get_data_dir
 
 logger = logging.getLogger(__name__)
 
 IGNORE_FILENAME = "industry_ignored.json"
-
-# Product-name prefixes that are auto-hidden from both Industry lists regardless
-# of the manual ignore set. Lower-cased; matched as a prefix on the trimmed name.
-AUTO_HIDE_PREFIXES = ("expired ",)
 
 _SINGLETON: Optional["IgnoreList"] = None
 _SINGLETON_LOCK = threading.Lock()
@@ -37,10 +34,7 @@ _SINGLETON_LOCK = threading.Lock()
 
 def is_auto_hidden(name: Optional[str]) -> bool:
     """True for products that should never appear (e.g. 'Expired …' filaments)."""
-    if not name:
-        return False
-    low = name.strip().lower()
-    return any(low.startswith(p) for p in AUTO_HIDE_PREFIXES)
+    return is_expired_item_name(name)
 
 
 class IgnoreList:

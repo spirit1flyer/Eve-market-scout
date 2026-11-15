@@ -346,7 +346,11 @@ class MainScanMixin:
         _ts = _pt.perf_counter()
         if self.stock_market_tab:
             sell_config = get_hub_config(self.sell_station)
-            self.stock_market_tab.update_from_local_orders(watchlist_orders, sell_config["region_id"])
+            self.stock_market_tab.update_from_local_orders(
+                watchlist_orders,
+                sell_config["region_id"],
+                hub_key=self.sell_station,
+            )
             # Material filter tracking now handled by HubPanel.refresh_display()
         _step_stockmarket = _pt.perf_counter() - _ts
 
@@ -402,7 +406,11 @@ class MainScanMixin:
         if scan_result.sell_station_orders and self.stock_market_tab:
             sell_config = get_hub_config(self.sell_station)
             _ts = _pt.perf_counter()
-            self.stock_market_tab.update_from_local_orders(scan_result.sell_station_orders, sell_config["region_id"])
+            self.stock_market_tab.update_from_local_orders(
+                scan_result.sell_station_orders,
+                sell_config["region_id"],
+                hub_key=self.sell_station,
+            )
             _step_stockmarket = _pt.perf_counter() - _ts
             # Material filter tracking now handled by HubPanel.refresh_display()
 

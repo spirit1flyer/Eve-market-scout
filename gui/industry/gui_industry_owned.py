@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, List, Optional
 
+from core.item_filters import is_expired_item_name
 from core.tk_queue import submit
 from gui.gui_window_utils import make_scrollable
 from industry.industry_ignore import IgnoreList, is_auto_hidden
@@ -182,18 +183,23 @@ class OwnedBlueprintsPanel:
         bps = self.bp_db.get_blueprints()
         rows = []
         unmapped = []
+        expired_count = 0
         for bp in bps:
             bp_tid = bp["type_id"]
             product_tid = self.sde.get_product_for_blueprint(bp_tid)
             if product_tid is None:
                 unmapped.append(bp_tid)
                 continue  # no manufacturing product (research-only/odd BP)
+            product_name = self.names.get_type_name(product_tid) or str(product_tid)
+            if is_expired_item_name(product_name):
+                expired_count += 1
+                continue
             char = self.roster.get(bp["character_id"])
             rows.append({
                 "item_id": bp["item_id"],
                 "bp_type_id": bp_tid,
                 "product_tid": product_tid,
-                "name": self.names.get_type_name(product_tid) or str(product_tid),
+                "name": product_name,
                 "is_copy": bool(bp["is_copy"]),
                 "me": bp["material_efficiency"],
                 "te": bp["time_efficiency"],
@@ -206,7 +212,8 @@ class OwnedBlueprintsPanel:
         bpc_count = sum(1 for r in rows if r["is_copy"])
         _print(
             f"refresh blueprints={len(bps)} mapped={len(rows)} "
-            f"unmapped={len(unmapped)} bpo={bpo_count} bpc={bpc_count}"
+            f"unmapped={len(unmapped)} expired={expired_count} "
+            f"bpo={bpo_count} bpc={bpc_count}"
         )
         if unmapped:
             sample = ",".join(str(tid) for tid in unmapped[:10])

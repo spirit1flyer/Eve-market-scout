@@ -213,6 +213,17 @@ class CharactersPanel:
         """Pull this character's owned blueprints via ESI (worker thread)."""
         if not self.bp_puller or char.character_id in self._pulling:
             return
+        can_fetch, next_in = self.bp_db.get_cache_status(char.character_id)
+        if not can_fetch:
+            mins, secs = divmod(next_in, 60)
+            print(
+                "[ESI-Timing] resource=blueprints trigger=manual "
+                f"decision=CACHE next_in={next_in}s"
+            )
+            self.set_status(
+                f"Industry: blueprints cached for {mins}m {secs}s"
+            )
+            return
         print("[ESI-Timing] resource=blueprints trigger=manual decision=FETCH")
         self._pulling.add(char.character_id)
         self.set_status(f"Industry: pulling blueprints for {char.character_name}…")
@@ -290,15 +301,15 @@ class CharactersPanel:
 
         actions = ttk.Frame(wrap)
         actions.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(actions, text="Re-pull skills",
-                   command=lambda: self._render_skills(skills_box, char, force=True)
+        ttk.Button(actions, text="Refresh skills",
+                   command=lambda: self._render_skills(skills_box, char)
                    ).pack(side=tk.LEFT)
         ttk.Button(actions, text="Save", command=_save).pack(side=tk.RIGHT)
         ttk.Button(actions, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
 
         fit_window(dlg, min_width=380)
 
-    def _render_skills(self, container, char, force=False):
+    def _render_skills(self, container, char):
         for w in container.winfo_children():
             w.destroy()
         loading = ttk.Label(container, text="Loading skills…", foreground=CLR_MUTED)
@@ -306,9 +317,9 @@ class CharactersPanel:
 
         def work():
             can_fetch, next_in = self.skills.get_cache_status(char.character_id)
-            decision = "FETCH" if force or can_fetch else "CACHE"
+            decision = "FETCH" if can_fetch else "CACHE"
             print(f"[ESI-Timing] resource=industry_skills trigger=manual decision={decision} next_in={next_in}s")
-            self.skills.fetch(char.character_id, force_refresh=force)
+            self.skills.fetch(char.character_id)
             levels = self.skills.get_levels(char.character_id)
             submit(lambda: self._fill_skills(container, levels))
 

@@ -13,7 +13,7 @@ class ESIPaginationChangedError(RuntimeError):
 
 async def fetch_market_snapshot(
     client, region_id: int
-) -> tuple[list[dict], Optional[datetime], int]:
+) -> tuple[list[dict], Optional[datetime], int, dict]:
     """Fetch one complete, internally consistent regional order snapshot."""
     url = f"{ESI_BASE_URL}/markets/{region_id}/orders/"
     endpoint = f"/markets/{region_id}/orders/"
@@ -43,6 +43,7 @@ async def fetch_market_snapshot(
                 total_pages = int(response.headers.get("X-Pages", 1))
                 expires = client._parse_expires_header(response)
                 page_one_validator = response.headers.get("Last-Modified")
+                etag = response.headers.get("ETag")
                 all_orders = list(await response.json())
                 break
 
@@ -72,4 +73,9 @@ async def fetch_market_snapshot(
         for page in sorted(page_results):
             all_orders.extend(page_results[page])
 
-    return all_orders, expires, total_pages
+    return all_orders, expires, total_pages, {
+        "etag": etag,
+        "last_modified": page_one_validator,
+        "complete": True,
+        "source": "esi_region_orders",
+    }

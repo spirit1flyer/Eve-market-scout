@@ -214,14 +214,27 @@ class ReprocessTabManager:
             return
 
         # Network refresh off-thread, then apply on the Tk thread.
-        self.set_status("Refreshing reprocessing settings from ESI...")
+        self.set_status("Refreshing or reusing reprocessing settings...")
 
         def work():
             try:
                 if skills is not None:
-                    skills.fetch_skills(force_refresh=True, slot="seller")
+                    can_fetch, next_in = skills.get_cache_status("seller")
+                    decision = "FETCH" if can_fetch else "CACHE"
+                    print(
+                        "[ESI-Timing] resource=skills trigger=reprocess_manual "
+                        f"decision={decision} next_in={next_in}s"
+                    )
+                    skills.fetch_skills(slot="seller")
                 if standings is not None:
-                    standings.fetch_standings(force_refresh=True, slot="seller")
+                    can_fetch, next_in = standings.get_cache_status("seller")
+                    decision = "FETCH" if can_fetch else "CACHE"
+                    print(
+                        "[ESI-Timing] resource=standings "
+                        f"trigger=reprocess_manual decision={decision} "
+                        f"next_in={next_in}s"
+                    )
+                    standings.fetch_standings(slot="seller")
             except Exception as e:
                 _print(f"ESI refresh error: {e}")
             submit(lambda: self._apply_esi(skills, standings, announce=True))

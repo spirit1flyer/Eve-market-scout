@@ -31,10 +31,12 @@ The roster scope set already includes `esi-characters.read_blueprints.v1`
 """
 
 import logging
+import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +53,7 @@ BASE_URL = "https://esi.evetech.net/latest"
 # Slow-pace safety: pause between blueprint pages so a heavy roster pull never
 # hammers ESI (most characters are 1 page; large asset hangars can be several).
 PAGE_PAUSE_SECONDS = 0.3
+BLUEPRINT_MIN_REFRESH_SECONDS = 60 * 60
 
 _SINGLETON: Optional["IndustryBlueprintsDB"] = None
 _SINGLETON_LOCK = threading.Lock()
@@ -122,9 +125,15 @@ class IndustryBlueprintsDB:
             CREATE TABLE IF NOT EXISTS pull_meta (
                 character_id  INTEGER PRIMARY KEY,
                 last_pulled   TEXT,
+                expires_at    TEXT,
                 count         INTEGER NOT NULL DEFAULT 0
             );
         """)
+        columns = {
+            row[1] for row in c.execute("PRAGMA table_info(pull_meta)").fetchall()
+        }
+        if "expires_at" not in columns:
+            c.execute("ALTER TABLE pull_meta ADD COLUMN expires_at TEXT")
         c.commit()
         logger.debug("[IndustryBP] schema ensured at %s", self.db_path)
 
@@ -132,7 +141,8 @@ class IndustryBlueprintsDB:
     # Writes
     # =========================================================================
 
-    def replace_for_character(self, character_id: int, rows: list[dict]) -> int:
+    def replace_for_character(self, character_id: int, rows: list[dict],
+                              expires_at: Optional[datetime] = None) -> int:
         """Replace ALL owned blueprints for one character with `rows`.
 
         A blueprint pull is authoritative for that character: anything not in the
@@ -145,6 +155,7 @@ class IndustryBlueprintsDB:
         """
         character_id = int(character_id)
         now = datetime.now(timezone.utc).isoformat()
+        expires_text = expires_at.isoformat() if expires_at else None
         prepared = []
         for r in rows or []:
             iid = r.get("item_id")
@@ -184,12 +195,14 @@ class IndustryBlueprintsDB:
                         prepared,
                     )
                 c.execute(
-                    "INSERT INTO pull_meta (character_id, last_pulled, count) "
-                    "VALUES (?, ?, ?) "
+                    "INSERT INTO pull_meta "
+                    "(character_id, last_pulled, expires_at, count) "
+                    "VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(character_id) DO UPDATE SET "
                     "  last_pulled = excluded.last_pulled, "
+                    "  expires_at = excluded.expires_at, "
                     "  count = excluded.count",
-                    (character_id, now, len(prepared)),
+                    (character_id, now, expires_text, len(prepared)),
                 )
             logger.debug("[IndustryBP] replaced %d blueprints for character %s",
                          len(prepared), character_id)
@@ -270,13 +283,31 @@ class IndustryBlueprintsDB:
         return {int(r["location_id"]): int(r["cid"]) for r in rows}
 
     def get_pull_meta(self, character_id: int) -> Optional[dict]:
-        """{last_pulled, count} for a character, or None if never pulled."""
+        """Pull timing/count metadata for a character, or None if never pulled."""
         c = self._conn()
         row = c.execute(
-            "SELECT last_pulled, count FROM pull_meta WHERE character_id = ?",
+            "SELECT last_pulled, expires_at, count FROM pull_meta "
+            "WHERE character_id = ?",
             (int(character_id),),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def get_cache_status(self, character_id: int) -> tuple[bool, int]:
+        """Return (can_fetch, seconds_remaining) for a manual blueprint pull."""
+        meta = self.get_pull_meta(character_id)
+        expires_raw = meta.get("expires_at") if meta else None
+        if not expires_raw:
+            return True, 0
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return True, 0
+        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            return True, 0
+        return False, max(0, int(remaining))
 
     def get_stats(self) -> dict:
         c = self._conn()
@@ -313,23 +344,30 @@ class BlueprintPuller:
     def pull(self, character_id: int) -> tuple[bool, str]:
         """Fetch + store one character's blueprints. Returns (ok, message)."""
         character_id = int(character_id)
+        can_fetch, next_in = self.db.get_cache_status(character_id)
+        if not can_fetch:
+            return True, f"cached blueprints valid for {_format_duration(next_in)}"
+
         headers = self.roster.get_auth_headers(character_id)
         if not headers:
             msg = f"not authenticated for character {character_id}"
             print(f"[IndustryBP] {msg}")
             return False, msg
 
-        rows = self._fetch_all_pages(character_id, headers)
-        if rows is None:
+        snapshot = self._fetch_all_pages(character_id, headers)
+        if snapshot is None:
             return False, "ESI fetch failed (see log)"
+        rows, expires_at = snapshot
 
-        written = self.db.replace_for_character(character_id, rows)
+        written = self.db.replace_for_character(
+            character_id, rows, expires_at=expires_at
+        )
         msg = f"stored {written} blueprints"
         print(f"[IndustryBP] character {character_id}: {msg}")
         return True, msg
 
     def _fetch_all_pages(self, character_id: int, headers: dict
-                         ) -> Optional[list[dict]]:
+                         ) -> Optional[tuple[list[dict], datetime]]:
         """Walk every X-Pages page; None on hard failure, [] is valid (no BPs)."""
         all_rows: list[dict] = []
         url = f"{BASE_URL}/characters/{character_id}/blueprints/"
@@ -344,6 +382,7 @@ class BlueprintPuller:
             all_rows.extend(first.json() or [])
             total_pages = int(first.headers.get("X-Pages", "1"))
             first_validator = first.headers.get("Last-Modified")
+            expires_at = _response_expiry(first)
             print(f"[IndustryBP] character {character_id}: X-Pages={total_pages}")
         except (requests.RequestException, ValueError) as e:
             print(f"[IndustryBP] character {character_id} page 1 error: {e}")
@@ -372,7 +411,37 @@ class BlueprintPuller:
                 print(f"[IndustryBP] character {character_id} page {page} "
                       f"error: {e}")
                 return None
-        return all_rows
+        return all_rows, expires_at
+
+
+def _response_expiry(response: requests.Response) -> datetime:
+    """Honor ESI expiry, with a one-hour local minimum between blueprint pulls."""
+    now = datetime.now(timezone.utc)
+    local_floor = now + timedelta(seconds=BLUEPRINT_MIN_REFRESH_SECONDS)
+    server_expiry = None
+
+    cache_control = response.headers.get("Cache-Control", "")
+    match = re.search(r"max-age=(\d+)", cache_control)
+    if match:
+        server_expiry = now + timedelta(seconds=int(match.group(1)))
+    else:
+        expires_raw = response.headers.get("Expires")
+        if expires_raw:
+            try:
+                server_expiry = parsedate_to_datetime(expires_raw)
+                if server_expiry.tzinfo is None:
+                    server_expiry = server_expiry.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                server_expiry = None
+
+    return max(local_floor, server_expiry) if server_expiry else local_floor
+
+
+def _format_duration(seconds: int) -> str:
+    minutes, secs = divmod(max(0, int(seconds)), 60)
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 STRUCTURE_ID_FLOOR = 1_000_000_000_000  # player structures live above 1T

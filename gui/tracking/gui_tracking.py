@@ -562,37 +562,35 @@ class TrackingTabManager:
             self.set_status("ESI skills not initialized")
             return
         
-        # Check cache status - show time remaining if not ready
-        can_refresh, seconds_remaining = self.esi_skills.get_cache_status("seller")
-        if not can_refresh and seconds_remaining > 0:
-            mins = seconds_remaining // 60
-            secs = seconds_remaining % 60
-            print(f"[ESI-Timing] resource=skills_standings trigger=manual decision=SKIP reason=esi_cache next_in={seconds_remaining}s")
-            self.set_status(f"Skills cache valid for {mins}m {secs}s")
-            return
-        
         # Disable button during refresh
         self.skills_btn.configure(state=tk.DISABLED)
-        self.set_status("Refreshing skills/standings...")
+        self.set_status("Refreshing or reusing skills/standings...")
         slots = "seller,buyer" if getattr(self.auth, "has_buyer", False) else "seller"
-        print(f"[ESI-Timing] resource=skills_standings trigger=manual decision=FETCH slots={slots}")
+        print(f"[ESI-Timing] resource=skills_standings trigger=manual decision=CHECK slots={slots}")
         
         def do_fetch():
             """Background thread work."""
             sell_hub = self._sell_hub_override or self.selected_hub
             buy_hub = self._buy_hub_override or sell_hub
 
+            def log_cache_decision(resource, provider, slot):
+                can_fetch, next_in = provider.get_cache_status(slot)
+                decision = "FETCH" if can_fetch else "CACHE"
+                print(f"[ESI-Timing] resource={resource} trigger=manual "
+                      f"slot={slot} decision={decision} next_in={next_in}s")
+
             # Fetch seller skills/standings
             seller_skills = None
             if self.auth.is_authenticated:
-                fetched = self.esi_skills.fetch_skills(slot="seller", force_refresh=True)
+                log_cache_decision("skills", self.esi_skills, "seller")
+                fetched = self.esi_skills.fetch_skills(slot="seller")
                 if fetched:
                     station_standing = 0.0
                     faction_standing = 0.0
                     if self.esi_standings:
-                        # Force-refresh standings so in-memory cache doesn't shadow ESI.
+                        log_cache_decision("standings", self.esi_standings, "seller")
                         # base=True: fee math wants raw standings, not Connections-adjusted.
-                        self.esi_standings.fetch_standings(force_refresh=True, slot="seller")
+                        self.esi_standings.fetch_standings(slot="seller")
                         corp, fac = self.esi_standings.get_standings_for_hub(
                             sell_hub, slot="seller", base=True)
                         station_standing = corp
@@ -609,14 +607,15 @@ class TrackingTabManager:
             # Fetch buyer skills/standings if logged in
             buyer_skills = None
             if hasattr(self.auth, 'has_buyer') and self.auth.has_buyer:
-                fetched = self.esi_skills.fetch_skills(slot="buyer", force_refresh=True)
+                log_cache_decision("skills", self.esi_skills, "buyer")
+                fetched = self.esi_skills.fetch_skills(slot="buyer")
                 if fetched:
                     station_standing = 0.0
                     faction_standing = 0.0
                     if self.esi_standings:
-                        # Force-refresh standings so in-memory cache doesn't shadow ESI.
+                        log_cache_decision("standings", self.esi_standings, "buyer")
                         # base=True: fee math wants raw standings, not Connections-adjusted.
-                        self.esi_standings.fetch_standings(force_refresh=True, slot="buyer")
+                        self.esi_standings.fetch_standings(slot="buyer")
                         corp, fac = self.esi_standings.get_standings_for_hub(
                             buy_hub, slot="buyer", base=True)
                         station_standing = corp
@@ -648,7 +647,7 @@ class TrackingTabManager:
                 
                 # Re-enable button
                 self.skills_btn.configure(state=tk.NORMAL)
-                self.set_status("Skills/standings refreshed")
+                self.set_status("Skills/standings updated")
                 
                 # Notify main GUI
                 if self._on_characters_changed:

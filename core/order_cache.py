@@ -1,17 +1,22 @@
 """Shared per-region order cache with in-flight guard and disk persistence."""
 
+import asyncio
 import gzip
 import json
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from core.config import TRADE_HUBS
 from core.sound_manager import get_data_dir
 
-_REGION_ID_TO_HUB_KEY: dict[int, str] = {
-    cfg["region_id"]: key for key, cfg in TRADE_HUBS.items()
-}
+_REGION_ID_TO_HUB_KEY: dict[int, str] = {}
+for _hub_key, _hub_cfg in TRADE_HUBS.items():
+    if _hub_cfg.get("type") != "structure":
+        # Built-in hubs are inserted first; a custom NPC station in the same
+        # region shares that complete regional snapshot and disk file.
+        _REGION_ID_TO_HUB_KEY.setdefault(_hub_cfg["region_id"], _hub_key)
 
 
 class OrderCacheStore:
@@ -23,8 +28,17 @@ class OrderCacheStore:
         self._inflight_locks_meta = threading.Lock()
         self._load_all_disk_caches()
 
-    def cache_orders_for_region(self, region_id: int, orders: list,
-                                 expires: Optional[datetime] = None):
+    def cache_orders_for_region(
+        self,
+        region_id: int,
+        orders: list,
+        expires: Optional[datetime] = None,
+        *,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+        complete: bool = True,
+        source: str = "unknown",
+    ):
         """Cache orders for a region, with empty-result guard.
 
         Rejects an empty write when a populated cache already exists, protecting
@@ -42,6 +56,10 @@ class OrderCacheStore:
             'orders': orders,
             'timestamp': datetime.now(timezone.utc),
             'expires': expires,
+            'etag': etag,
+            'last_modified': last_modified,
+            'complete': complete,
+            'source': source,
         }
         print(f"[API] Cached {len(orders)} orders for region {region_id}")
         self._save_region_cache_to_disk(region_id)
@@ -80,6 +98,10 @@ class OrderCacheStore:
                 'age_seconds': None,
                 'expires_in_seconds': None,
                 'order_count': 0,
+                'complete': False,
+                'source': None,
+                'etag': None,
+                'last_modified': None,
             }
 
         now = datetime.now(timezone.utc)
@@ -88,7 +110,11 @@ class OrderCacheStore:
         expires_in = ((expires - now).total_seconds()
                       if expires is not None else None)
 
-        if age > max_age_seconds:
+        complete = bool(cached.get('complete', False))
+        if not complete:
+            reusable = False
+            reason = 'incomplete'
+        elif age > max_age_seconds:
             reusable = False
             reason = 'age_limit'
         elif expires_in is not None and expires_in <= 0:
@@ -105,6 +131,10 @@ class OrderCacheStore:
             'age_seconds': age,
             'expires_in_seconds': expires_in,
             'order_count': len(cached.get('orders') or []),
+            'complete': complete,
+            'source': cached.get('source'),
+            'etag': cached.get('etag'),
+            'last_modified': cached.get('last_modified'),
         }
 
     def peek_cached_orders(self, region_id: int,
@@ -118,7 +148,7 @@ class OrderCacheStore:
         protects). Returns (orders, age_seconds) or None.
         """
         cached = self._order_cache.get(region_id)
-        if not cached or not cached.get('orders'):
+        if not cached or not cached.get('complete', False):
             return None
         age = (datetime.now(timezone.utc) - cached['timestamp']).total_seconds()
         if age > max_age_seconds:
@@ -183,6 +213,13 @@ class OrderCacheStore:
                 'orders': orders,
                 'timestamp': timestamp,
                 'expires': expires,
+                'etag': data.get('etag'),
+                'last_modified': data.get('last_modified'),
+                # Legacy cache files lack proof that every page completed.
+                # Keep the data available for display, but reacquire before
+                # treating it as a reusable acquisition snapshot.
+                'complete': bool(data.get('complete', False)),
+                'source': data.get('source', 'legacy_disk'),
             }
             hub_key = _REGION_ID_TO_HUB_KEY.get(region_id, str(region_id))
             print(f"[API] Loaded {len(orders)} orders for {hub_key} from disk")
@@ -205,6 +242,10 @@ class OrderCacheStore:
                     if entry.get('timestamp') else None,
                 'expires': entry['expires'].isoformat()
                     if entry.get('expires') else None,
+                'etag': entry.get('etag'),
+                'last_modified': entry.get('last_modified'),
+                'complete': bool(entry.get('complete', False)),
+                'source': entry.get('source'),
             }
             path.parent.mkdir(parents=True, exist_ok=True)
             with gzip.open(path, 'wt', encoding='utf-8') as f:
@@ -225,8 +266,30 @@ class OrderCacheStore:
             print(f"[API] Failed to delete disk cache for region {region_id}: {e}")
 
     def _get_region_fetch_lock(self, region_id: int) -> threading.Lock:
-        """Get (or create) a per-region fetch lock for in-flight deduplication."""
+        """Get (or create) a per-resource fetch lock for in-flight deduplication."""
         with self._inflight_locks_meta:
             if region_id not in self._inflight_locks:
                 self._inflight_locks[region_id] = threading.Lock()
             return self._inflight_locks[region_id]
+
+    @asynccontextmanager
+    async def fetch_guard(self, cache_key: int):
+        """Serialize one acquisition key across worker threads/event loops."""
+        fetch_lock = self._get_region_fetch_lock(cache_key)
+        acquire_fut = asyncio.get_running_loop().run_in_executor(
+            None, fetch_lock.acquire
+        )
+        try:
+            await asyncio.shield(acquire_fut)
+        except asyncio.CancelledError:
+            # The executor acquire keeps running after coroutine cancellation.
+            # Release it when it lands so the resource cannot wedge forever.
+            def release_orphaned_acquire(future):
+                if not future.cancelled() and future.exception() is None:
+                    fetch_lock.release()
+            acquire_fut.add_done_callback(release_orphaned_acquire)
+            raise
+        try:
+            yield
+        finally:
+            fetch_lock.release()

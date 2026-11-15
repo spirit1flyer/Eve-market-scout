@@ -201,7 +201,9 @@ def main() -> int:
 
     print(f"\n--- fetch_structure_orders({structure_id}) ---")
     try:
-        orders, expires = fetch_structure_orders(structure_id, auth, slot=slot)
+        orders, expires, metadata = fetch_structure_orders(
+            structure_id, auth, slot=slot
+        )
     except StructureAccessError as e:
         print(f"[FAIL] {e}")
         if e.status == 403:
@@ -215,6 +217,7 @@ def main() -> int:
     print(f"[OK]   {len(orders)} orders ({buys} buy / {sells} sell) "
           f"across {unique_types} item types")
     print(f"       cache expires: {expires}")
+    print(f"       snapshot metadata: {metadata}")
 
     if orders:
         sample = orders[0]
