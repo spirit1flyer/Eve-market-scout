@@ -14,6 +14,7 @@ import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict
 from core.esi_rate_limit import esi_request
+from core.esi_diagnostics import decision_event
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -53,6 +54,8 @@ class IndustrySkills:
         """Pull skills for one character. Returns raw {skill_id: level} or None."""
         cache = self._cache.get(character_id)
         if not force_refresh and cache and not cache.is_expired:
+            decision_event("industry_skills", "REUSE", "provider",
+                           items=len(cache.raw_skills))
             return cache.raw_skills
 
         headers = self.roster.get_auth_headers(character_id)
@@ -78,6 +81,7 @@ class IndustrySkills:
             raw_skills[sid] = skill.get("trained_skill_level", 0)
 
         self._cache[character_id] = _SkillCache(raw_skills)
+        decision_event("industry_skills", "COMPLETE", "provider", items=len(raw_skills))
         print(f"[IndustrySkills] Fetched {len(raw_skills)} skills for character {character_id}")
         return raw_skills
 

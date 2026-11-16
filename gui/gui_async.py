@@ -22,6 +22,7 @@ import threading
 import aiohttp
 
 from core.config import REQUEST_TIMEOUT, get_esi_headers
+from core.esi_rate_limit import make_trace_config
 from core.ssl_context import make_connector
 
 
@@ -46,6 +47,7 @@ def run_coro_blocking(client, coro_fn):
             session = aiohttp.ClientSession(
                 connector=make_connector(),
                 headers=get_esi_headers(),
+                trace_configs=[make_trace_config(pacing=False)],
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             )
             client.session = session

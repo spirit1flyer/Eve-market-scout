@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 from core.config import TRADE_HUBS
 from core.sound_manager import get_data_dir
+from core.esi_diagnostics import decision_event, format_refresh_wait
 
 _REGION_ID_TO_HUB_KEY: dict[int, str] = {}
 for _hub_key, _hub_cfg in TRADE_HUBS.items():
@@ -73,12 +74,21 @@ class OrderCacheStore:
            already-expired entry would poison the scanner's countdown timer.
         """
         timing = self.get_cache_timing(region_id, max_age_seconds)
+        decision_event(
+            "structure_orders" if region_id >= 10**12 else "regional_orders",
+            "REUSE" if timing['reusable'] else "MISS", "shared_cache",
+            reason=timing['reason'], items=timing['order_count'],
+            next_in=f"{timing['expires_in_seconds']:.0f}s"
+            if timing['expires_in_seconds'] is not None else "unknown",
+        )
         if not timing['reusable']:
             return None
 
         cached = self._order_cache[region_id]
         age = timing['age_seconds']
-        print(f"[API] Using cached orders for region {region_id} (age: {age:.0f}s)")
+        wait = format_refresh_wait(timing['expires_in_seconds'])
+        print(f"[API] Using cached orders for region {region_id} "
+              f"(age: {age:.0f}s; next scan eligible in: {wait})")
         return cached['orders']
 
     def get_cache_timing(self, region_id: int,

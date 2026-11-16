@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from core.calculate import TradingSkills
 from core.esi_rate_limit import esi_request
+from core.esi_diagnostics import decision_event
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -118,6 +119,7 @@ class ESISkills:
         # Check cache
         cache = self._get_cache(slot)
         if not force_refresh and cache and not cache.is_expired:
+            decision_event("skills", "REUSE", "provider", slot=slot)
             return cache.skills
         
         # Get character ID for this slot
@@ -157,6 +159,7 @@ class ESISkills:
             expires_at=now + self.cache_duration
         )
         self._set_cache(slot, new_cache)
+        decision_event("skills", "COMPLETE", "provider", slot=slot, items=len(skills_list))
         
         char_name = char.character_name or slot
         print(f"ESISkills: Fetched {len(skills_list)} skills for {char_name}")
@@ -403,6 +406,7 @@ class ESIStandings:
         
         if not force_refresh and cache and cache_time:
             if datetime.now() < cache_time + self.cache_duration:
+                decision_event("standings", "REUSE", "provider", slot=slot)
                 return cache
         
         char = self.auth.get_character(slot)
@@ -486,6 +490,7 @@ class ESIStandings:
             self._cache_time = datetime.now()
         
         connections = self._buyer_connections if slot == "buyer" else self._seller_connections
+        decision_event("standings", "COMPLETE", "provider", slot=slot, items=len(data))
         print(f"ESIStandings: Fetched {len(standings['factions'])} faction standings, "
               f"{len(standings['npc_corps'])} corp standings for {slot} (Connections L{connections})")
         

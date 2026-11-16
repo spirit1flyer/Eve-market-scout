@@ -136,7 +136,8 @@ class AddStockItemDialog(tk.Toplevel):
                     
                     async def do_search():
                         client.reset_for_new_loop()
-                        async with aiohttp.ClientSession(connector=make_connector(), headers=get_esi_headers(), timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
+                        from core.esi_rate_limit import make_trace_config
+                        async with aiohttp.ClientSession(connector=make_connector(), headers=get_esi_headers(), trace_configs=[make_trace_config(pacing=False)], timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as session:
                             client.session = session
                             return await client.search_item_by_name(query)
                     

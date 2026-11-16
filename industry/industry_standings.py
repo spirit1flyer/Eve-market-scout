@@ -17,6 +17,7 @@ from typing import Optional, Dict
 
 from core.config import get_esi_headers
 from core.esi_rate_limit import esi_request
+from core.esi_diagnostics import decision_event
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -58,6 +59,7 @@ class IndustryStandings:
         """
         cache = self._cache.get(character_id)
         if not force_refresh and cache and not cache.is_expired:
+            decision_event("industry_standings", "REUSE", "provider")
             return cache.standings
 
         headers = self.roster.get_auth_headers(character_id)
@@ -95,6 +97,7 @@ class IndustryStandings:
                 standings["factions"][from_id] = eff
 
         self._cache[character_id] = _StandingsCache(standings)
+        decision_event("industry_standings", "COMPLETE", "provider", items=len(data))
         print(f"[IndustryStandings] Fetched {len(standings['factions'])} factions / "
               f"{len(standings['npc_corps'])} corps for character {character_id}")
         return standings

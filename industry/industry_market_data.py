@@ -7,7 +7,7 @@ maintains —
   * 7d/30d history:          market_history.db (everef archive)
 The only ESI traffic is the two universe-wide industry endpoints nothing else
 fetches — /markets/prices/ (CCP adjusted prices, for EIV) and /industry/systems/
-(system cost indices) — via the shared api.ESIClient, TTL-gated to 6 hours.
+(system cost indices) — via the shared durable public-response provider.
 
 Also owns the CCP-tuned job-cost constants (SCC surcharge, NPC facility tax,
 alpha clone tax). These are CCP-tuned and have been changed by patches; a stale
@@ -22,10 +22,13 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from core.sound_manager import get_data_dir
+from core.esi_diagnostics import format_refresh_wait
+from core.esi_public_cache import next_refresh_seconds
+from gui.gui_async import run_coro_blocking
 
 from industry.industry_engine import Recipe, SellInfo, FacilityParams, SellFees
 
@@ -35,8 +38,6 @@ SETTINGS_FILE = str(get_data_dir() / "industry_settings.json")
 # Region dumps up to a day old are fine — the scanner refreshes them far more
 # often; a stale dump beats no data (same call as drug_api).
 DUMP_MAX_AGE = 86400
-# Adjusted prices / cost indices update server-side ~daily.
-INDUSTRY_TTL = 6 * 3600
 # History fetch window. ~3 months so the manipulation-baseline (below) has a
 # stable average to compare against; the 7d/30d figures are calendar subsets.
 HISTORY_FETCH_DAYS = 90
@@ -275,15 +276,13 @@ class IndustryMarketData:
 
         if callback:
             callback("Industry data...", 5, 100)
-        if self._industry_stale():
-            try:
-                self._fetch_industry(wanted, set(system_ids))
-                notes.append("industry: fresh")
-            except Exception as e:
-                print(f"[IndustryDiag] industry fetch failed: {e}")
-                notes.append("industry: FAILED (cached)")
-        else:
-            notes.append("industry: cached")
+        try:
+            # Filter the shared full snapshots every time: newly selected IDs
+            # must not wait six hours merely because this view was opened.
+            notes.append(self._fetch_industry(wanted, set(system_ids)))
+        except Exception as e:
+            print(f"[IndustryDiag] industry fetch failed: {e}")
+            notes.append("industry: FAILED (cached)")
 
         if callback:
             callback("Reading order dumps...", 35, 100)
@@ -329,41 +328,27 @@ class IndustryMarketData:
         print(f"[IndustryDiag] Refresh: {self.freshness_note}")
         return self.freshness_note
 
-    def _industry_stale(self) -> bool:
-        if not self.industry_fetched_at:
-            return True
-        try:
-            fetched = datetime.fromisoformat(self.industry_fetched_at)
-        except ValueError:
-            return True
-        return (datetime.now() - fetched).total_seconds() > INDUSTRY_TTL
-
     def _fetch_industry(self, needed_tids: Set[int], wanted_systems: Set[int]):
-        """Adjusted prices + cost indices via the shared client (2 calls)."""
+        """Read full shared snapshots, acquiring only when eligible."""
         client = self.get_client()
 
-        async def _run():
-            # Shared client's session is per-event-loop and lazily created; on
-            # this fresh loop we must create it ourselves or _get crashes on
-            # session=None (the drug "industry: FAILED" bug).
-            session = client.ensure_session()
-            try:
-                return await asyncio.gather(
-                    client._get("/markets/prices/"),
-                    client._get("/industry/systems/"))
-            finally:
-                await session.close()
+        async def _run(api):
+            # Drain both before closing the worker loop, including on failure.
+            results = await asyncio.gather(
+                api.get_public_industry_snapshot("/markets/prices/"),
+                api.get_public_industry_snapshot("/industry/systems/"),
+                return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            return results
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            prices, systems = loop.run_until_complete(_run())
-        finally:
-            loop.close()
+        snapshots = run_coro_blocking(client, _run)
+        prices, systems = [snapshot["payload"] for snapshot in snapshots]
 
         for item in prices or []:
             tid = item.get("type_id")
-            if tid in needed_tids and item.get("adjusted_price"):
+            if tid in needed_tids and "adjusted_price" in item:
                 self.adjusted_prices[tid] = item["adjusted_price"]
 
         for entry in systems or []:
@@ -376,7 +361,17 @@ class IndustryMarketData:
                     indices[ci["activity"]] = ci.get("cost_index", 0)
             self.cost_indices[sid] = indices
 
-        self.industry_fetched_at = datetime.now().isoformat()
+        oldest = min(snapshot["acquired_at"] for snapshot in snapshots)
+        self.industry_fetched_at = oldest.isoformat()
+        now = datetime.now(timezone.utc)
+        age = max(0, (now - oldest).total_seconds())
+        next_refresh = ", ".join(
+            f"{label} in {format_refresh_wait(next_refresh_seconds(snapshot, now))}"
+            for label, snapshot in zip(("prices", "indices"), snapshots))
+        durability = ("" if all(s["durable"] for s in snapshots)
+                      else "; disk save FAILED (memory only)")
+        return (f"industry: snapshot {age / 60:.0f} min old; "
+                f"next eligible refresh: {next_refresh}{durability}")
 
     def _read_dump(self, client, region_id: int):
         """(orders, age_note) from existing caches, or (None, '').

@@ -23,6 +23,7 @@ from typing import Optional, Tuple
 from core.config import get_esi_headers
 from core.esi_rate_limit import esi_request
 from esi.esi_auth import ESIAuth
+from core.esi_private_cache import get_private_cache, private_context
 
 BASE_URL = "https://esi.evetech.net/latest"
 
@@ -139,16 +140,13 @@ def discover_accessible_structures(
     Unreachable structures (403/404 on resolve) are skipped silently — they
     may be ones the character has lost access to since placing the order.
     """
-    headers = auth.get_auth_headers(slot)
     char = auth.get_character(slot)
-    if not headers or not char or not char.character_id:
+    if not char or not char.character_id or not char.access_token:
         raise StructureAccessError(0, 401, f"{slot} slot not authenticated")
 
-    resp = _request_with_retry(
-        f"{BASE_URL}/characters/{char.character_id}/orders/", headers=headers
-    )
-    resp.raise_for_status()
-    orders = resp.json()
+    context = private_context(auth, slot)
+    snapshot = get_private_cache().get(auth, context, "orders", trigger="structure_discovery")
+    orders = snapshot["payload"]
 
     structure_ids = sorted({
         o["location_id"] for o in orders

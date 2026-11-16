@@ -174,6 +174,42 @@ class MainControlsMixin:
         )
         self.browse_orders_btn.pack(side=tk.LEFT, padx=5)
 
+        ttk.Button(row2, text="ESI Report", command=self._print_esi_report,
+                   width=11).pack(side=tk.LEFT, padx=5)
+        self.root.bind("<F12>", lambda _event: self._print_esi_report(), add="+")
+        self.root.bind("<Control-F12>", lambda _event: self._check_private_cache(), add="+")
+
+    def _print_esi_report(self):
+        """Print observed session evidence without scheduling any acquisition."""
+        from core.esi_diagnostics import print_report
+        print_report()
+        self._set_status("ESI report written to terminal and eve_scout.log")
+
+    def _check_private_cache(self):
+        """Run synthetic, offline cache safety checks in the normal app process."""
+        import threading
+        from core.tk_queue import submit
+        if getattr(self, "_private_cache_check_running", False):
+            return
+        self._private_cache_check_running = True
+        self._set_status("Checking private cache safety (offline)...")
+
+        def worker():
+            passed = False
+            try:
+                from tools.private_cache_checks import run_checks
+                passed = run_checks()
+            except Exception as exc:
+                print(f"[ESI-CacheCheck] result=FAIL error_type={type(exc).__name__}")
+
+            def finish():
+                self._private_cache_check_running = False
+                self._set_status("Private cache checks passed (offline)" if passed
+                                 else "Private cache check failed; see eve_scout.log")
+            submit(finish)
+
+        threading.Thread(target=worker, name="private-cache-check", daemon=True).start()
+
     # =========================================================================
     # TOGGLE HANDLERS
     # =========================================================================

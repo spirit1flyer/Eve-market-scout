@@ -75,29 +75,8 @@ def _setup_logging():
         ]
     )
     
-    # Create a stream that writes to both console (if available) and log
-    class TeeStream:
-        """Stream that writes to both original stream and log file."""
-        def __init__(self, original, log_func):
-            self.original = original
-            self.log_func = log_func
-            self.encoding = getattr(original, 'encoding', 'utf-8')
-        
-        def write(self, text):
-            if text.strip():  # Don't log empty lines
-                self.log_func(text.rstrip())
-            if self.original:
-                try:
-                    self.original.write(text)
-                except Exception:
-                    pass  # Console might not exist in packaged build
-        
-        def flush(self):
-            if self.original:
-                try:
-                    self.original.flush()
-                except Exception:
-                    pass
+    # Serialize complete worker lines and flush them immediately to the terminal.
+    from core.console_logging import TeeStream
     
     # Redirect stdout and stderr
     sys.stdout = TeeStream(sys.stdout, logging.info)
@@ -152,6 +131,7 @@ _setup_exception_handler()
 
 from core import custom_stations  # noqa: F401 — populates TRADE_HUBS before GUI init
 from core.api import ESIClient
+from core.esi_rate_limit import make_trace_config
 from scanning.scanner import MarketScanner
 from scanning.scanner_common import ScanResult
 from gui.gui_main import MarketScoutGUI
@@ -449,6 +429,7 @@ async def run_scan(
     session = aiohttp.ClientSession(
         connector=make_connector(),
         headers=get_esi_headers(),
+        trace_configs=[make_trace_config(pacing=False)],
         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     )
     _client.session = session
@@ -503,6 +484,9 @@ async def run_scan(
 
 def main():
     """Main entry point."""
+    from core.esi_diagnostics import start
+    from core.config import APP_VERSION, ESI_COMPATIBILITY_DATE
+    start(__file__, APP_VERSION, ESI_COMPATIBILITY_DATE, _LOG_FILE)
     print("[Startup] EVE Market Scout initializing...")
     
     # ==========================================================================

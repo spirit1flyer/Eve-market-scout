@@ -12,13 +12,14 @@ from core.config import (
     JITA_REGION_ID,
     get_esi_headers,
 )
-from core.esi_rate_limit import record_response, wait_async
+from core.esi_rate_limit import record_response, wait_async, make_trace_config
 from esi.esi_supplement import ESISupplementCache
 from history.market_history import MarketHistoryDB
 from core.ssl_context import make_connector
 from core.order_cache import OrderCacheStore
 from core.market_snapshot import ESIPaginationChangedError, fetch_market_snapshot
 from core.type_name_mixin import TypeNameMixin
+from core.esi_get import ESIGetMixin
 
 # Local debug flag - set True to enable diagnostic output
 DEBUG_ESI = False
@@ -31,7 +32,7 @@ class ESIConnectionHaltedError(RuntimeError):
     restarting the app."""
 
 
-class ESIClient(TypeNameMixin):
+class ESIClient(TypeNameMixin, ESIGetMixin):
     """Async client for EVE ESI API."""
 
     def __init__(self):
@@ -302,7 +303,7 @@ class ESIClient(TypeNameMixin):
             state["session"] = aiohttp.ClientSession(
                 connector=make_connector(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                headers=get_esi_headers(),
+                headers=get_esi_headers(), trace_configs=[make_trace_config(pacing=False)],
             )
         return state["session"]
 
@@ -439,7 +440,7 @@ class ESIClient(TypeNameMixin):
         self.session = aiohttp.ClientSession(
             connector=make_connector(),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            headers=get_esi_headers(),
+            headers=get_esi_headers(), trace_configs=[make_trace_config(pacing=False)],
         )
         return self
 
@@ -457,48 +458,6 @@ class ESIClient(TypeNameMixin):
     async def _await_rate_limit_pause(self):
         """Wait for the process-wide legacy/bucket rate gate."""
         await wait_async()
-
-    async def _get_with_headers(self, endpoint: str,
-                                params: dict = None) -> tuple[dict | list, dict]:
-        """Rate-limited GET returning JSON plus response-header metadata.
-
-        429s get one automatic retry after sleeping for `Retry-After` seconds;
-        any other 4xx/5xx falls through to `raise_for_status()` as before so
-        existing callers (e.g. `_get_page_safe` swallowing 404) keep working.
-        """
-        self._check_halted()
-        url = f"{ESI_BASE_URL}{endpoint}"
-        await self._await_rate_limit_pause()
-        async with self.semaphore:
-            for attempt in range(2):
-                await self._await_rate_limit_pause()
-                async with self.session.get(url, params=params) as response:
-                    self._record_response_headers(response, endpoint)
-                    if response.status == 429 and attempt == 0:
-                        retry_after = max(
-                            1, int(response.headers.get("Retry-After", "1") or "1")
-                        )
-                        print(
-                            f"[ESI-RL] HTTP 429 on {endpoint} — Retry-After "
-                            f"{retry_after}s, sleeping then retrying once"
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
-                    if response.status == 429:
-                        print(
-                            f"[ESI-RL] HTTP 429 on {endpoint} AGAIN after "
-                            f"retry — giving up, raising"
-                        )
-                    response.raise_for_status()
-                    return await response.json(), dict(response.headers)
-        # Unreachable — the loop always returns or raises — but kept for type
-        # checkers that can't prove that.
-        raise RuntimeError("ESI _get_with_headers fell through retry loop unexpectedly")
-
-    async def _get(self, endpoint: str, params: dict = None) -> dict | list:
-        """Rate-limited GET. Honors ESI error-budget and 429 headers."""
-        data, _headers = await self._get_with_headers(endpoint, params)
-        return data
 
     async def get_system_info(self, system_id: int) -> dict:
         """Get system info including security status and stargates."""

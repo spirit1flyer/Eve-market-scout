@@ -20,6 +20,8 @@ standings_cache.json
 # Cache files
 *.jsonl
 esi_supplement.jsonl
+esi_private_*.json.gz
+esi_private_*.json.gz.*.tmp
 
 # Downloaded archives (500MB+)
 history-archive/

@@ -28,6 +28,7 @@ from typing import Optional, Dict, Callable
 from datetime import datetime, timedelta
 
 from core.config import ESI_USER_AGENT, get_esi_headers
+from core.esi_diagnostics import traced_request
 from core.sound_manager import get_data_dir
 
 # File paths - use centralized data directory
@@ -728,8 +729,8 @@ class ESIAuth:
             return False, "No PKCE code verifier (auth flow state lost)"
             
         try:
-            response = requests.post(
-                TOKEN_URL,
+            response = traced_request(
+                "POST", TOKEN_URL,
                 data={
                     "grant_type": "authorization_code",
                     "code": code,
@@ -775,8 +776,8 @@ class ESIAuth:
     def _verify_token(self, char: CharacterAuth) -> bool:
         """Verify token and get character info."""
         try:
-            response = requests.get(
-                VERIFY_URL,
+            response = traced_request(
+                "GET", VERIFY_URL,
                 headers={
                     "Authorization": f"Bearer {char.access_token}",
                     "User-Agent": ESI_USER_AGENT,
@@ -816,8 +817,8 @@ class ESIAuth:
 
             try:
                 # PKCE refresh doesn't need code_verifier, just client_id
-                response = requests.post(
-                    TOKEN_URL,
+                response = traced_request(
+                    "POST", TOKEN_URL,
                     data={
                         "grant_type": "refresh_token",
                         "refresh_token": char.refresh_token,

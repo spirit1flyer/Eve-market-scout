@@ -10,6 +10,7 @@ import aiohttp
 import requests
 
 from core.config import ERROR_LIMIT_PAUSE_THRESHOLD
+from core.esi_diagnostics import attach_trace, traced_request
 
 
 _lock = threading.Lock()
@@ -134,13 +135,13 @@ def record_response(headers, status: int, endpoint: str = ""):
 def esi_request(method: str, url: str, **kwargs) -> requests.Response:
     """Send a synchronous ESI request through the shared pacing gate."""
     wait_sync()
-    response = requests.request(method, url, **kwargs)
+    response = traced_request(method, url, **kwargs)
     record_response(response.headers, response.status_code, url)
     return response
 
 
-def make_trace_config() -> aiohttp.TraceConfig:
-    """Trace direct aiohttp requests that do not go through ESIClient._get."""
+def make_trace_config(pacing: bool = True) -> aiohttp.TraceConfig:
+    """Observe all requests; optionally pace direct callers outside ESIClient."""
     trace = aiohttp.TraceConfig()
 
     async def on_request_start(_session, _context, _params):
@@ -153,6 +154,8 @@ def make_trace_config() -> aiohttp.TraceConfig:
             str(params.url),
         )
 
-    trace.on_request_start.append(on_request_start)
-    trace.on_request_end.append(on_request_end)
+    if pacing:
+        trace.on_request_start.append(on_request_start)
+        trace.on_request_end.append(on_request_end)
+    attach_trace(trace)
     return trace
