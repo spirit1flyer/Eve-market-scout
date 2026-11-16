@@ -88,6 +88,8 @@ async def _raw_request_network(client, method: str, endpoint: str,
     while True:
         await client._await_rate_limit_pause()
         async with client.semaphore:
+            # Another response may establish a cooldown while we wait for a slot.
+            await client._await_rate_limit_pause()
             async with session.request(
                 method, url, params=params, json=json_body, headers=headers
             ) as response:

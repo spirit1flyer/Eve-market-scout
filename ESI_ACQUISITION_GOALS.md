@@ -5,19 +5,42 @@ This file owns the agreed behavior and remaining work order.
 [The compliance reassessment](ESI_COMPLIANCE_REVIEW.md) records baseline findings
 and implementation evidence. An implementation entry is not a runtime pass.
 
-## Current checkpoint — 2026-11-16
+## F1 checkpoint update — 2026-11-16
 
+Current source is **3.68 live**, with Caleb's approval to bump, commit and
+push. The general ESI audit has now been performed; see
+[the audit and F1 follow-up](ESI_FULL_AUDIT_2026-11-16.md). The selected
+[F1/F2 plan](PLAN_ESI_F1_F2.md) governs the next targeted work.
+
+F1 is implemented: queued contract requests recheck the shared cooldown
+inside the semaphore before sending. Two isolated checks bring the IDE
+runner to 54. Syntax/diff checks pass; the latest observed runtime pass
+remains 52/52, and F1's 54-check IDE run and ordinary Contracts review remain
+pending. F2 and its two checks are still planned. The deferred list below
+remains parked; this checkpoint does not declare ESI sign-off.
+
+## Prior checkpoint — 2026-11-16, before the general audit and F1
+
+- **Current pushed code checkpoint:** `b26f1d8` on
+  `checkpoint/esi-compliance-2026-11-16`. It contains both the earlier
+  acquisition batch and the newest history/policy/SSO/notice batch. This is
+  a recovery checkpoint, not a verified release. Subsequent testing is
+  recorded below. The
+  remaining-list/handoff update below is documentation written after that
+  commit; it does not change application code.
 - **Previous pushed baseline:** `b329c8c` on `main`, following `46c76f4`.
-  `APP_VERSION` remains **3.67 live**. The latest commit includes shared
+  `APP_VERSION` remains **3.67 live**. That baseline commit includes shared
   skills/standings persistence, reputation retention/manual/seven-day policy,
   and the expanded offline accounting/character/rep runner.
-- **Current position:** the shared-acquisition batch has cleared its expanded
-  test gate. The second batch (steps 2–4) is now implemented locally:
-  recent-history persistence, agreed consumer policies, and SSO/notices.
-  Syntax/diff checks pass; the expanded 52-check IDE run and live testing are
-  pending. The whole ESI phase remains open. A new general ESI compliance
-  audit waits until Caleb has tested this batch.
-- **Verified:** IDE run `11364-1794830978` passed **40/40** offline checks at
+- **Current position:** batch 2 passed **52/52** offline checks at **08:31:08
+  Central on 2026-11-16**, run `7296-1794837922`, revision
+  `esi-evidence-2-policy-batch`, code `df45afeff0d3`. The real restart in run
+  `21248-1794840356` restored 27 history snapshots / 4,498 rows at 08:45:58,
+  preserving original ages and expiry; Holdings reused ten at 08:46:16 with
+  `durable=10 fetched=0 reused=10 complete=True`. The remaining items are now
+  **set aside at Caleb's request**, as listed below. The general ESI audit
+  remains the next planned assessment; it has not been performed.
+- **Earlier verified checkpoint:** IDE run `11364-1794830978` passed **40/40** offline checks at
   **06:11:55 Central on 2026-11-16**, including both corrected 404 regressions,
   regional page/save recovery, blueprints, small routes, accounting, reputation
   and private structures. Earlier real seller, Industry, wallet and structure
@@ -59,16 +82,99 @@ and implementation evidence. An implementation entry is not a runtime pass.
   reused twice after restart. Contracts reused its saved list after restart;
   some item fetches failed and remain separate from successful list reuse.
   Neither run reported early repeats. Details are in ESI_DIAGNOSTICS.md.
-- **Next work:** Caleb restarts from the IDE and runs Ctrl+F12 (expected
-  52/52), then tests history/restart, hub switching/Jita, Stock Market load,
-  reputation/auth cases and the Data use / CCP dialog. Read the saved log
-  before claiming runtime success. The 40-check result remains the prior
-  batch checkpoint, not a pass for the twelve newly added checks. Only after
-  this user testing should a fresh general ESI compliance audit begin.
+- **Consumer-policy evidence:** live scans followed ESI expiry and reused the
+  Jita reference. Stock Market reused scanner snapshots and, after restart,
+  reused Amarr at age 278 seconds. The 52-check pass includes Jita's 23h/24h
+  boundary, direct Jita freshness, Stock Market's one-hour boundary and hub
+  independence, shared SSO cooldowns, and notice content/build declarations.
+  Stock Market uses **at least one hour from actual acquisition** on hub
+  load/open; the old 20-minute Stock Market policy in imported memory is stale.
+- **Next work:** keep the deferred list parked. Do not request another blanket
+  test round or start repairs from it automatically. The previously requested
+  general ESI compliance audit is the next planned assessment, with unresolved
+  cases explicitly recorded; this documentation update does not perform it or
+  declare ESI closeout.
+
+## Remaining problem list and new-chat handoff — 2026-11-16
+
+**Latest direction: set the remaining items aside as a later fix/check list.**
+The 52/52 IDE suite and real recent-history restart/reuse verification have
+passed. Do not reopen them merely because a fresh chat begins. Setting items
+aside does not mark them verified or authorize implementation.
+
+### Deferred fix and verification list
+
+Counts below come from the retained November 14–16 logs, not lifetime usage.
+Successful dialog openings and explicit rep-button clicks are not separately
+logged, so absence of those events cannot establish non-use.
+
+| Item | Evidence and classification | Later action |
+| --- | --- | --- |
+| Data use / CCP notice | Content and build-declaration checks passed. Successful opens are not logged; attempted computer-use inspection timed out. Visual readability remains unverified, not a demonstrated UI defect. | Verify the dialog when resumed. Verify the bundled notice before any future executable distribution; no build is requested. |
+| Explicit reputation refresh controls | Two Trading manual skills/standings operations and two Industry standings operations on November 15 each demonstrated acquisition followed by reuse. Persistence/restart and synthetic seven-day/failure policies pass. Logging does not distinguish a dialog open from the newer explicit Refresh rep button. | Verify that specific control behavior; retain established seller/Industry acquisition/reuse evidence. Do not label reputation as wholly untested or broken. |
+| Structure metadata/discovery, authorization changes and unexpired regional/private-book reuse after restart | Private books had three successful acquisitions across two runs, reuse and Browse-to-Tracking sharing. No shared-provider structure metadata/discovery/search activity was recorded. Specific authorization-change and unexpired-book restart cases remain live verification gaps; synthetic coverage passes. | Exercise those specific cases when resumed. Do not substitute the now-passed recent-history restart test or treat ordinary private-book use as untested. |
+| Buyer invalid_grant | Observed authentication failure, including both explicit buyer skill-fetch attempts on November 15. Successful reauthentication/data acquisition is not recorded. | Buyer reauthentication, then targeted data-path verification. Do not infer seller/Industry cache failure or redesign authentication from this observation alone. |
+| Contract item fetch errors | Four manual searches, 21 scheduler cycles and 95 completed regional sync operations are recorded. The large item batch returned 31,759 successes, two gone and 65 bad; subsequent searches repeatedly encountered one bad item. Successful list persistence/restart reuse remains established. | Investigate causes and decide whether a code correction is needed. Error responses alone do not prove a cache defect; do not call the whole Contracts feature broken or untested. |
+
+**Separate next assessment:** the requested general ESI compliance audit,
+after the testing now recorded. Carry the deferred cases explicitly and
+classify findings as original omissions, regressions we introduced, unverified
+cases, or genuinely new requirements before proposing work. Parking this list
+is not ESI sign-off, and no audit or repair was performed by this update.
+
+**Retain completed evidence:** public Industry persistence/restart reuse;
+wallet restoration and independent expiry; seller/Industry skills/standings
+persistence; private-book Browse-to-Tracking sharing; regional acceptance/save
+and reuse; blueprint save/restart reuse; the corrected 40-check suite; the
+52/52 policy-batch pass; and actual recent-history row restoration/reuse after
+the 08:45 restart. See the latest results in [ESI_DIAGNOSTICS.md](ESI_DIAGNOSTICS.md).
+The missing 404 expiry import and failed-page negative-cache interaction were
+regressions introduced by our cache work and subsequently passed their checks.
+Do not reopen these merely because a fresh chat begins. New evidence can
+justify a targeted regression investigation.
+
+**Important correction from the three-day review:** commit af8cf40 persisted
+Holdings' last-refreshed timestamp without persisting its recent history rows.
+That introduced a restart case where the app could suppress acquisition while
+the rows were absent. The earlier SKIP observation was insufficient proof of
+working history restoration. The new provider in b26f1d8 addresses this in
+source; its correction subsequently passed both the 52-check suite and real
+row restoration/reuse after restart. This was rework against the original
+history fix, not an additional product feature.
+
+**Scope and communication for the next chat:**
+
+- Do only what Caleb explicitly requests. Report additional findings separately
+  without implementing them automatically. No feature or refactor backlog is
+  implied by this handoff.
+- Keep code-written, static-check-passed, synthetic-test-passed, and live-tested
+  statuses distinct. A growing check count is not a growing defect count.
+- Explain a proposed correction in plain language: original problem, intended
+  behavior, what changes internally, and what evidence would show it works.
+- Preserve bounded checkpoints; ask for commit approval rather than silently
+  accumulating further implementation batches. A commit approval includes push.
+- Caleb prefers ending a long chat and starting a new one over compaction.
+  Use saved state and original transcripts for handoffs. No setting was changed
+  to disable compaction, and the agent cannot guarantee preventing it.
+
+**Deliberately outside the remaining implementation list:** changes to the
+Trade Refresh scheduler's 20-minute floor; an extra hourly wallet delay;
+offline JWT verification, token-encryption or scope redesign; reopening the
+confirmed developer account/email; and unrelated performance/feature work.
+The previously noted late-purchase accounting cases are coverage limitations,
+not newly proven accounting defects or authorization to rewrite accounting.
+After ESI closeout, review Stock Market against Caleb's intended workflow;
+Industry follows that. Do not substitute the older Claude backlog.
 
 ## Plain-language checkpoint record — 2026-11-16
 
+This section records evidence **at the original commit**, before the later
+52/52 pass and live history restart. Use Current checkpoint and the deferred
+list above for current status; pending statements in this historical record
+are not instructions to repeat completed testing.
+
 Checkpoint branch: `checkpoint/esi-compliance-2026-11-16`, based on `b329c8c`.
+The checkpoint was committed and pushed as `b26f1d8`.
 This preserves the current work for recovery and review. It is not a tested
 release or a declaration that the application is ESI compliant.
 
@@ -118,6 +224,14 @@ explicit corrections; do not revive an assistant proposal the user corrected.
 If an original record is unavailable, identify that limitation instead of
 claiming it was reviewed. Check current source and logs separately for status.
 
+The continuation transcript for this handoff is session
+`01a1e453-af3c-7d50-b825-4217347d2bdd`, under the local sessions directory for
+2026/11/16. It contains the user's audit-after-testing correction, strict-scope
+instruction, checkpoint approval, three-day work review, and preference to end
+long chats rather than rely on compaction. The three-day review read original
+November 14–16 project messages, including a continuation started November 12,
+and cross-checked commits and saved test results. It changed no application code.
+
 Decisions preserved from those messages:
 
 - The scanner needs ESI's roughly five-minute turnover. Stock Market and
@@ -153,7 +267,7 @@ Decisions preserved from those messages:
 | Reputation retention and manual/seven-day refresh | Committed/pushed in b329c8c. Seller/Industry retain last good rep beyond its update deadline and on failure. Its synthetic policy scenarios passed in the current 40/40 run. | Real manual rep-control behavior remains unobserved; fold it into final live checks. |
 | Private structures and discovery | Authorization-scoped books/metadata and discovery provider implemented; synthetic isolation/restart checks passed. Real books persist/reuse and Browse-to-Tracking sharing passed. | Live metadata/discovery sharing, authorization changes and unexpired private-book restart reuse remain unobserved. |
 | Regional books, blueprints and smaller routes | Implemented locally and passed 40/40. Both 404 regressions verified fixed. Real regional save/reuse, blueprint save/restart reuse and contract-list restart reuse observed. | Unexpired regional restart reuse and remaining live metadata/auth cases. Contract item errors remain distinct from list-cache success. |
-| History, consumer policies, SSO and notices | Implemented locally; syntax/diff checks passed. Twelve new isolated checks join the prior forty in the IDE runner. | Run 52 checks and user-test the live behavior. Remaining rep/auth/accounting cases stay open. General compliance re-audit follows user testing. |
+| History, consumer policies, SSO and notices | 52/52 passed at 08:31:08 Central. Real restart restored 27 snapshots / 4,498 history rows with original age/expiry and reused ten holdings histories without acquisition. Scanner/Jita and Stock Market live evidence is recorded above. | Notice readability and the specific remaining live cases are parked in the deferred list. Future executable notice verification remains pending before distribution. General ESI audit remains planned. |
 
 Latest wallet evidence: run `16552-1794789044` acquired eligible replacements
 around 18:32 Central and passed all eleven offline checks at 18:32:08. After
@@ -169,18 +283,16 @@ passing in the current suite. See [verification evidence](ESI_DIAGNOSTICS.md).
 
 1. **Done: batch 1 and its 40-check gate.** The user completed the combined
    walkthrough; its evidence remains valid. No extra standalone rerun is due.
-2. **Next: batch 2, implemented together before the next test handoff.**
-   Persist the recent ESI history payload with acquisition/expiry and honest
-   per-item completion; enforce selected-scanner turnover, the 24-hour Jita
-   reference and one-hour Stock Market hub policy; finish shared SSO cooldowns
-   and accessible packaged notices. Details and boundaries are in steps 2–4.
-3. **Then: one combined verification and phase-1 closeout.** Extend Ctrl+F12
-   for history restore/partial failure, 23h/24h Jita and 59m/60m Stock Market
-   boundaries, independent hub switching and SSO cooldowns. Use the IDE/log
-   workflow and one consolidated live checklist, folding in the outstanding
-   rep, metadata/discovery, authorization and unexpired restart cases. Runtime
-   evidence determines which cases close; synthetic checks do not silently
-   clear unobserved live routes. Preserve the existing accounting regressions.
+2. **Written and pushed: batch 2 in b26f1d8; 52/52 now passed.**
+   Recent history, scanner/Jita/Stock Market policies, SSO cooldowns and the
+   accessible notice are already implemented. The runner already contains
+   52 scenarios. Do not implement or extend this batch again as the next step.
+3. **Done: recorded IDE checks and real history restart/reuse.** Preserve
+   these results. Caleb has set the remaining fix/check items aside; do not
+   restart a blanket test round or implement deferred work automatically.
+4. **Next planned assessment: the requested general ESI compliance audit.**
+   Carry the deferred cases and classifications above. Do not silently
+   implement findings or claim phase-1 closure from synthetic tests alone.
 
 Keep the agreed scope bounded. New findings stay separate unless they block
 the requested behavior. The Trade Refresh scheduler's 20-minute floor still
@@ -195,7 +307,8 @@ successful seller/Industry persistence, and unexercised authorization cases.
 ## Remaining phase-1 work, in order
 
 The five-stage implementation sequence agreed in the original conversation is
-retained here. The detailed findings are code-review work items within that
+retained here as design/history. Current checkpoint, deferred list and Immediate
+continuation above govern what to do next. The detailed findings are code-review work items within that
 sequence, not newly agreed product behavior or proof of runtime failures.
 
 ### 1. Finish shared acquisition, persistence and direct/manual coverage

@@ -333,6 +333,9 @@ def run_checks():
         sso_shared_cooldown_restart, sso_failed_grant_isolation,
         sso_date_and_concurrent_throttle, distribution_notice,
     )
+    from tools.esi_audit_fix_checks import (
+        contract_queued_cooldown, contract_cancelled_cooldown,
+    )
     checks = (_reuse_and_restart, _isolation, _concurrent, _page_failure,
               _mixed_pages, _save_failure, _wallet_adapter, _authorization_race,
               inventory_cache_lifecycle, inventory_delayed_journal, inventory_partial_refresh,
@@ -351,7 +354,8 @@ def run_checks():
               history_cache_control_age, jita_reference_and_active_orders,
               stock_age_and_hub_independence, order_force_singleflight,
               sso_shared_cooldown_restart, sso_failed_grant_isolation,
-              sso_date_and_concurrent_throttle, distribution_notice)
+              sso_date_and_concurrent_throttle, distribution_notice,
+              contract_queued_cooldown, contract_cancelled_cooldown)
     passed = 0
     for check in checks:
         try:

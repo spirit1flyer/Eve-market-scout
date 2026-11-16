@@ -4,12 +4,21 @@ This instrumentation identifies the running checkout and records evidence of
 actual activity. It does not implement the remaining fixes from the compliance
 audit and does not label an untested route compliant.
 
-Latest checkpoint: run `11364-1794830978` passed **40/40** at **06:11:55
-Central, 2026-11-16**. Both corrected 404 regressions passed. Older failed-run
-and pending instructions below are historical. The second policy batch is
-implemented locally with an expanded **52-check** runner awaiting IDE testing;
-look for revision **esi-evidence-2-policy-batch** after restart. The current work order is in
+Latest checkpoint: run `7296-1794837922` passed **52/52** at **08:31:08
+Central, 2026-11-16**, revision `esi-evidence-2-policy-batch`, code
+`df45afeff0d3`. Real restart `21248-1794840356` restored 27 recent-history
+snapshots / 4,498 rows at 08:45:58, then reused ten Holdings histories without
+acquisition. Older failed-run and pending instructions below are historical.
+Caleb has set the remaining specific fix/check items aside; the list and
+current work order are in
 [ESI_ACQUISITION_GOALS.md](ESI_ACQUISITION_GOALS.md).
+
+F1 follow-up: the contract dispatch cooldown recheck and two synthetic checks
+are implemented locally. The runner now contains **54** checks; the latest
+observed pass remains **52/52**. F1 IDE verification is pending; F2 is still
+planned. See the F1 handoff at the end of this document.
+Caleb approved version `3.68 live` and commit/push on 2026-11-16. That source
+version bump is not runtime evidence; the saved 52-check pass used `3.67 live`.
 
 ## Reading the output
 
@@ -590,3 +599,78 @@ Combined verification handoff:
 The next general ESI compliance audit is deferred until after Caleb tests the
 batch. Trade Refresh's 20-minute scheduler and broader Stock Market/Industry
 workflow reviews remain outside this implementation.
+
+### Policy-batch pass, real history restart and deferred follow-ups — 2026-11-16
+
+The saved log confirms these separate observations:
+
+- Run `7296-1794837922` started at 08:05:24 Central with revision
+  `esi-evidence-2-policy-batch`, code `df45afeff0d3`. At 08:31:08 it recorded
+  `passed=52 total=52 network=none data=synthetic`. The injected history
+  RESTORE at 08:31:07 belongs to that suite, not an application restart.
+- The actual recent-history database contained 27 complete snapshots / 4,498
+  rows from Amarr and Jita, with saved acquisition/expiry and actual payloads.
+  This was checked read-only; it did not itself establish live restart reuse.
+- New process `21248-1794840356` started at 08:45:58 with the same revision/code.
+  It restored all 27 snapshots / 4,498 rows, with original ages of 1,425–2,414
+  seconds and original expiry `2026-11-17T11:05:00+00:00`. Every restored
+  snapshot's row count and expiry matched the prior process's PERSIST record.
+  At 08:46:16 Holdings recorded
+  `requested=10 accepted=10 durable=10 failed=0 fetched=0 reused=10 complete=True`.
+  No history FETCH or RESTORE_FAILED was recorded in that reviewed run through
+  08:49. This closes the actual-row history restart/reuse gap.
+- Stock Market reused Amarr after restart at age 278 seconds (08:46:15), then
+  reused the newer scanner snapshot at age 24 seconds (08:46:59). Earlier live
+  use acquired Amarr at age 7,837 seconds and repeatedly reused newer snapshots.
+  Scanner schedules followed ESI expiry; Jita reference reuse was observed.
+  Boundary/hub-independence checks passed in the synthetic suite. Stock Market's
+  active-hub policy is at least one hour from acquisition, not 20 minutes.
+- SSO numeric/date/missing-header cooldown, concurrency/restart and failed-grant
+  isolation checks passed synthetically. Notice content and build declarations
+  passed; successful notice opens are not logged. Direct computer-use capture
+  failed twice with timeouts, so readability was not visually verified.
+
+The retained November 14–16 logs show two Trading manual skills/standings
+operations and two Industry standings operations (each acquisition then reuse),
+three private-book acquisitions across two runs, four manual contract searches,
+21 contract scheduler cycles and 95 completed regional sync operations. These
+are recorded operations, not lifetime usage or proof of every edge case.
+The rep dialog and explicit Refresh rep button are not distinguished in logging.
+
+Caleb asked to set the remaining items aside as a later fix/check list. See
+[the deferred list](ESI_ACQUISITION_GOALS.md#deferred-fix-and-verification-list)
+for notice readability, the explicit rep controls, structure metadata/discovery
+and authorization/unexpired-book cases, buyer authentication and contract item
+errors. Confirmed errors and verification gaps remain distinct. No application
+code changed and no general ESI audit was performed by this documentation update.
+
+### F1 contract dispatch cooldown — implemented, IDE verification pending, 2026-11-16
+
+`contracts/contracts_esi.py::_raw_request_network()` now rechecks the existing
+shared cooldown inside the semaphore immediately before dispatch, on every
+loop iteration. The outer check and existing retry/session/response behavior
+remain in place. A cooldown established while a task queues therefore applies
+before that task sends; cancellation exits the semaphore context normally.
+
+`tools/esi_audit_fix_checks.py` adds `contract_queued_cooldown` and
+`contract_cancelled_cooldown` to the existing Ctrl+F12 runner (54 total).
+They exercise the actual network helper with an occupied local semaphore,
+event-ordered gate closure and a fake session. They assert zero sends during
+the new pause, one successful send after release with preserved arguments and
+response, and cancellation propagation/slot release. The old implementation
+would complete the request and fail the blocked-state assertion rather than
+depending on a timeout. No pre-fix runtime result was obtained: the IDE test
+run is user-controlled, and no standalone harness was used.
+
+Syntax compilation of all three changed Python files and `git diff --check`
+passed. These are static results, not a synthetic runtime pass. No app was
+launched or controlled, and no live throttle was manufactured.
+
+Restart `main.py` from this checkout in the IDE, then press **Ctrl+F12**.
+Confirm the `[ESI-Evidence] event=START` entry path identifies this checkout,
+both new named checks report PASS, and the summary reads
+`[ESI-CacheCheck] passed=54 total=54 network=none data=synthetic` in
+`%APPDATA%/EVEMarketScout/eve_scout.log`. Earlier 52-check results do not verify
+F1. Ordinary Contracts behavior and unexpected exceptions remain to be
+reviewed in the next user-run session. F2 and its two additional checks are
+not part of this implementation; the combined target remains 56.
