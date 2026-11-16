@@ -52,11 +52,22 @@ def validate_route_payload(resource, payload):
         if not isinstance(payload, list):
             raise ValueError("order list required")
         seen = set()
-        for row in payload:
+        for row_index, row in enumerate(payload, start=1):
             if not isinstance(row, dict):
                 raise ValueError("order object required")
             for field in ("order_id", "type_id", "location_id", "volume_total", "duration"):
-                _positive(row[field])
+                try:
+                    _positive(row[field])
+                except ValueError as exc:
+                    details = (
+                        f"resource={resource} row={row_index} field={field} "
+                        f"value={row[field]!r} value_type={type(row[field]).__name__} "
+                        f"order_id={row.get('order_id')!r} "
+                        f"type_id={row.get('type_id')!r} "
+                        f"location_id={row.get('location_id')!r}"
+                    )
+                    print(f"[OrderValidation] reason=positive_integer_required {details}")
+                    raise ValueError(f"{exc}; {details}") from exc
             if type(row["volume_remain"]) is not int or not 0 <= row["volume_remain"] <= row["volume_total"]:
                 raise ValueError("invalid remaining volume")
             if (type(row["is_buy_order"]) is not bool or type(row["price"]) not in (int, float)

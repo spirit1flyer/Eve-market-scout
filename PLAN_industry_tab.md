@@ -1,5 +1,16 @@
 # Industry Tab — Master Project Plan (Rev 7)
 
+Status 2026-11-16: **GUI split into three modules before the filtering redesign.**
+`gui_industry.py` retains the manager, data-refresh/calculation coordination,
+metadata and SDE-update lifecycle. `gui_industry_browser.py` contains the existing
+page layout, filters, sorting and list interactions. `gui_industry_details.py`
+contains item breakdowns, build/research time, dialogs and shared display helpers.
+The manager re-exports the existing helpers used by the Owned panel. All 70
+manager methods and 10 module helpers retain their original syntax trees;
+syntax, dependency and import checks cover the extraction. Caleb confirmed the
+Industry page looks good in the live app on 2026-11-16. No category/filter redesign
+or calculation changes are included.
+
 Status: **PHASE 3 (3.1–3.4) IMPLEMENTED (2026-06-27).** Stage 3.4 added BPC
 pricing: engine `calc_full(blueprint_cost_per_run=...)` folds amortized BPC cost
 into build cost (engine test 18/18); `industry_market_data.BpcPricing` resolves

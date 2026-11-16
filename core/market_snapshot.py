@@ -26,6 +26,10 @@ async def _regional_page_locked(client, store, region, page):
     try:
         return await asyncio.to_thread(store.accept_page, region, page, payload, headers)
     except (ValueError, KeyError, TypeError) as exc:
+        print(
+            f"[RegionalPages] decision=REJECT region={region} page={page} "
+            f"error_type={type(exc).__name__} details={str(exc)!r}"
+        )
         raise ESIPaginationChangedError(f"invalid_page={page} error_type={type(exc).__name__}") from exc
 
 

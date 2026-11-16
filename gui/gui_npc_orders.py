@@ -89,6 +89,7 @@ class NPCOrdersTabManager:
         
         # NPC orders data
         self.orders: dict[int, WatchlistItem] = {}  # type_id -> WatchlistItem
+        self._sell_volumes = None  # Last scan: type_id -> {price: remaining volume}
         self._load_orders()
         
         # Track alert state for tab coloring
@@ -252,7 +253,7 @@ class NPCOrdersTabManager:
         self.tree.heading("price_under", text="Price Under", command=lambda: self._sort_tree("price_under"))
         self.tree.heading("price_over", text="Price Over", command=lambda: self._sort_tree("price_over"))
         self.tree.heading("current_price", text="Current Price", command=lambda: self._sort_tree("current_price"))
-        self.tree.heading("qty", text="Qty", command=lambda: self._sort_tree("qty"))
+        self.tree.heading("qty", text="Qty ≤ Price Under", command=lambda: self._sort_tree("qty"))
         self.tree.heading("status", text="Status", command=lambda: self._sort_tree("status"))
         self.tree.heading("notes", text="Notes", command=lambda: self._sort_tree("notes"))
 
@@ -261,7 +262,7 @@ class NPCOrdersTabManager:
         self.tree.column("price_under", width=100, anchor=tk.E)
         self.tree.column("price_over", width=100, anchor=tk.E)
         self.tree.column("current_price", width=100, anchor=tk.E)
-        self.tree.column("qty", width=70, anchor=tk.E)
+        self.tree.column("qty", width=130, anchor=tk.E)
         self.tree.column("status", width=100, anchor=tk.CENTER)
         self.tree.column("notes", width=200)
 
@@ -336,7 +337,7 @@ class NPCOrdersTabManager:
             "price_under": "Price Under",
             "price_over": "Price Over",
             "current_price": "Current Price",
-            "qty": "Qty",
+            "qty": "Qty ≤ Price Under",
             "status": "Status",
             "notes": "Notes"
         }
@@ -504,6 +505,17 @@ class NPCOrdersTabManager:
             self.tree.delete(item)
 
         for order_item in self.orders.values():
+            if self._sell_volumes is not None:
+                volumes = self._sell_volumes.get(order_item.type_id, {})
+                order_item.current_price = min(volumes, default=None)
+                if not volumes:
+                    order_item.current_qty = 0
+                elif order_item.price_under is None:
+                    order_item.current_qty = None
+                else:
+                    order_item.current_qty = sum(
+                        qty for price, qty in volumes.items()
+                        if price <= order_item.price_under)
             self._insert_item(order_item)
 
         self._update_tab_color()
@@ -715,7 +727,7 @@ class NPCOrdersTabManager:
         # Distinguish "no listings" (qty=0) from "never scanned" (qty=None)
         if item.current_price:
             current = f"{item.current_price:,.0f}"
-            qty = f"{item.current_qty:,}" if item.current_qty else "-"
+            qty = f"{item.current_qty:,}" if item.current_qty is not None else "-"
         elif item.current_qty == 0:
             current = "No listings"
             qty = "0"
@@ -891,36 +903,19 @@ class NPCOrdersTabManager:
             )
 
     def update_from_local_orders(self, orders: list[dict]):
-        """Update prices from local hub market orders."""
+        """Cache local sell volume by price so threshold edits recalculate totals."""
         if not self.orders:
             return
-        
-        # Build lookup: type_id -> (lowest sell price, quantity at that price)
-        sell_data = {}  # type_id -> {"price": float, "qty": int}
+
+        sell_volumes = {}
         for order in orders:
             if order.get("is_buy_order"):
                 continue
-            
-            type_id = order["type_id"]
+            volumes = sell_volumes.setdefault(order["type_id"], {})
             price = order["price"]
-            volume = order.get("volume_remain", 0)
-            
-            if type_id not in sell_data or price < sell_data[type_id]["price"]:
-                # New lowest price - reset quantity
-                sell_data[type_id] = {"price": price, "qty": volume}
-            elif price == sell_data[type_id]["price"]:
-                # Same price - accumulate quantity
-                sell_data[type_id]["qty"] += volume
-        
-        for type_id, item in self.orders.items():
-            if type_id in sell_data:
-                item.current_price = sell_data[type_id]["price"]
-                item.current_qty = sell_data[type_id]["qty"]
-            else:
-                # No sell orders for this item - clear stale data
-                item.current_price = None
-                item.current_qty = 0
-        
+            volumes[price] = volumes.get(price, 0) + order.get("volume_remain", 0)
+
+        self._sell_volumes = sell_volumes
         self._refresh_display()
 
     def get_alert_items(self) -> list[WatchlistItem]:
