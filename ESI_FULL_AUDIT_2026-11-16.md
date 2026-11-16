@@ -281,3 +281,33 @@ live cooldown was induced. See `ESI_DIAGNOSTICS.md` for the exact handoff.
 Caleb subsequently approved the version bump to `3.68 live` and commit/push
 on 2026-11-16. The original audit remains against `3.67 live`; publication
 does not close the pending F1 runtime checks or implement F2.
+
+## F2 follow-up — 2026-11-16
+
+Caleb separately authorized F2 implementation. Tracking now admits complete
+regional snapshots with the existing expiry-aware `get_cached_orders`
+accessor, including valid empty books and books older than 300 seconds with
+future ESI expiry. Its REUSE diagnostic reads display-only age metadata and
+uses `unknown` when unavailable. The full regional rows, exact per-type sell
+fallback and separate authorized private structure path are preserved.
+`core/order_cache.py` was not changed. Original audit observations remain above.
+
+Two registered checks, `underbid_regional_expiry_reuse` and
+`underbid_regional_fallback`, use the actual isolated regional cache and
+temporary route stores with injected requesters. They cover a 301-second-old
+unexpired book, restart with original clocks, valid empty reuse, full-row
+preservation, expired/missing/incomplete and absent-expiry policies, no active
+types, unique sorted fallback requests and cached repeats. Existing structure
+routing checks retain authorization/account-change/failure assertions and
+now cover unknown display age independently of admission.
+
+**Evidence:** all four changed Python files pass syntax compilation;
+`git diff --check` passes. No pre-fix or post-fix IDE runtime result was
+obtained during implementation. The runner now contains 56 checks; runtime
+acceptance of F1/F2 remains pending the correct checkout's Ctrl+F12 run (all
+four named PASS lines and `passed=56 total=56 network=none data=synthetic`),
+plus ordinary Contracts/Tracking operation and exception review. No app was
+launched or controlled, no production client/cooldown was instantiated by the
+checks, and no live throttle was induced. See `ESI_DIAGNOSTICS.md` for handoff.
+Caleb subsequently approved the F2 version bump to `3.69 live` and commit/push
+on 2026-11-16. The version checkpoint does not establish runtime acceptance.

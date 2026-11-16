@@ -275,7 +275,10 @@ def underbid_structure_routing(directory):
     config = {"type": "structure", "station_id": STRUCTURE, "region_id": 11000004}
 
     class RegionalCache:
-        def peek_cached_orders(self, *args, **kwargs):
+        def get_cached_orders(self, *args, **kwargs):
+            raise AssertionError("private structure consulted public regional cache")
+
+        def get_cache_timing(self, *args, **kwargs):
             raise AssertionError("private structure consulted public regional cache")
 
     def fetch(cache, identity=auth, hub=config, regional=None):
@@ -304,12 +307,17 @@ def underbid_structure_routing(directory):
 
     server.pages, server.fail_page = 1, None
     npc = {"station_id": 60003760, "region_id": 10000002}
-    public = fetch(restored, hub=npc, regional=SimpleNamespace(peek_cached_orders=lambda *a, **k: None))
+    public = fetch(restored, hub=npc, regional=SimpleNamespace(get_cached_orders=lambda *a, **k: None))
     _require(public and server.calls[-1][0] == "type_orders", "NPC per-type fallback changed")
     count = len(server.calls)
-    regional = SimpleNamespace(peek_cached_orders=lambda *a, **k: (public, 10))
-    _require(fetch(restored, hub=npc, regional=regional) == public and len(server.calls) == count,
+    regional = SimpleNamespace(get_cached_orders=lambda *a, **k: public,
+                               get_cache_timing=lambda *a, **k: {"age_seconds": None, "reusable": False})
+    logs = []
+    _require(fetch_underbid_orders_sync(npc, [34], regional, route_cache=restored,
+                                       log=logs.append) == public and len(server.calls) == count,
              "NPC shared regional snapshot was not reused")
+    _require(len(logs) == 1 and "age=unknown" in logs[0],
+             "unavailable display age changed reuse or was not logged as unknown")
 
 
 def public_metadata_cache(directory):

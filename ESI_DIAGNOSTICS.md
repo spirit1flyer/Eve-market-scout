@@ -13,12 +13,11 @@ Caleb has set the remaining specific fix/check items aside; the list and
 current work order are in
 [ESI_ACQUISITION_GOALS.md](ESI_ACQUISITION_GOALS.md).
 
-F1 follow-up: the contract dispatch cooldown recheck and two synthetic checks
-are implemented locally. The runner now contains **54** checks; the latest
-observed pass remains **52/52**. F1 IDE verification is pending; F2 is still
-planned. See the F1 handoff at the end of this document.
-Caleb approved version `3.68 live` and commit/push on 2026-11-16. That source
-version bump is not runtime evidence; the saved 52-check pass used `3.67 live`.
+F1/F2 follow-up: the contract cooldown recheck, Tracking expiry-aware reuse
+and four synthetic checks are implemented. The runner now contains **56**
+checks; the latest observed pass remains **52/52**. F1/F2 IDE verification is
+pending; see the handoffs below. Caleb approved `3.69 live` and commit/push
+on 2026-11-16. The saved 52-check pass used `3.67 live`.
 
 ## Reading the output
 
@@ -674,3 +673,28 @@ both new named checks report PASS, and the summary reads
 F1. Ordinary Contracts behavior and unexpected exceptions remain to be
 reviewed in the next user-run session. F2 and its two additional checks are
 not part of this implementation; the combined target remains 56.
+
+### F2 Tracking regional expiry reuse — implemented, IDE verification pending, 2026-11-16
+
+Tracking now uses `get_cached_orders`: complete regional books, including
+empty books, remain reusable through ESI expiry beyond 300 seconds. Expired,
+missing or incomplete books retain the per-type sell fallback; absent expiry
+uses the existing 300-second policy. Full shared rows remain intact; REUSE
+age is display-only, with unavailable age logged as `unknown`.
+
+`underbid_regional_expiry_reuse` checks an unexpired 301-second-old full book,
+restore with original clocks and valid empty reuse with zero route requests.
+`underbid_regional_fallback` covers expired/missing/incomplete/no-expiry books,
+no active types, unique sorted types and cached repeats without regional
+mutation. Real isolated stores/injected requesters are used. Structure-routing
+doubles retain private guards and cover unknown age independent of admission.
+
+All four changed Python files pass syntax compilation; `git diff --check`
+passes. No pre-fix or post-fix IDE runtime result was obtained. Restart
+`main.py` from this checkout, press **Ctrl+F12**, and confirm the START entry
+identifies this checkout, all four F1/F2 named checks PASS, and
+`[ESI-CacheCheck] passed=56 total=56 network=none data=synthetic` appears in
+`%APPDATA%/EVEMarketScout/eve_scout.log`. Earlier 52/54 results do not verify F2.
+Exercise ordinary Tracking/Contracts use for saved-log review of completed
+operations/exceptions. Caleb approved `3.69 live` and commit/push on
+2026-11-16; this version checkpoint does not establish runtime acceptance.

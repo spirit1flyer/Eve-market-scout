@@ -7,12 +7,13 @@ def fetch_market_orders_sync(region_id, type_ids=None, order_cache=None, *,
                              route_cache=None, log=print):
     """Use a full regional snapshot or exact cached per-type sell responses."""
     if order_cache is not None:
-        peeked = order_cache.peek_cached_orders(region_id, max_age_seconds=300)
-        if peeked is not None:
-            orders, age = peeked
+        orders = order_cache.get_cached_orders(region_id, max_age_seconds=300)
+        if orders is not None:
+            age = order_cache.get_cache_timing(region_id).get("age_seconds")
+            age_display = f"{age:.0f}s" if age is not None else "unknown"
             log("[TradeSync] stage=underbid_snapshot decision=REUSE "
                 f"source=shared_region_cache region={region_id} "
-                f"age={age:.0f}s orders={len(orders)}")
+                f"age={age_display} orders={len(orders)}")
             return orders
     if not type_ids:
         log("[TradeSync] stage=underbid_snapshot decision=SKIP "

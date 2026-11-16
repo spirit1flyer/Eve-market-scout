@@ -1,11 +1,19 @@
 # Targeted ESI plan: F1 and F2
 
 Prepared 2026-11-16 against app `3.67 live`.
-Status: F1 implemented locally on 2026-11-16; syntax/diff checks passed,
-IDE runtime verification pending. F2 and its two checks remain planned.
-The current IDE runner contains 54 checks; 56 remains the F1/F2 target.
-Caleb approved the version bump and commit/push on 2026-11-16; current source
-is `3.68 live`. This does not change the pending runtime-verification status.
+Status: F1 and F2 implemented locally on 2026-11-16; syntax/diff checks passed,
+IDE runtime verification pending. The current IDE runner contains all 56 checks.
+Caleb approved the F1 checkpoint at `3.68 live` and then the F2 version bump
+and commit/push on 2026-11-16; source is now `3.69 live`.
+IDE verification remains pending.
+
+F2 uses the expiry-aware regional accessor and display-only timing metadata.
+Its two registered checks cover older unexpired books, restore, valid empty
+books, full-row preservation, expired/missing/incomplete/no-expiry fallback,
+no active types, unique sorted types and repeated route-cache reuse. Regional
+test doubles preserve the private structure guard and cover unknown display
+age without making another admission decision. Pre-fix runtime evidence was
+unavailable; no user-controlled IDE run was performed during implementation.
 
 ## Scope and outcome
 

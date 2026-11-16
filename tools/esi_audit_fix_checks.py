@@ -1,13 +1,18 @@
 """Synthetic ESI audit regressions for the IDE's Ctrl+F12 runner.
 
-Only fixture-local gate/session/semaphore state is used. No live client,
-transport, credentials, cache or process-wide cooldown is touched.
+Only fixture-local gates, sessions and temporary caches are used. No live
+client, transport, credentials, cache or process-wide cooldown is touched.
 """
 
 import asyncio
 from contextlib import asynccontextmanager
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 from contracts.contracts_esi import _raw_request_network
+from gui.tracking.gui_tracking_market import fetch_market_orders_sync
+from tools.acquisition_batch_checks import _Orders, _order
+from tools.route_cache_checks import _Server, _Store
 
 
 def _require(condition, message):
@@ -157,3 +162,103 @@ def contract_cancelled_cooldown(directory):
                 await asyncio.gather(follower, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+class _UnderbidServer(_Server):
+    def __init__(self, *, allow_acquisition=False):
+        super().__init__()
+        self.allow_acquisition = allow_acquisition
+        self.attempts = []
+
+    def request(self, method, url, headers, params, timeout):
+        self.attempts.append((method, url, dict(params)))
+        _require(self.allow_acquisition, "regional reuse attempted route acquisition")
+        _require(params.get("order_type") == "sell", "fallback changed order side")
+        return super().request(method, url, headers, params, timeout)
+
+
+def _regional_times(store, region):
+    entry = store.get_snapshot_entry(region)
+    return None if entry is None else (entry["timestamp"], entry["expires"])
+
+
+def underbid_regional_expiry_reuse(directory):
+    region = 10000002
+    now = datetime.now(timezone.utc)
+    acquired = now - timedelta(seconds=301)
+    expiry = acquired + timedelta(seconds=600)
+    rows = [_order(), {**_order(2), "is_buy_order": True},
+            {**_order(3), "type_id": 35}, {**_order(4), "location_id": 60008494}]
+    original = deepcopy(rows)
+    orders = _Orders(directory / "populated")
+    orders.cache_orders_for_region(region, rows, expiry, acquired_at=acquired)
+    server = _UnderbidServer()
+    routes = _Store(directory / "routes", server)
+    logs = []
+
+    def fetch(store):
+        result = fetch_market_orders_sync(region, [34], store,
+                                         route_cache=routes, log=logs.append)
+        _require(result == original and not server.attempts,
+                 "unexpired older regional book was filtered, changed or reacquired")
+        _require(_regional_times(store, region) == (acquired, expiry),
+                 "regional read reset acquisition or expiry")
+        return result
+
+    _require(fetch(orders) is rows and rows == original,
+             "Tracking replaced or mutated shared regional rows")
+    restored = _Orders(directory / "populated")
+    restored._load_region_disk_cache(region)
+    _require(fetch(restored) is restored.get_snapshot_entry(region)["orders"],
+             "Tracking did not return the restored full regional book")
+    _require(all("stage=underbid_snapshot decision=REUSE" in line
+                 and "source=shared_region_cache" in line
+                 and f"region={region}" in line and "orders=4" in line
+                 for line in logs) and len(logs) == 2,
+             "regional reuse diagnostic changed")
+
+    empty = _Orders(directory / "empty")
+    empty.cache_orders_for_region(region, [], expiry, acquired_at=acquired)
+    _require(fetch_market_orders_sync(region, [34], empty,
+                 route_cache=routes, log=lambda line: None) == [] and not server.attempts,
+             "valid empty unexpired regional book triggered acquisition")
+    _require(_regional_times(empty, region) == (acquired, expiry),
+             "empty regional read reset acquisition or expiry")
+
+
+def underbid_regional_fallback(directory):
+    region = 10000002
+    now = datetime.now(timezone.utc)
+    cases = (("expired", 60, -30, True, [34], True),
+             ("missing", None, None, True, [34], True),
+             ("incomplete", 60, 600, False, [34], True),
+             ("no_expiry_recent", 60, None, True, [34], False),
+             ("no_expiry_old", 600, None, True, [34], True),
+             ("no_types", None, None, True, [], False),
+             ("duplicate_types", None, None, True, [35, 34, 35, 34], True))
+    for name, age, expires_in, complete, types, fallback in cases:
+        case = directory / name
+        orders = _Orders(case / "regional")
+        regional_rows = [_order(7)]
+        if age is not None:
+            expiry = None if expires_in is None else now + timedelta(seconds=expires_in)
+            orders.cache_orders_for_region(region, regional_rows, expiry,
+                acquired_at=now - timedelta(seconds=age), complete=complete)
+        before = deepcopy(orders.get_snapshot_entry(region))
+        server = _UnderbidServer(allow_acquisition=fallback)
+        routes = _Store(case / "routes", server)
+        expected_types = sorted(set(types)) if fallback else []
+        expected = ([{**_order(101), "type_id": type_id, "issued": server.time.isoformat()}
+                     for type_id in expected_types] if fallback else
+                    regional_rows if age is not None else [])
+        for _ in range(2):
+            result = fetch_market_orders_sync(region, types, orders,
+                                              route_cache=routes, log=lambda line: None)
+            _require(result == expected, f"{name}: wrong regional/fallback result")
+            _require(len(server.attempts) == len(expected_types)
+                     and [call[3] for call in server.calls] == expected_types,
+                     f"{name}: wrong unique/sorted acquisition or route-cache reuse")
+            _require(all(call[:3] == ("type_orders", region, 1) for call in server.calls),
+                     f"{name}: fallback used a different route")
+            _require(orders.get_snapshot_entry(region) == before,
+                     f"{name}: reading regional data changed its rows or metadata")
