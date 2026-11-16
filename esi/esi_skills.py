@@ -5,16 +5,12 @@ Supports separate skill lookups for seller and buyer characters.
 Requires scope: esi-skills.read_skills.v1
 """
 
-import requests
 from typing import Optional, Dict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from core.calculate import TradingSkills
-from core.esi_rate_limit import esi_request
-from core.esi_diagnostics import decision_event
-
-BASE_URL = "https://esi.evetech.net/latest"
+from core.esi_character_cache import character_snapshot, trained_levels, usable_until
 
 # Trading skill type IDs (verified against SDE 2026-05)
 SKILL_IDS = {
@@ -52,18 +48,19 @@ class SkillCache:
     
     @property
     def is_expired(self) -> bool:
-        return datetime.now() >= self.expires_at
+        return datetime.now(timezone.utc) >= self.expires_at
 
 
 class ESISkills:
     """Fetches and caches character skills from ESI."""
     
-    def __init__(self, auth):
+    def __init__(self, auth, cache=None):
         """
         Args:
             auth: ESIAuth instance for authentication
         """
         self.auth = auth
+        self._snapshot_cache = cache
         
         # Separate caches for seller and buyer
         self._seller_cache: Optional[SkillCache] = None
@@ -75,13 +72,31 @@ class ESISkills:
         # How long to cache skills (they rarely change)
         self.cache_duration = timedelta(hours=1)
     
-    def _get_cache(self, slot: str) -> Optional[SkillCache]:
-        """Get cache for specified slot."""
-        if slot == "buyer":
-            return self._buyer_cache
-        return self._seller_cache
+    def _get_cache(self, slot: str, allow_stale=False) -> Optional[SkillCache]:
+        """Restore the matching raw response without initiating acquisition."""
+        try:
+            snapshot = character_snapshot(self.auth, "skills", slot, cache=self._snapshot_cache,
+                                          allow_stale=allow_stale)
+            if snapshot is not None:
+                return self._apply_snapshot(slot, snapshot)
+            self._set_cache(slot, None)
+            return None
+        except Exception as exc:
+            self._set_cache(slot, None)
+            print(f"ESISkills: cache unavailable ({type(exc).__name__})")
+            return None
+
+    def _apply_snapshot(self, slot, snapshot):
+        raw_skills = trained_levels(snapshot)
+        cached = SkillCache(
+            TradingSkills(broker_relations=raw_skills.get(SKILL_IDS["broker_relations"], 0),
+                          accounting=raw_skills.get(SKILL_IDS["accounting"], 0),
+                          advanced_broker_relations=raw_skills.get(SKILL_IDS["advanced_broker_relations"], 0)),
+            raw_skills, snapshot["acquired_at"], usable_until(snapshot))
+        self._set_cache(slot, cached)
+        return cached
     
-    def _set_cache(self, slot: str, cache: SkillCache):
+    def _set_cache(self, slot: str, cache: Optional[SkillCache]):
         """Set cache for specified slot."""
         if slot == "buyer":
             self._buyer_cache = cache
@@ -89,80 +104,26 @@ class ESISkills:
             self._seller_cache = cache
             self._cache = cache  # Legacy compatibility
     
-    def _make_request(self, endpoint: str, slot: str = "seller") -> Optional[dict]:
-        """Make authenticated ESI request."""
-        headers = self.auth.get_auth_headers(slot)
-        if not headers:
-            print(f"ESISkills: Not authenticated for {slot}")
-            return None
-        
-        url = f"{BASE_URL}{endpoint}"
-        try:
-            response = esi_request("GET", url, headers=headers, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"ESISkills request error: {e}")
-            return None
-    
     def fetch_skills(self, force_refresh: bool = False, slot: str = "seller") -> Optional[TradingSkills]:
         """
         Fetch character skills and return TradingSkills object.
         
         Args:
-            force_refresh: If True, bypass cache
+            force_refresh: Request an eligible update; never bypass ESI expiry
             slot: "seller" or "buyer"
         
         Returns:
             TradingSkills object, or None if fetch failed
         """
-        # Check cache
-        cache = self._get_cache(slot)
-        if not force_refresh and cache and not cache.is_expired:
-            decision_event("skills", "REUSE", "provider", slot=slot)
-            return cache.skills
-        
-        # Get character ID for this slot
-        char = self.auth.get_character(slot)
-        if not char or not char.character_id:
-            print(f"ESISkills: No character ID for {slot}")
+        try:
+            snapshot = character_snapshot(self.auth, "skills", slot, fetch=True,
+                force=force_refresh, cache=self._snapshot_cache, trigger="trading_skills")
+            trading_skills = self._apply_snapshot(slot, snapshot).skills
+        except Exception as exc:
+            self._set_cache(slot, None)
+            print(f"ESISkills request error: {type(exc).__name__}")
             return None
-        
-        char_id = char.character_id
-        
-        data = self._make_request(f"/characters/{char_id}/skills/", slot)
-        if not data:
-            return None
-        
-        # Parse skills
-        raw_skills = {}
-        skills_list = data.get("skills", [])
-        
-        for skill in skills_list:
-            type_id = skill.get("skill_id")
-            level = skill.get("trained_skill_level", 0)
-            raw_skills[type_id] = level
-        
-        # Extract trading skills
-        trading_skills = TradingSkills(
-            broker_relations=raw_skills.get(SKILL_IDS["broker_relations"], 0),
-            accounting=raw_skills.get(SKILL_IDS["accounting"], 0),
-            advanced_broker_relations=raw_skills.get(SKILL_IDS["advanced_broker_relations"], 0),
-        )
-        
-        # Cache it
-        now = datetime.now()
-        new_cache = SkillCache(
-            skills=trading_skills,
-            raw_skills=raw_skills,
-            fetched_at=now,
-            expires_at=now + self.cache_duration
-        )
-        self._set_cache(slot, new_cache)
-        decision_event("skills", "COMPLETE", "provider", slot=slot, items=len(skills_list))
-        
-        char_name = char.character_name or slot
-        print(f"ESISkills: Fetched {len(skills_list)} skills for {char_name}")
+        print(f"ESISkills: Loaded {len(snapshot['payload']['skills'])} skills for {slot}")
         print(f"  Broker Relations: {trading_skills.broker_relations}")
         print(f"  Accounting: {trading_skills.accounting}")
         print(f"  Advanced Broker Relations: {trading_skills.advanced_broker_relations}")
@@ -186,7 +147,7 @@ class ESISkills:
         """Get trading skills for buyer character."""
         return self.get_skills("buyer")
     
-    def get_skill_level(self, skill_name: str, slot: str = "seller") -> int:
+    def get_skill_level(self, skill_name: str, slot: str = "seller", *, allow_stale=False) -> int:
         """
         Get level of a specific skill by name.
         
@@ -197,8 +158,8 @@ class ESISkills:
         Returns:
             Trained level (0-5), or 0 if unknown/not trained
         """
-        cache = self._get_cache(slot)
-        if not cache or cache.is_expired:
+        cache = self._get_cache(slot, allow_stale=allow_stale)
+        if not cache or (cache.is_expired and not allow_stale):
             return 0
         
         type_id = SKILL_IDS.get(skill_name.lower())
@@ -242,7 +203,7 @@ class ESISkills:
         if cache.is_expired:
             return (True, 0)
         
-        remaining = (cache.expires_at - datetime.now()).total_seconds()
+        remaining = (cache.expires_at - datetime.now(timezone.utc)).total_seconds()
         return (False, max(0, int(remaining)))
     
     def clear_cache(self, slot: str = None):
@@ -279,9 +240,10 @@ class ESIStandings:
     Station/corp/faction mappings are now driven by config.TRADE_HUBS.
     """
     
-    def __init__(self, auth, skills_fetcher: 'ESISkills' = None):
+    def __init__(self, auth, skills_fetcher: 'ESISkills' = None, cache=None):
         self.auth = auth
         self.skills_fetcher = skills_fetcher
+        self._snapshot_cache = cache
         
         # Separate caches for seller and buyer
         self._seller_standings_cache = None
@@ -356,32 +318,45 @@ class ESIStandings:
         return base_standing
 
     def _get_cached_standings(self, slot: str) -> Optional[dict]:
-        """Return a fresh in-memory snapshot without fetching from ESI."""
-        if slot == "buyer":
-            cache = self._buyer_standings_cache
-            cache_time = self._buyer_cache_time
-        else:
-            cache = self._seller_standings_cache
-            cache_time = self._seller_cache_time
-        if not cache or not cache_time:
-            return None
-        if datetime.now() >= cache_time + self.cache_duration:
-            return None
-        return cache
-    
-    def _make_request(self, endpoint: str, slot: str = "seller") -> Optional[dict]:
-        """Make authenticated ESI request."""
-        headers = self.auth.get_auth_headers(slot)
-        if not headers:
-            return None
-        
-        url = f"{BASE_URL}{endpoint}"
+        """Derive from matching durable raw responses; never acquire on a read."""
         try:
-            response = esi_request("GET", url, headers=headers, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"ESIStandings request error: {e}")
+            snapshot = character_snapshot(self.auth, "standings", slot, cache=self._snapshot_cache)
+            if snapshot is not None:
+                self._read_social_skills(slot)
+                return self._categorize(snapshot["payload"], slot)
+        except Exception as exc:
+            print(f"ESIStandings: cache unavailable ({type(exc).__name__})")
+        self.clear_cache(slot)
+        return None
+
+    def _read_social_skills(self, slot):
+        connections = self.skills_fetcher.get_skill_level("connections", slot, allow_stale=True) if self.skills_fetcher else 0
+        diplomacy = self.skills_fetcher.get_skill_level("diplomacy", slot, allow_stale=True) if self.skills_fetcher else 0
+        if slot == "buyer":
+            self._buyer_connections, self._buyer_diplomacy = connections, diplomacy
+        else:
+            self._seller_connections, self._seller_diplomacy = connections, diplomacy
+
+    def _categorize(self, data, slot):
+        result = {key: {} for key in ("agents", "npc_corps", "factions", "npc_corps_base", "factions_base")}
+        for row in data:
+            category = {"agent": "agents", "npc_corp": "npc_corps", "faction": "factions"}[row["from_type"]]
+            result[category][row["from_id"]] = self._apply_skill_modifier(row["standing"], slot)
+            if category != "agents":
+                result[category + "_base"][row["from_id"]] = row["standing"]
+        return result
+
+    def _standings_snapshot(self, slot, force_refresh):
+        try:
+            # This acquisition remains inside the existing explicit refresh path.
+            self._fetch_social_skills(slot)
+            snapshot = character_snapshot(self.auth, "standings", slot, fetch=True,
+                force=force_refresh, cache=self._snapshot_cache, trigger="trading_standings")
+            self._read_social_skills(slot)
+            return snapshot
+        except Exception as exc:
+            self.clear_cache(slot)
+            print(f"ESIStandings request error: {type(exc).__name__}")
             return None
     
     def fetch_standings(self, force_refresh: bool = False, slot: str = "seller") -> Optional[dict]:
@@ -396,43 +371,15 @@ class ESIStandings:
         Note: ESI returns BASE standings. This method applies Connections/Diplomacy
         skill modifiers to return EFFECTIVE standings.
         """
-        # Check cache
-        if slot == "buyer":
-            cache = self._buyer_standings_cache
-            cache_time = self._buyer_cache_time
-        else:
-            cache = self._seller_standings_cache
-            cache_time = self._seller_cache_time
-        
-        if not force_refresh and cache and cache_time:
-            if datetime.now() < cache_time + self.cache_duration:
-                decision_event("standings", "REUSE", "provider", slot=slot)
-                return cache
-        
-        char = self.auth.get_character(slot)
-        if not char or not char.character_id:
-            print(f"ESIStandings: No character ID for {slot}")
+        snapshot = self._standings_snapshot(slot, force_refresh)
+        if snapshot is None:
             return None
-        
-        char_id = char.character_id
-        
-        # Fetch social skill levels first
-        self._fetch_social_skills(slot)
-        
-        data = self._make_request(f"/characters/{char_id}/standings/", slot)
-        if not data:
-            return None
+        data = snapshot["payload"]
         
         # Parse into categories and apply skill modifiers. The *_base dicts
         # keep the raw ESI standings (no Connections/Diplomacy) — broker fee
         # math needs those; display and reprocessing tax use the adjusted ones.
-        standings = {
-            'agents': {},
-            'npc_corps': {},
-            'factions': {},
-            'npc_corps_base': {},
-            'factions_base': {},
-        }
+        standings = self._categorize(data, slot)
         
         # Diagnostic: log raw response shape so we can verify ESI is returning
         # the expected corp standings (e.g., Emperor Family 1000125 for Amarr).
@@ -445,22 +392,9 @@ class ESIStandings:
 
         unknown_types = set()
         for entry in data:
-            from_id = entry.get('from_id')
             from_type = entry.get('from_type')
-            base_standing = entry.get('standing', 0.0)
 
-            # Apply Connections/Diplomacy modifier
-            effective_standing = self._apply_skill_modifier(base_standing, slot)
-
-            if from_type == 'agent':
-                standings['agents'][from_id] = effective_standing
-            elif from_type == 'npc_corp':
-                standings['npc_corps'][from_id] = effective_standing
-                standings['npc_corps_base'][from_id] = base_standing
-            elif from_type == 'faction':
-                standings['factions'][from_id] = effective_standing
-                standings['factions_base'][from_id] = base_standing
-            else:
+            if from_type not in ('agent', 'npc_corp', 'faction'):
                 unknown_types.add(from_type)
 
         if unknown_types:
@@ -481,17 +415,16 @@ class ESIStandings:
         # Store in appropriate cache
         if slot == "buyer":
             self._buyer_standings_cache = standings
-            self._buyer_cache_time = datetime.now()
+            self._buyer_cache_time = snapshot["acquired_at"]
         else:
             self._seller_standings_cache = standings
-            self._seller_cache_time = datetime.now()
+            self._seller_cache_time = snapshot["acquired_at"]
             # Legacy compatibility
             self._standings_cache = standings
-            self._cache_time = datetime.now()
+            self._cache_time = snapshot["acquired_at"]
         
         connections = self._buyer_connections if slot == "buyer" else self._seller_connections
-        decision_event("standings", "COMPLETE", "provider", slot=slot, items=len(data))
-        print(f"ESIStandings: Fetched {len(standings['factions'])} faction standings, "
+        print(f"ESIStandings: Loaded {len(standings['factions'])} faction standings, "
               f"{len(standings['npc_corps'])} corp standings for {slot} (Connections L{connections})")
         
         return standings
@@ -577,7 +510,7 @@ class ESIStandings:
         """
         return self.get_standings_for_hub("amarr", slot)
     
-    def get_cache_status(self, slot: str = "seller") -> tuple[bool, int]:
+    def get_cache_status(self, slot: str = "seller", force_refresh=False) -> tuple[bool, int]:
         """
         Check if cache is valid and how long until it expires.
         
@@ -589,20 +522,15 @@ class ESIStandings:
             - can_refresh: True if cache is expired or empty (OK to fetch)
             - seconds_remaining: Seconds until cache expires (0 if expired/empty)
         """
-        if slot == "buyer":
-            cache_time = self._buyer_cache_time
-        else:
-            cache_time = self._seller_cache_time
-        
-        if not cache_time:
-            return (True, 0)
-        
-        expires_at = cache_time + self.cache_duration
-        if datetime.now() >= expires_at:
-            return (True, 0)
-        
-        remaining = (expires_at - datetime.now()).total_seconds()
-        return (False, max(0, int(remaining)))
+        try:
+            snapshot = character_snapshot(self.auth, "standings", slot, cache=self._snapshot_cache)
+        except Exception:
+            snapshot = None
+        if snapshot is None:
+            return True, 0
+        eligible = snapshot["expires"] if force_refresh else usable_until(snapshot)
+        remaining = (eligible - datetime.now(timezone.utc)).total_seconds()
+        return remaining <= 0, max(0, int(remaining))
     
     def clear_cache(self, slot: str = None):
         """

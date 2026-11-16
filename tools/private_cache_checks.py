@@ -306,8 +306,20 @@ def _authorization_race(directory):
 
 def run_checks():
     """Return pass/fail; each check prints a concise, payload-free result."""
+    from tools.wallet_accounting_checks import (
+        inventory_cache_lifecycle, inventory_delayed_journal, inventory_partial_refresh,
+    )
+    from tools.character_cache_checks import (
+        character_sharing_restart, character_context_isolation, character_expiry_force,
+        character_validation_failures, character_concurrency, character_local_views,
+        reputation_retention, reputation_refresh_policy,
+    )
     checks = (_reuse_and_restart, _isolation, _concurrent, _page_failure,
-              _mixed_pages, _save_failure, _wallet_adapter, _authorization_race)
+              _mixed_pages, _save_failure, _wallet_adapter, _authorization_race,
+              inventory_cache_lifecycle, inventory_delayed_journal, inventory_partial_refresh,
+              character_sharing_restart, character_context_isolation, character_expiry_force,
+              character_validation_failures, character_concurrency, character_local_views,
+              reputation_retention, reputation_refresh_policy)
     passed = 0
     for check in checks:
         try:

@@ -11,6 +11,7 @@ scanner_inventory_sync.py.
 
 import json
 import os
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict, field
@@ -164,8 +165,10 @@ class InventoryEntry:
 class InventoryManager:
     """Manages scanner inventory entries for a single hub with persistence."""
 
-    def __init__(self, hub_key: str = "amarr"):
+    def __init__(self, hub_key: str = "amarr", data_dir=None):
         self.hub_key = hub_key
+        # Optional storage isolates in-app replays without changing global paths.
+        self._data_dir = Path(data_dir) if data_dir is not None else None
         self.entries: Dict[int, InventoryEntry] = {}  # type_id -> entry
         # Write-coalescing: mutators mark _dirty + schedule one idle flush
         # instead of writing per-call (was 14+ full-JSON rewrites per ESI cycle).
@@ -194,8 +197,13 @@ class InventoryManager:
 
     # === Persistence ===
 
+    def _storage_path(self):
+        if self._data_dir is not None:
+            return str(self._data_dir / f"scanner_inventory_{self.hub_key}.json")
+        return _inventory_file(self.hub_key)
+
     def _load(self):
-        path = _inventory_file(self.hub_key)
+        path = self._storage_path()
         if not os.path.exists(path):
             return
         try:
@@ -256,7 +264,7 @@ class InventoryManager:
     def _do_save_now(self):
         import time as _pt
         _pt0 = _pt.perf_counter()
-        path = _inventory_file(self.hub_key)
+        path = self._storage_path()
         try:
             data = {
                 "hub": self.hub_key,

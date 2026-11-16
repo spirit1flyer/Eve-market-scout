@@ -376,21 +376,31 @@ class CharactersPanel:
                          command=lambda cc=c: self._sort_standings(tree, cc))
             tree.column(c, width=w, anchor="w" if c != "standing" else "e")
 
-        def work():
-            can_fetch, next_in = self.standings.get_cache_status(char.character_id)
+        def work(force_refresh=False):
+            can_fetch, next_in = self.standings.get_cache_status(char.character_id, force_refresh=force_refresh)
             decision = "FETCH" if can_fetch else "CACHE"
             print(f"[ESI-Timing] resource=industry_standings trigger=manual decision={decision} next_in={next_in}s")
-            self.standings.fetch(char.character_id)
+            self.standings.fetch(char.character_id, force_refresh=force_refresh)
             data = self.standings.get(char.character_id)
             # Only factions + corps are relevant; agents are dropped.
             ids = [i for kind in ("factions", "npc_corps")
                    for i in data.get(kind, {})]
             self.standings.resolve_names(ids)
-            submit(lambda: self._fill_standings(status, tree, box, data))
+            def finish():
+                if dlg.winfo_exists():
+                    self._fill_standings(status, tree, box, data)
+                    refresh_btn.configure(state=tk.NORMAL)
+            submit(finish)
 
-        threading.Thread(target=work, daemon=True).start()
+        def start_refresh(force_refresh=False):
+            refresh_btn.configure(state=tk.DISABLED)
+            status.configure(text="Refreshing rep..." if force_refresh else "Loading saved rep...")
+            threading.Thread(target=work, args=(force_refresh,), daemon=True).start()
 
+        refresh_btn = ttk.Button(wrap, text="Refresh rep", command=lambda: start_refresh(True))
+        refresh_btn.pack(side=tk.LEFT, pady=(6, 0))
         ttk.Button(wrap, text="Close", command=dlg.destroy).pack(side=tk.RIGHT, pady=(6, 0))
+        start_refresh()
         fit_window(dlg, min_width=340)
 
     def _fill_standings(self, status, tree, box, data):
@@ -402,11 +412,16 @@ class CharactersPanel:
                 name = self.standings.name_for(fid) or str(fid)
                 rows.append((label, name, float(val)))
         if not rows:
+            tree._rows = []
+            tree.delete(*tree.get_children())
             status.configure(text="No standings pulled (not authenticated, or none).")
             self._refit(box, 340)
             return
-        status.configure(text=f"{len(rows)} standings pulled.")
-        sb = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        status.configure(text=f"{len(rows)} standings loaded.")
+        sb = getattr(tree, "_standings_scrollbar", None)
+        if sb is None:
+            sb = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+            tree._standings_scrollbar = sb
         tree.configure(yscrollcommand=sb.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
         sb.pack(side=tk.LEFT, fill=tk.Y, pady=(4, 0))

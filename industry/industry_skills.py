@@ -10,13 +10,9 @@ scope set already includes `esi-skills.read_skills.v1`. Parse math mirrors
 `esi_skills.ESISkills` but is keyed per character_id rather than seller/buyer.
 """
 
-import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict
-from core.esi_rate_limit import esi_request
-from core.esi_diagnostics import decision_event
-
-BASE_URL = "https://esi.evetech.net/latest"
+from core.esi_character_cache import RosterAuth, character_snapshot, trained_levels, usable_until
 
 # Industry-relevant skill type IDs (verified against SDE).
 INDUSTRY_SKILL_IDS = {
@@ -32,67 +28,61 @@ INDUSTRY_SKILL_IDS = {
 
 
 class _SkillCache:
-    def __init__(self, raw_skills: Dict[int, int]):
-        self.raw_skills = raw_skills
-        self.fetched_at = datetime.now()
-        self.expires_at = self.fetched_at + timedelta(hours=1)
+    def __init__(self, snapshot):
+        self.raw_skills = trained_levels(snapshot)
+        self.fetched_at = snapshot["acquired_at"]
+        self.expires_at = usable_until(snapshot)
 
     @property
     def is_expired(self) -> bool:
-        return datetime.now() >= self.expires_at
+        return datetime.now(timezone.utc) >= self.expires_at
 
 
 class IndustrySkills:
     """Fetches + caches industry skills per roster character_id."""
 
-    def __init__(self, roster):
+    def __init__(self, roster, cache=None):
         """roster: an IndustryRoster instance (provides get_auth_headers)."""
         self.roster = roster
+        self._snapshot_cache = cache
         self._cache: Dict[int, _SkillCache] = {}
+
+    def _read_cache(self, character_id, allow_stale=False):
+        try:
+            snapshot = character_snapshot(RosterAuth(self.roster, character_id), "skills",
+                "industry", cache=self._snapshot_cache, allow_stale=allow_stale)
+            if snapshot is not None:
+                cache = _SkillCache(snapshot)
+                self._cache[character_id] = cache
+                return cache
+        except Exception as exc:
+            print(f"[IndustrySkills] cache unavailable: {type(exc).__name__}")
+        self._cache.pop(character_id, None)
+        return None
 
     def fetch(self, character_id: int, force_refresh: bool = False) -> Optional[Dict[int, int]]:
         """Pull skills for one character. Returns raw {skill_id: level} or None."""
-        cache = self._cache.get(character_id)
-        if not force_refresh and cache and not cache.is_expired:
-            decision_event("industry_skills", "REUSE", "provider",
-                           items=len(cache.raw_skills))
-            return cache.raw_skills
-
-        headers = self.roster.get_auth_headers(character_id)
-        if not headers:
-            print(f"[IndustrySkills] Not authenticated for character {character_id}")
-            return None
-
         try:
-            resp = esi_request(
-                "GET",
-                f"{BASE_URL}/characters/{character_id}/skills/",
-                headers=headers, timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"[IndustrySkills] request error for {character_id}: {e}")
+            snapshot = character_snapshot(RosterAuth(self.roster, character_id), "skills",
+                "industry", fetch=True, force=force_refresh, cache=self._snapshot_cache,
+                trigger="industry_skills")
+            cached = _SkillCache(snapshot)
+        except Exception as exc:
+            self._cache.pop(character_id, None)
+            print(f"[IndustrySkills] request error: {type(exc).__name__}")
             return None
+        self._cache[character_id] = cached
+        print(f"[IndustrySkills] Loaded {len(cached.raw_skills)} skills for character {character_id}")
+        return cached.raw_skills
 
-        raw_skills = {}
-        for skill in data.get("skills", []):
-            sid = skill.get("skill_id")
-            raw_skills[sid] = skill.get("trained_skill_level", 0)
-
-        self._cache[character_id] = _SkillCache(raw_skills)
-        decision_event("industry_skills", "COMPLETE", "provider", items=len(raw_skills))
-        print(f"[IndustrySkills] Fetched {len(raw_skills)} skills for character {character_id}")
-        return raw_skills
-
-    def get_levels(self, character_id: int) -> Dict[str, int]:
+    def get_levels(self, character_id: int, *, allow_stale=False) -> Dict[str, int]:
         """Return the named industry skill levels for a character.
 
         Cache-only: missing/expired data returns all zeros. Network acquisition
         is deliberately limited to an explicit Characters > Skills action.
         """
-        cache = self._cache.get(character_id)
-        if not cache or cache.is_expired:
+        cache = self._read_cache(character_id, allow_stale=allow_stale)
+        if not cache or (cache.is_expired and not allow_stale):
             return {name: 0 for name in INDUSTRY_SKILL_IDS}
 
         return {
@@ -100,9 +90,9 @@ class IndustrySkills:
             for name, sid in INDUSTRY_SKILL_IDS.items()
         }
 
-    def get_level(self, character_id: int, skill_name: str) -> int:
+    def get_level(self, character_id: int, skill_name: str, *, allow_stale=False) -> int:
         """Level of one named skill (0 if unknown/not trained)."""
-        return self.get_levels(character_id).get(skill_name.lower(), 0)
+        return self.get_levels(character_id, allow_stale=allow_stale).get(skill_name.lower(), 0)
 
     def peek_levels(self, character_id: int) -> Optional[Dict[str, int]]:
         """Named skill levels from cache ONLY — never triggers a network fetch.
@@ -111,7 +101,7 @@ class IndustrySkills:
         can decide to render a placeholder + warm the cache in the background
         instead of blocking on ESI. Mirrors `get_levels`' naming.
         """
-        cache = self._cache.get(character_id)
+        cache = self._read_cache(character_id)
         if not cache or cache.is_expired:
             return None
         return {name: cache.raw_skills.get(sid, 0)
@@ -119,10 +109,10 @@ class IndustrySkills:
 
     def get_cache_status(self, character_id: int) -> tuple:
         """(can_refresh, seconds_remaining)."""
-        cache = self._cache.get(character_id)
+        cache = self._read_cache(character_id)
         if not cache or cache.is_expired:
             return (True, 0)
-        remaining = (cache.expires_at - datetime.now()).total_seconds()
+        remaining = (cache.expires_at - datetime.now(timezone.utc)).total_seconds()
         return (False, max(0, int(remaining)))
 
     def clear(self, character_id: int = None):

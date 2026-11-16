@@ -39,6 +39,11 @@ Decisions preserved from those messages:
   then reuse it across starts for the remaining time. REUSE must show the wait.
 - Finish and verify ESI/cache work, then work through Stock Market with the
   user, then Industry. The user runs the IDE app; use its saved log as evidence.
+- Reputation ("rep") means saved faction/corporation standings, used for the
+  seller and Industry. On 2026-11-15 the user chose manual updates plus a
+  seven-day on-use refresh: keep using saved rep across starts and on refresh
+  failure, request an eligible update explicitly or when used at seven days
+  old. A freshness deadline must not turn known rep into zero.
 
 ## Execution status
 
@@ -46,17 +51,19 @@ Decisions preserved from those messages:
 | --- | --- | --- |
 | Diagnostics and readable REUSE waits | User-run logs show requests, acceptance, persistence, original ages, readable waits, heartbeats and automatic reports. | Exercise remaining routes; reports alone cannot clear unexercised paths or cross-restart repeats. |
 | Full public Industry prices and systems | Shared expiry-aware provider, locks and atomic persistence. Real acquisition, repeated reuse and restart restoration/reuse verified. | Retain regression coverage as other consumers are integrated. |
-| Wallet balance, transactions, journal, active orders and order history | Shared private provider, independent clocks, context isolation, atomic full snapshots and separate successful-page stages. All five real acquisitions persisted; eight synthetic checks passed. | Real private RESTORE then REUSE remains unobserved. Verify actual inventory reconciliation with fetched, reused and restored records. |
+| Wallet balance, transactions, journal, active orders and order history | All five real resources persisted/restored. Four unexpired resources reused after a real restart, with original ages/expiry; expired balance acquired independently. Eleven offline cache/accounting checks passed at 18:32:08 Central. | Live character changes and discovery sharing; accounting cases beyond the synthetic fixtures, including late purchases. Retain regression checks while extending the provider. |
+| Skills and standings, Trading and Industry | Seventeen checks passed at 19:00:02 Central. Real seller/Industry skills and standings acquired, saved, restored and reused across restart. | New seven-day/manual rep policy and two additional scenarios (nineteen total) await runtime verification. Matching-context sharing is synthetic-verified; buyer login fails with invalid_grant and needs reauthentication. |
 | Structure discovery's active character orders | Routed through the private provider. | Live matching-context reuse; structure metadata still needs shared protection. |
 | Remaining acquisition paths and consumer policies | Reviewed below; not finished. | Skills/standings, direct/manual paths, history overlay, order snapshot hardening, agreed consumer ages, SSO cooldown and notices. |
 
-Evidence at review: run `19360-1794786679` saved all five private resources at
-17:52:39-46 Central and updated four inventory listings at 17:53:23. Ctrl+F12
-passed eight synthetic checks at 17:54:03. The 18:02:54 heartbeat still belonged
-to that original process: 73 responses, zero errors and zero observed early
-repeats. This does not establish a real private-cache restart or all accounting
-cases. That process shut down at 18:03:22; no subsequent startup was present at
-review. See [verification instructions](ESI_DIAGNOSTICS.md).
+Latest wallet evidence: run `16552-1794789044` acquired eligible replacements
+around 18:32 Central and passed all eleven offline checks at 18:32:08. After
+restart, run `25944-1794789218` restored all five snapshots at 18:33:47 and
+reused transactions, journal, orders and order history at 18:34:40 without
+requests to those routes. Original ages/absolute expiry were preserved; balance
+alone was expired and fetched again. The public underbid fallback separately
+repeated eighteen requests before prior expiry in the earlier process. That
+known direct-path gap remains open. See [verification instructions](ESI_DIAGNOSTICS.md).
 
 ## Remaining phase-1 work, in order
 
@@ -66,11 +73,9 @@ sequence, not newly agreed product behavior or proof of runtime failures.
 
 ### 1. Finish shared acquisition, persistence and direct/manual coverage
 
-**Close the current wallet verification first.** Restart and request Trade
-Refresh while a saved linking resource is still unexpired; compare original
-timestamps and private route counts. If its window has already elapsed,
-acquire an eligible replacement and test during that new window. Verify
-character changes, discovery sharing and independent resource clocks.
+**Wallet restart/reuse and the eleven-check accounting checkpoint passed.**
+Continue protecting that behavior as the provider is extended. Live character
+changes and discovery sharing remain unobserved; do not mark those complete.
 
 Run isolated accounting fixtures through the actual inventory sync with
 fetched, reused and restored wallet records. Require equal lots, cost basis,
@@ -78,15 +83,33 @@ listings, partial fills, completed/cancelled orders, fees/taxes and realized
 P&L; repeated sync/restart must not double-count. Include delayed linking
 records and partial refresh failures. The existing inventory/P&L replay cases
 are useful foundations; the eight cache checks alone do not cover this.
-The new wallet constructor's incompatibility with `ESIWallet(None)` in existing
-replay code was corrected during this review; its added assertion needs the
-next in-app safety-check run.
+The wallet constructor's compatibility assertion for `ESIWallet(None)` passed
+in the 18:32 eleven-check run.
+
+The checkpoint through the prior review was committed and pushed as `46c76f4`
+on 2026-11-15, retaining `APP_VERSION` 3.67 live. Subsequent work adds three
+isolated in-app scenarios: complete order lifecycle across FIFO lots; delayed
+journal fee/tax backfill with independent expiry; and partial journal-refresh
+failure/recovery. Each compares fetched, reused and restored wallet data through
+the actual inventory sync, then repeats sync and reloads inventory from disk.
+These three accounting scenarios passed in the user's 18:32 in-app run.
+Late-arriving purchase records and other delayed-linking cases remain outside
+these three scenarios; their pass is not exhaustive coverage.
 
 Then extend the established provider approach in small verified steps:
 
 - **Skills and standings:** persist full raw responses and ESI expiry; share
   matching authorization contexts between trading and Industry. Keep derived
   calculations local and preserve the existing user-triggered acquisition.
+  Original shared-provider chunk passed seventeen checks and normal live
+  seller/Industry acquisition/restart/reuse. The newer reputation policy is
+  implemented locally and awaits nineteen-check/live verification.
+  Skills retain their existing one-hour non-forced preference; rep uses the
+  user-selected seven-day/manual policy. Explicit force may bypass a consumer
+  preference only after server freshness permits it. Skills follow
+  Cache-Control where supplied (ESI's event-driven route); original Expires,
+  Cache-Control, Date and Age metadata remain saved. This is a route-specific
+  interpretation of server caching, not a new wallet delay or scheduler change.
 - **Private structures:** isolate books and metadata by authorization context
   before sharing Browse Orders, discovery and Industry lookups. The current
   shared structure-book cache is keyed only by structure ID and can return
@@ -153,8 +176,9 @@ Compare original timestamps across runs; process-local repeat counters alone
 are insufficient. Keep implemented, statically checked and live-verified
 statuses separate. Only then proceed to the follow-on workflow phases below.
 
-Next implementation chunk after the wallet verification gate: shared durable
-skills/standings responses, followed by the private-structure/direct-path work.
+Current verification gate: reputation retention and manual/seven-day refresh
+(nineteen-check runner and normal IDE behavior). Next implementation
+chunk after that: private-structure/direct-path work.
 
 ## Consumer policies
 
@@ -165,12 +189,21 @@ skills/standings responses, followed by the private-structure/direct-path work.
 | Jita reference while scanning another hub | Preserved complete Jita snapshot, intentionally allowed to be semi-stale | Initially if absent; on an explicit Jita pull/direct Jita scan; or when the reference reaches 24 hours old. |
 | Stock Market hub | Saved complete snapshot for that hub | On loading/opening the hub if missing or the last successful acquisition was at least one hour ago. A newer scanner acquisition satisfies this check. |
 | Industry order consumers | Saved semi-stale snapshots | A slower cadence is acceptable. No new exact Industry refresh interval was agreed. Reuse available data rather than introducing scanner-frequency traffic. |
+| Reputation for seller/Industry | Last good saved raw standings in the matching authorization context | On an explicit rep refresh or an existing worker acquisition path when seven days old, respecting ESI freshness. Cache-only reads keep using saved rep even when an update is due; failed refresh retains it and its original timestamps. |
 
 All actual acquisitions must respect the resource's ESI cache expiry and rate
 limits. A consumer's preferred age does not authorize a request before ESI
 expiry. Explicit refresh means request an eligible update, not bypass CCP's
 cache. Expired ESI data may still be displayed by consumers that tolerate it;
 label the age accurately.
+
+Reputation's seven-day age is measured from successful acquisition, not a tab
+visit or restart. Trading's **Refresh Skills** button explicitly requests an
+eligible rep update; ordinary character/hub use follows the seven-day policy.
+Industry's Standings dialog reuses on open and offers **Refresh rep** for an
+explicit update. Cached social skill levels remain available for effective
+rep calculations so those modifiers do not vanish after the skills window.
+Raw/base rep remains the source for seller broker-fee calculations.
 
 The Stock Market one-hour rule concerns order snapshots. Holdings-history
 freshening is a separate operation and must not be mistaken for proof that

@@ -81,7 +81,8 @@ the full report after one minute, or use ESI Report/F12. Repeating a report
 while idle must not initiate a fetch. Do not launch the app on the user's
 behalf to obtain this evidence.
 
-Changes are uncommitted and APP_VERSION remains 3.67 live. The compliance
+The instrumentation/cache checkpoint was committed and pushed as `46c76f4`
+on 2026-11-15; APP_VERSION remains 3.67 live. The compliance
 audit's remaining acquisition, persistence, and distribution work is separate.
 The [saved goals](ESI_ACQUISITION_GOALS.md) define the intended consumer policies;
 this instrumentation does not implement them.
@@ -102,7 +103,7 @@ verified for these two resources. F12 still requires direct runtime evidence.
 
 ## Wallet/order cache verification — partial live verification
 
-After restarting from the IDE, **Ctrl+F12** runs eight offline safety checks in
+After restarting from the IDE, **Ctrl+F12** runs nineteen offline safety checks in
 a background worker and prints `[ESI-CacheCheck]` results. Expect
 `passed=8 total=8 network=none data=synthetic`. These cover independent expiry,
 restart payload/time preservation, character/owner/client/scope separation,
@@ -167,3 +168,119 @@ fetched, reused and disk-restored transactions/journal/order history. Repeat
 syncs and restart must not double-count; partial or late linking data needs
 coverage. The current synthetic cache checks and four observed listing updates
 do not establish those accounting results.
+
+### Expanded accounting checks — prepared 2026-11-15
+
+The runner now contains the original eight cache checks plus
+`inventory_cache_lifecycle`, `inventory_delayed_journal` and
+`inventory_partial_refresh`. No result from this expanded runner has been
+observed yet. Restart `main.py` from the IDE and press **Ctrl+F12**; require
+each scenario to report PASS and the summary to report `passed=11 total=11
+network=none data=synthetic`. The eight-check result above predates this work.
+
+The new scenarios use actual wallet parsing, inventory sync, FIFO, fee/tax
+backfill and inventory serialization in temporary directories. They compare
+freshly fetched, reused and cache-restored views; repeat sync and reload the
+inventory; and check partial fills, fulfilled/cancelled listings, cost basis,
+profit and failure recovery. Inventory storage is injected per instance and
+the replay defers writes to explicit flush, avoiding global path changes or
+Tk callbacks from the test worker. Normal inventory storage remains the default.
+No synthetic acquisition events enter the production ESI evidence counters.
+
+These fixtures cover delayed journal records, not every possible delayed buy,
+sale or history record. They also do not replace the real authorization-context
+restart/reuse check through **Tracking → Trade Refresh**. If saved linking data
+has expired, acquire an eligible snapshot first, then restart and refresh
+within its saved window. Confirm RESTORE followed by REUSE with original times.
+
+### Wallet/accounting checkpoint passed — 2026-11-15, 18:32–18:35 Central
+
+Run `16552-1794789044` passed all eleven existing checks at 18:32:08, including
+the unauthenticated-wallet compatibility assertion and all three accounting
+scenarios. Eligible real wallet replacements were fully acquired and saved
+around 18:32. A same-process manual refresh reused them.
+
+After the 18:33:34 shutdown, run `25944-1794789218` restored all five snapshots
+at 18:33:47, preserving original acquisition times and absolute expiry. Trade
+Refresh at 18:34:40 reused transactions (age 155s), journal (153s), active orders
+(151s) and order history (150s), with no HTTP requests to those four routes.
+Balance was independently expired and fetched again. The real scanner
+inventory sync updated four listings and recorded no new buys, sales or fees
+on repeated syncs; other live accounting cases remain unexercised.
+
+The earlier process also observed eighteen pre-expiry public market-order
+requests from `underbid_fallback` after its full regional-cache miss. This is
+the known uncached per-type fallback, not a private-wallet repeat. Restart
+resets the observer's repeat counter, so the newer process's zero does not
+clear this gap. No exceptions or HTTP failures were found in these runs.
+
+### Shared skills/standings — prepared, not runtime-verified
+
+The runner now adds six scenarios: `character_sharing_restart`,
+`character_context_isolation`, `character_expiry_force`,
+`character_validation_failures`, `character_concurrency`, and
+`character_local_views`. Restart the IDE app and press **Ctrl+F12**; require
+`passed=17 total=17 network=none data=synthetic`. The earlier eleven-check pass
+does not verify these additions or the new provider hooks.
+
+For real routes, use **Tracking → Refresh Skills**, then Industry's
+**Characters → Skills / Standings** dialogs. Look for skills/standings
+FETCH → ACCEPT → PERSIST → COMPLETE (`status=durable`) or REUSE with a readable
+wait. Both consumers now use the same raw-resource names with different
+triggers. Matching character/owner/application/scopes share snapshots; different
+scope sets intentionally do not. Being the same character alone is insufficient.
+
+Repeat and restart within the usable window. Getters may RESTORE from disk
+without acquiring; explicit refresh should REUSE the original response/time
+when still eligible for reuse. Cache-only getters and derived recalculation
+must not issue ESI requests. Compare original times and route counts across
+runs, not just the current process's repeat counter.
+
+The existing one-hour consumer preference is retained, bounded by any later
+server freshness. Force bypasses only that preference, never server freshness.
+Skills use Cache-Control when supplied; Date/Age prevent restarting max-age.
+The legacy Expires value is retained in page metadata. This follows the
+[event-based skills caching announcement](https://developers.eveonline.com/blog/smarter-caching-when-events-drive-invalidation).
+Standings retain normal expiry handling. Invalid/full-page failures preserve
+prior accepted data; failed disk saves report MEMORY_ONLY and retry persistence
+on reuse without acquiring again. The new scenarios cover these paths using
+injected data only. The user's normal app run remains the runtime gate.
+
+### Shared character checkpoint passed — 2026-11-15, 18:59–19:02 Central
+
+Run `30072-1794790665` passed all seventeen checks at 19:00:02. Seller standings
+saved at 18:59:46 and Industry standings at 19:00:32, both with durable status.
+After restart, run `5748-1794790867` restored seller standings at 19:01:19,
+reused them at 19:01:42, and restored/reused Industry standings at 19:01:56.
+Both skill responses also persisted/restored/reused with original ages.
+This verifies those real contexts separately; matching-context sharing is
+covered by the synthetic scenarios, not by two different real characters.
+
+Buyer acquisition failed twice at SSO refresh with HTTP 400 / invalid_grant.
+Buyer skills failed before its standings acquisition; no buyer standings
+snapshot was created. This is distinct from seller/Industry disk persistence.
+The buyer needs reauthentication; no credentials were inspected or changed.
+
+### Reputation retention — implemented, runtime check pending
+
+The user chose saved rep until explicitly refreshed plus refresh on use at
+seven days. Standings/rep now have a seven-day normal acquisition preference;
+cache-only reads keep using the last good matching-context snapshot after
+that window. Failure emits FETCH_FAILED then STALE_REUSE, preserving the old
+snapshot and original age, without a successful-acquisition COMPLETE. Saved
+social skill levels remain available for effective rep calculations. Skills'
+normal read/acquisition freshness is otherwise separate.
+
+Restart the IDE app and press **Ctrl+F12**. The runner now adds
+`reputation_retention` and `reputation_refresh_policy`; require
+`passed=19 total=19 network=none data=synthetic`. These cover old-rep restoration,
+social modifiers, context isolation, the seven-day boundary, explicit eligible
+updates and failure retention. The seventeen-check pass predates these changes.
+
+For manual real behavior use **Tracking → Refresh Skills**, or Industry's
+**Characters → Standings → Refresh rep**. Opening the Industry dialog normally
+reuses rep younger than seven days. Explicit buttons bypass the seven-day
+preference but must still REUSE before ESI expiry. Reprocessing's explicit ESI
+button follows the same rule for seller rep. Inspect original ages and readable
+waits; never erase live snapshots or manipulate dates to force the seven-day
+case, which the isolated fixtures cover.

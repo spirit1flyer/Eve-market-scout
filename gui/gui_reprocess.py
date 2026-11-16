@@ -227,14 +227,14 @@ class ReprocessTabManager:
                     )
                     skills.fetch_skills(slot="seller")
                 if standings is not None:
-                    can_fetch, next_in = standings.get_cache_status("seller")
+                    can_fetch, next_in = standings.get_cache_status("seller", force_refresh=True)
                     decision = "FETCH" if can_fetch else "CACHE"
                     print(
                         "[ESI-Timing] resource=standings "
                         f"trigger=reprocess_manual decision={decision} "
                         f"next_in={next_in}s"
                     )
-                    standings.fetch_standings(slot="seller")
+                    standings.fetch_standings(slot="seller", force_refresh=True)
             except Exception as e:
                 _print(f"ESI refresh error: {e}")
             submit(lambda: self._apply_esi(skills, standings, announce=True))

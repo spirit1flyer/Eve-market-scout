@@ -97,6 +97,22 @@ def get_private_cache():
 class PrivateWalletCache:
     """One full accepted representation per exact resource and auth context."""
 
+    resource_paths = RESOURCE_PATHS
+    fallback_seconds = FALLBACK_SECONDS
+    single_value_resources = ("balance",)
+
+    @staticmethod
+    def _validate_payload(resource, payload):
+        parse_wallet_resource(resource, payload)
+
+    @staticmethod
+    def _item_count(resource, payload):
+        return 1 if resource == "balance" else len(payload)
+
+    @staticmethod
+    def _response_expiry(resource, headers, received):
+        return _expires(headers, received)
+
     def __init__(self, directory, request=esi_request, now=None):
         self.directory = Path(directory)
         self.request = request
@@ -108,7 +124,7 @@ class PrivateWalletCache:
         self.meta_lock = threading.Lock()
 
     def _identity(self, context, resource, params):
-        if resource not in RESOURCE_PATHS:
+        if resource not in self.resource_paths:
             raise ValueError("unsupported private resource")
         descriptor = {"partition": context.partition, "resource": resource,
                       "params": params or {}}
@@ -124,11 +140,12 @@ class PrivateWalletCache:
     def _event(self, context, resource, action, trigger, entry=None, **fields):
         if entry is not None:
             now = self.now()
+            eligible_at = fields.pop("eligible_at", entry["expires"])
             fields.update(
                 age=f"{max(0, (now - entry['acquired_at']).total_seconds()):.0f}s",
-                next_in=f"{max(0, (entry['expires'] - now).total_seconds()):.0f}s",
+                next_in=f"{max(0, (eligible_at - now).total_seconds()):.0f}s",
                 expires=entry["expires"].isoformat(), complete=True,
-                items=1 if resource == "balance" else len(entry["payload"]),
+                items=self._item_count(resource, entry["payload"]),
                 pages=len(entry["page_metadata"]), source="esi_private_full")
         decision_event(resource, action, trigger, slot=context.slot,
                        context=context.partition[:12], **fields)
@@ -148,7 +165,7 @@ class PrivateWalletCache:
                 raise PrivateSnapshotError("unproven_snapshot")
             if self._identity(context, resource, saved.get("params")) != key:
                 raise PrivateSnapshotError("mismatched_request")
-            parse_wallet_resource(resource, saved["payload"])
+            self._validate_payload(resource, saved["payload"])
             json.dumps(saved["payload"], allow_nan=False)
             acquired = _utc(saved["acquired_at"])
             expires = _utc(saved["expires"])
@@ -231,7 +248,7 @@ class PrivateWalletCache:
                     or saved.get("resource") != resource or saved.get("complete") is not False):
                 raise PrivateSnapshotError("invalid_page_stage")
             for page, row in saved["pages"].items():
-                parse_wallet_resource(resource, row["payload"])
+                self._validate_payload(resource, row["payload"])
                 json.dumps(row["payload"], allow_nan=False)
                 _utc(row["expires"])
                 _utc(row["acquired_at"])
@@ -259,7 +276,7 @@ class PrivateWalletCache:
         for attempt in range(2 if retry_server_errors else 1):
             self._check_context(auth, context)
             response = self.request("GET",
-                f"{BASE_URL}/characters/{context.character_id}/{RESOURCE_PATHS[resource]}",
+                f"{BASE_URL}/characters/{context.character_id}/{self.resource_paths[resource]}",
                 headers=headers, params=dict(query), timeout=30)
             if getattr(response, "status_code", 200) < 500 or attempt == 1:
                 break
@@ -267,17 +284,17 @@ class PrivateWalletCache:
         response.raise_for_status()
         self._check_context(auth, context)
         payload = response.json()
-        parse_wallet_resource(resource, payload)
+        self._validate_payload(resource, payload)
         json.dumps(payload, allow_nan=False)
         received = self.now()
         metadata = {name.lower(): value for name, value in response.headers.items()
                     if name.lower() in ("etag", "last-modified", "expires", "cache-control",
                                         "date", "age", "x-pages")}
         try:
-            expires = _expires(metadata, received)
+            expires = self._response_expiry(resource, metadata, received)
             expiry_source = "esi"
         except ValueError:
-            expires = received + timedelta(seconds=FALLBACK_SECONDS[resource])
+            expires = received + timedelta(seconds=self.fallback_seconds[resource])
             expiry_source = "fallback"
         row = {"payload": payload, "headers": metadata, "expires": expires.isoformat(),
                "acquired_at": received.isoformat(), "expiry_source": expiry_source}
@@ -332,26 +349,29 @@ class PrivateWalletCache:
                 raise PrivateSnapshotError("pagination_not_proven")
             if not paginated and reported_pages != 1:
                 raise PrivateSnapshotError("unexpected_pagination")
-            parse_wallet_resource(resource, data)
+            self._validate_payload(resource, data)
             metadata.append({"page": page, "total_pages": total, "expires": row["expires"],
                 "acquired_at": row["acquired_at"],
                 "etag": response_headers.get("etag"), "last_modified": validator,
+                "response_expires": response_headers.get("expires"),
+                "cache_control": response_headers.get("cache-control"),
+                "date": response_headers.get("date"), "age": response_headers.get("age"),
                 "expiry_source": row["expiry_source"]})
-            if resource == "balance":
+            if resource in self.single_value_resources:
                 payload = data
             else:
                 payload.extend(data)
             if not paginated or page >= total:
                 break
         self._check_context(auth, context)
-        parse_wallet_resource(resource, payload)
+        self._validate_payload(resource, payload)
         json.dumps(payload, allow_nan=False)
         return {"payload": payload, "page_metadata": metadata,
                 "acquired_at": self.now(),
                 # Wait for every page to expire before reacquiring the full book.
                 "expires": max(_utc(page["expires"]) for page in metadata)}
 
-    def get(self, auth, context, resource, params=None, trigger="trade"):
+    def get(self, auth, context, resource, params=None, trigger="trade", min_age_seconds=0):
         key = self._identity(context, resource, params)
         lock = self._lock(key)
         if lock.locked():
@@ -360,8 +380,12 @@ class PrivateWalletCache:
             self._check_context(auth, context)
             self._restore(context, resource, key)
             entry = self.entries.get(key)
-            if entry and self.now() < entry["expires"]:
-                self._event(context, resource, "REUSE", trigger, entry, reason="esi_unexpired")
+            if entry and (self.now() < entry["expires"] or
+                          (self.now() - entry["acquired_at"]).total_seconds() < min_age_seconds):
+                reason = "esi_unexpired" if self.now() < entry["expires"] else "consumer_age"
+                self._event(context, resource, "REUSE", trigger, entry, reason=reason,
+                            eligible_at=max(entry["expires"], entry["acquired_at"] +
+                                            timedelta(seconds=min_age_seconds)))
                 if not entry["durable"]:
                     self._save(context, resource, key, entry)
                 return entry

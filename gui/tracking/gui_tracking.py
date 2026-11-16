@@ -267,7 +267,7 @@ class TrackingTabManager:
         # Refresh Skills button (manual, not on ESI cycle)
         self.skills_btn = ttk.Button(
             seller_row, text="Refresh Skills",
-            command=self._refresh_skills_async, width=12
+            command=lambda: self._refresh_skills_async(force_rep=True), width=12
         )
         self.skills_btn.pack(side=tk.LEFT, padx=2)
         
@@ -552,7 +552,7 @@ class TrackingTabManager:
         self.standings_bar.update(self.skills)
         self._refresh_display()
 
-    def _refresh_skills_async(self):
+    def _refresh_skills_async(self, force_rep=False):
         """Refresh skills and standings in background thread."""
         if not self.auth.is_authenticated:
             self.set_status("Not logged in")
@@ -574,7 +574,7 @@ class TrackingTabManager:
             buy_hub = self._buy_hub_override or sell_hub
 
             def log_cache_decision(resource, provider, slot):
-                can_fetch, next_in = provider.get_cache_status(slot)
+                can_fetch, next_in = provider.get_cache_status(slot, force_refresh=force_rep) if resource == "standings" else provider.get_cache_status(slot)
                 decision = "FETCH" if can_fetch else "CACHE"
                 print(f"[ESI-Timing] resource={resource} trigger=manual "
                       f"slot={slot} decision={decision} next_in={next_in}s")
@@ -590,7 +590,7 @@ class TrackingTabManager:
                     if self.esi_standings:
                         log_cache_decision("standings", self.esi_standings, "seller")
                         # base=True: fee math wants raw standings, not Connections-adjusted.
-                        self.esi_standings.fetch_standings(slot="seller")
+                        self.esi_standings.fetch_standings(slot="seller", force_refresh=force_rep)
                         corp, fac = self.esi_standings.get_standings_for_hub(
                             sell_hub, slot="seller", base=True)
                         station_standing = corp
@@ -615,7 +615,7 @@ class TrackingTabManager:
                     if self.esi_standings:
                         log_cache_decision("standings", self.esi_standings, "buyer")
                         # base=True: fee math wants raw standings, not Connections-adjusted.
-                        self.esi_standings.fetch_standings(slot="buyer")
+                        self.esi_standings.fetch_standings(slot="buyer", force_refresh=force_rep)
                         corp, fac = self.esi_standings.get_standings_for_hub(
                             buy_hub, slot="buyer", base=True)
                         station_standing = corp

@@ -206,8 +206,8 @@ shared-rate-gate wiring were reviewed across async and synchronous ESI callers.
 | Regional market orders: scanner and shared hub provider | Normal disk restoration/reuse observed. Remaining gaps: non-atomic disk writes, successful-page reuse across full retries/restart, missing-validator acceptance and later-page metadata checks; Jita fallback and consumer ages also need correction. |
 | Regional orders: tracking per-type fallback | Shared full-cache reuse first; fallback lacks durable payload/expiry. A vanished later page can also leave partial data looking complete. |
 | Structure market orders: shared hub provider | Cache currently keyed by structure ID alone and returned before authentication checks. Scope by authorization context before routing Browse through it. Pagination/retry and direct Browse gaps remain. |
-| Wallet balance, transactions, journal, active orders, order history | Shared context-isolated durable provider implemented, with atomic snapshots and separate page stages. Five initial real acquisitions persisted; eight synthetic checks passed. Real private restart/reuse and full downstream accounting verification remain open. Discovery active orders now use this provider. |
-| Character skills and standings, trading and Industry | Read-only, locally time-gated in memory; no shared durable response-expiry cache. |
+| Wallet balance, transactions, journal, active orders, order history | Shared durable provider, real restart/reuse with original clocks verified, eleven offline cache/accounting checks passed. Live character changes/discovery sharing and accounting beyond the fixtures remain open. |
+| Character skills and standings, trading and Industry | Seventeen checks and real seller/Industry acquisition, persistence, restoration/reuse passed. Skills follow Cache-Control. New manual/seven-day reputation retention policy is implemented, awaiting nineteen-check/live verification. Buyer login fails before acquisition and needs reauthentication. |
 | Character blueprints | SQLite payload and expiry exist. Remaining: concurrent-pull deduplication, context review, stricter page/row validation, and honest DB-failure result; a caught write failure can be reported as successful zero-row storage. |
 | Public adjusted prices and industry systems | Shared full-response expiry-aware provider and atomic saves implemented. Real acquisition, repeated reuse and restart restoration/reuse verified. Original observed repeats were the baseline defect. |
 | Regional market history | Archive/supplement reuse exists; direct/holdings freshening lacks equivalent durable expiry-aware overlay. |
@@ -502,3 +502,60 @@ routes. Balance is eligible independently. Restart alone may restore resources
 without immediately running the wallet refresh because the existing automatic
 schedule retains its 20-minute floor. The added null-auth compatibility
 assertion also needs the next Ctrl+F12 run; the 17:54 result predates that edit.
+
+### Checkpoint and expanded accounting runner — 2026-11-15
+
+The preceding ESI/cache implementation and evidence were committed and pushed
+as `46c76f4`, keeping `APP_VERSION` 3.67 live. The next local chunk adds three
+cache-to-inventory acceptance scenarios to Ctrl+F12 (eleven checks total).
+They exercise the actual FIFO/sync/serialization path for fetched, reused and
+restored records, including journal delay and partial failure. Syntax and diff
+checks pass; the expanded runner and real private-cache restart/reuse remain
+live-unverified. See [the diagnostic handoff](ESI_DIAGNOSTICS.md) for the exact
+actions and limits. No additional acquisition family is marked complete.
+
+### Latest wallet verification and shared character implementation — 2026-11-15
+
+The user's run `16552-1794789044` passed all eleven checks at 18:32:08 Central.
+Run `25944-1794789218` restored all five real private snapshots at 18:33:47 and
+reused the four unexpired resources at 18:34:40 without requests to those
+routes. Balance acquired independently after expiry. This closes the ordinary
+wallet restart/reuse gate and verifies the listed synthetic accounting cases;
+it does not clear every authorization or delayed-accounting scenario.
+
+The first run also observed eighteen early repeats in the public Tracking
+underbid fallback. Source confirms no durable per-type fallback cache; that
+previously identified direct-path work remains necessary.
+
+The next local implementation adds `PrivateCharacterCache` over the same
+transport/lock/validation/staging/atomic-save machinery. Trading and Industry
+skills/standings use full raw responses and exact private context partitions.
+Cache-only reads restore/rederive without acquisition. Existing one-hour
+non-forced preference remains; force cannot bypass server freshness. Six new
+offline checks extend Ctrl+F12 to seventeen; their runtime results and actual
+character-route acquisitions/reuse/restoration remain pending. Wallet hooks
+retain their default behavior and need the regression run too.
+
+The [2026-01-27 skills caching announcement](https://developers.eveonline.com/blog/smarter-caching-when-events-drive-invalidation)
+states that skills/skillqueue use event-driven invalidation and should follow
+Cache-Control rather than legacy Expires. The skills-specific expiry hook
+honors that distinction, accounting for Date/Age and preserving original
+headers in snapshot page metadata. Other resources keep their existing expiry
+interpretation. No version bump, new commit or push is part of this chunk.
+
+### Character evidence and reputation clarification — 2026-11-15
+
+Run `30072-1794790665` passed seventeen checks at 19:00:02 Central. Real seller
+and Industry skill/standing responses were saved and restored/reused in run
+`5748-1794790867` with original ages. Buyer SSO refresh instead failed with
+invalid_grant; no successful buyer acquisition was implied by these results.
+
+The user clarified that rep is needed for the seller and Industry and selected
+manual refresh plus seven-day on-use refresh. Rep now stays readable from the
+last good matching-context disk snapshot after its update deadline and during
+failed refresh. Manual controls request eligible updates while honoring server
+freshness. Normal skill freshness stays separate; old social levels may be
+read solely to preserve effective rep modifiers. Raw rep continues to feed
+broker-fee calculations. Two new offline scenarios bring the runner to
+nineteen checks. Syntax/diff checks pass; this newer policy is not yet marked
+runtime-verified. No version bump, commit or push was performed.

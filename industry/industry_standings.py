@@ -12,34 +12,35 @@ fetcher supplies those levels (same /skills/ pull), else base standings are used
 """
 
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict
 
 from core.config import get_esi_headers
 from core.esi_rate_limit import esi_request
-from core.esi_diagnostics import decision_event
+from core.esi_character_cache import RosterAuth, character_snapshot, usable_until
 
 BASE_URL = "https://esi.evetech.net/latest"
 
 
 class _StandingsCache:
-    def __init__(self, standings: dict):
+    def __init__(self, standings: dict, snapshot):
         self.standings = standings
-        self.fetched_at = datetime.now()
-        self.expires_at = self.fetched_at + timedelta(hours=1)
+        self.fetched_at = snapshot["acquired_at"]
+        self.expires_at = usable_until(snapshot)
 
     @property
     def is_expired(self) -> bool:
-        return datetime.now() >= self.expires_at
+        return datetime.now(timezone.utc) >= self.expires_at
 
 
 class IndustryStandings:
     """Fetches + caches standings per roster character_id (display-only for now)."""
 
-    def __init__(self, roster, skills: 'IndustrySkills' = None):
+    def __init__(self, roster, skills: 'IndustrySkills' = None, cache=None):
         """roster: IndustryRoster; skills: optional IndustrySkills for modifiers."""
         self.roster = roster
         self.skills = skills
+        self._snapshot_cache = cache
         self._cache: Dict[int, _StandingsCache] = {}
         self._names: Dict[int, str] = {}   # id -> faction/corp/agent name
 
@@ -57,35 +58,27 @@ class IndustryStandings:
         Shape: {'agents': {id: standing}, 'npc_corps': {...}, 'factions': {...}}
         with Connections/Diplomacy applied when a skills fetcher is present.
         """
-        cache = self._cache.get(character_id)
-        if not force_refresh and cache and not cache.is_expired:
-            decision_event("industry_standings", "REUSE", "provider")
-            return cache.standings
-
-        headers = self.roster.get_auth_headers(character_id)
-        if not headers:
-            print(f"[IndustryStandings] Not authenticated for character {character_id}")
+        try:
+            snapshot = character_snapshot(RosterAuth(self.roster, character_id), "standings",
+                "industry", fetch=True, force=force_refresh, cache=self._snapshot_cache,
+                trigger="industry_standings")
+            standings = self._derive(character_id, snapshot)
+        except Exception as exc:
+            self._cache.pop(character_id, None)
+            print(f"[IndustryStandings] request error: {type(exc).__name__}")
             return None
+        print(f"[IndustryStandings] Loaded {len(standings['factions'])} factions / "
+              f"{len(standings['npc_corps'])} corps for character {character_id}")
+        return standings
 
+    def _derive(self, character_id, snapshot):
         connections = diplomacy = 0
         if self.skills:
-            connections = self.skills.get_level(character_id, "connections")
-            diplomacy = self.skills.get_level(character_id, "diplomacy")
-
-        try:
-            resp = esi_request(
-                "GET",
-                f"{BASE_URL}/characters/{character_id}/standings/",
-                headers=headers, timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"[IndustryStandings] request error for {character_id}: {e}")
-            return None
+            connections = self.skills.get_level(character_id, "connections", allow_stale=True)
+            diplomacy = self.skills.get_level(character_id, "diplomacy", allow_stale=True)
 
         standings = {"agents": {}, "npc_corps": {}, "factions": {}}
-        for entry in data:
+        for entry in snapshot["payload"]:
             from_id = entry.get("from_id")
             from_type = entry.get("from_type")
             eff = self._modifier(entry.get("standing", 0.0), connections, diplomacy)
@@ -96,18 +89,20 @@ class IndustryStandings:
             elif from_type == "faction":
                 standings["factions"][from_id] = eff
 
-        self._cache[character_id] = _StandingsCache(standings)
-        decision_event("industry_standings", "COMPLETE", "provider", items=len(data))
-        print(f"[IndustryStandings] Fetched {len(standings['factions'])} factions / "
-              f"{len(standings['npc_corps'])} corps for character {character_id}")
+        self._cache[character_id] = _StandingsCache(standings, snapshot)
         return standings
 
     def get(self, character_id: int) -> dict:
         """Categorized cached standings; never initiates a network request."""
-        cache = self._cache.get(character_id)
-        if not cache or cache.is_expired:
-            return {"agents": {}, "npc_corps": {}, "factions": {}}
-        return cache.standings
+        try:
+            snapshot = character_snapshot(RosterAuth(self.roster, character_id), "standings",
+                "industry", cache=self._snapshot_cache)
+            if snapshot is not None:
+                return self._derive(character_id, snapshot)
+        except Exception as exc:
+            print(f"[IndustryStandings] cache unavailable: {type(exc).__name__}")
+        self._cache.pop(character_id, None)
+        return {"agents": {}, "npc_corps": {}, "factions": {}}
 
     def resolve_names(self, ids) -> Dict[int, str]:
         """Resolve faction/corp/agent ids to names via public POST
@@ -132,13 +127,22 @@ class IndustryStandings:
     def name_for(self, id_: int) -> Optional[str]:
         return self._names.get(int(id_)) if id_ is not None else None
 
-    def get_cache_status(self, character_id: int) -> tuple[bool, int]:
+    def get_cache_status(self, character_id: int, force_refresh=False) -> tuple[bool, int]:
         """Return (can_fetch, seconds_remaining) for manual UI diagnostics."""
+        self.get(character_id)
         cache = self._cache.get(character_id)
-        if not cache or cache.is_expired:
+        if not cache:
             return True, 0
-        remaining = (cache.expires_at - datetime.now()).total_seconds()
-        return False, max(0, int(remaining))
+        if force_refresh:
+            snapshot = character_snapshot(RosterAuth(self.roster, character_id), "standings",
+                "industry", cache=self._snapshot_cache)
+            if snapshot is None:
+                return True, 0
+            eligible = snapshot["expires"]
+        else:
+            eligible = cache.expires_at
+        remaining = (eligible - datetime.now(timezone.utc)).total_seconds()
+        return remaining <= 0, max(0, int(remaining))
 
     def clear(self, character_id: int = None):
         if character_id is None:
