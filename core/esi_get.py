@@ -1,6 +1,7 @@
 """ESIClient GET transport and public Industry cache integration."""
 
 import asyncio
+import re
 
 from core.config import ESI_BASE_URL
 from core.esi_public_cache import PUBLIC_INDUSTRY_ROUTES, get_public_cache
@@ -47,6 +48,16 @@ class ESIGetMixin:
         """Rate-limited GET, sharing full public Industry responses."""
         if endpoint in PUBLIC_INDUSTRY_ROUTES and not params:
             snapshot = await self.get_public_industry_snapshot(endpoint)
+            return snapshot["payload"]
+        metadata = re.fullmatch(r"/universe/(stations|systems|constellations|regions|types|stargates)/(\d+)/", endpoint)
+        if (metadata or endpoint == "/universe/regions/") and not params:
+            from core.esi_route_cache import route_snapshot
+            self._check_halted()
+            resource = {"stations": "station_info", "systems": "system_info",
+                        "constellations": "constellation_info", "regions": "region_info",
+                        "types": "type_info", "stargates": "stargate_info"}[metadata[1]] if metadata else "region_ids"
+            snapshot = await asyncio.to_thread(route_snapshot, resource, int(metadata[2]) if metadata else 1,
+                                               trigger="client_metadata", cache=getattr(self, "_public_route_cache", None))
             return snapshot["payload"]
         data, _headers = await self._get_with_headers(endpoint, params)
         return data

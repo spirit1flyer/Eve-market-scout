@@ -26,7 +26,7 @@ import requests
 
 from core.sound_manager import get_data_dir
 from core.config import ESI_USER_AGENT, get_esi_headers
-from core.esi_diagnostics import traced_request
+from core.sso_cooldown import sso_request
 from esi.esi_auth import (
     CharacterAuth,
     create_sso_login_attempt,
@@ -240,7 +240,7 @@ class IndustryRoster:
         if not code_verifier:
             return False, "No PKCE code verifier (auth flow state lost)"
         try:
-            response = traced_request(
+            response = sso_request(
                 "POST", TOKEN_URL,
                 data={
                     "grant_type": "authorization_code",
@@ -287,7 +287,7 @@ class IndustryRoster:
             return False, f"Network error: {e}"
     def _verify_token(self, char: RosterCharacter) -> bool:
         try:
-            response = traced_request(
+            response = sso_request(
                 "GET", VERIFY_URL,
                 headers={
                     "Authorization": f"Bearer {char.access_token}",
@@ -313,7 +313,7 @@ class IndustryRoster:
             if char.access_token and not char.is_expired:
                 return True
             try:
-                response = traced_request(
+                response = sso_request(
                     "POST", TOKEN_URL,
                     data={
                         "grant_type": "refresh_token",

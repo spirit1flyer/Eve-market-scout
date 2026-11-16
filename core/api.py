@@ -20,6 +20,9 @@ from core.order_cache import OrderCacheStore
 from core.market_snapshot import ESIPaginationChangedError, fetch_market_snapshot
 from core.type_name_mixin import TypeNameMixin
 from core.esi_get import ESIGetMixin
+from core.history_mixin import HistoryMixin
+from core.order_policy import JitaReferenceMixin
+from core.esi_history_cache import get_history_cache
 
 # Local debug flag - set True to enable diagnostic output
 DEBUG_ESI = False
@@ -32,7 +35,7 @@ class ESIConnectionHaltedError(RuntimeError):
     restarting the app."""
 
 
-class ESIClient(TypeNameMixin, ESIGetMixin):
+class ESIClient(TypeNameMixin, ESIGetMixin, HistoryMixin, JitaReferenceMixin):
     """Async client for EVE ESI API."""
 
     def __init__(self):
@@ -68,6 +71,8 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
 
         # History cache: region_id -> {type_id -> history_list}
         self.history_cache: dict[int, dict[int, list[dict]]] = {}
+        self.recent_history = get_history_cache()
+        self.recent_history.overlay(self.history_cache)
 
         # Market history database (set externally, uses SQLite)
         self.market_history: Optional[MarketHistoryDB] = None
@@ -166,7 +171,7 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
             self._notify_halt()
 
     async def _fetch_pages_staged(
-        self, endpoint: str, pages: list[int]
+        self, endpoint: str, pages: list[int], page_loader=None
     ) -> tuple[dict[int, list], dict[int, Optional[str]], set[int]]:
         """Fetch `pages` of one region, retrying timed-out pages at
         progressively lower concurrency: 20 -> 10 -> 5 -> 2 -> 1.
@@ -200,6 +205,9 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
             async def fetch_one(p: int):
                 async with sem:
                     try:
+                        if page_loader is not None:
+                            row = await page_loader(p)
+                            return p, row, row["headers"].get("last-modified"), False
                         orders, headers = await self._get_with_headers(
                             endpoint, {"page": p}
                         )
@@ -232,7 +240,10 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
                         )
                         return p, None, None, False
 
-            wave = await asyncio.gather(*[fetch_one(p) for p in remaining])
+            wave = await asyncio.gather(*[fetch_one(p) for p in remaining], return_exceptions=True)
+            for item in wave:
+                if isinstance(item, BaseException):
+                    raise item
 
             failed = []
             for p, orders, last_modified, is_stale in wave:
@@ -331,31 +342,6 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
                 loop.run_until_complete(session.close())
             except Exception as e:
                 print(f"[API] close_loop_state: session close failed: {e}")
-
-    def clear_jita_cache(self):
-        """Clear Jita orders cache to force refresh on next scan."""
-        self.jita_orders_cache = []
-        self.jita_orders_timestamp = None
-
-    def has_jita_cache(self) -> bool:
-        """Check if Jita orders are cached."""
-        return len(self.jita_orders_cache) > 0
-
-    def get_jita_cache_age(self) -> str:
-        """Get human-readable age of Jita cache."""
-        if self.jita_orders_timestamp is None:
-            return "No cache"
-
-        age = datetime.now(timezone.utc) - self.jita_orders_timestamp
-        minutes = int(age.total_seconds() / 60)
-
-        if minutes < 1:
-            return "< 1 min"
-        elif minutes < 60:
-            return f"{minutes} min"
-        else:
-            hours = minutes // 60
-            return f"{hours}h {minutes % 60}m"
 
     def get_history_cache_stats(self) -> str:
         """Get human-readable history cache stats."""
@@ -531,9 +517,7 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
 
         Routes to `/markets/{region_id}/orders/` for NPC hubs (the historical
         path) and to `/markets/structures/{id}/` for player structures via
-        the auth'd `esi_structures.fetch_structure_orders`. Structures don't
-        have a regional market, so we cache them under the structure_id —
-        which is >= 1T and can't collide with any region_id.
+        the authorization-scoped shared structure provider.
         """
         from core.config import get_hub_config
         hub_config = get_hub_config(hub_key)
@@ -547,89 +531,69 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
 
         structure_id = hub_config["station_id"]
 
-        async with self.order_cache.fetch_guard(structure_id):
-            if not force_refresh:
-                cached = self.order_cache.get_cached_orders(structure_id)
-                if cached is not None:
-                    entry = self.order_cache._order_cache.get(structure_id, {})
-                    self._apply_earliest_expires(entry.get('expires'))
-                    return cached
-
-            from esi.esi_auth import ESIAuth
-            from esi.esi_structures import (
-                fetch_structure_orders,
-                StructureAccessError,
-                StructureSnapshotError,
-            )
-
-            auth = ESIAuth.singleton()
-            loop = asyncio.get_event_loop()
-
-            def _blocking():
-                return fetch_structure_orders(structure_id, auth, slot="seller")
-
+        # Auth-scoped provider owns reuse and in-flight work, including Browse.
+        # force_refresh never bypasses a still-unexpired ESI response.
+        from esi.esi_auth import ESIAuth
+        from core.esi_private_cache import private_context, PrivateSnapshotError
+        from esi.esi_structures import (
+            fetch_structure_orders, _structure_snapshot,
+            StructureAccessError, StructureSnapshotError,
+        )
+        auth = ESIAuth.singleton()
+        try:
+            context = private_context(auth)
+            orders, expires, metadata = await asyncio.to_thread(
+                fetch_structure_orders, structure_id, auth, "seller")
+            if private_context(auth) != context:
+                raise StructureAccessError(structure_id, 401, "authorization changed")
+        except PrivateSnapshotError:
+            print(f"[Structure] {hub_key} fetch failed: authorization unavailable")
+            return []
+        except StructureAccessError as exc:
+            print(f"[Structure] {hub_key} fetch failed: {exc}")
+            return []
+        except StructureSnapshotError as exc:
+            # Only the current authorization context may supply a fallback.
             try:
-                result = await loop.run_in_executor(None, _blocking)
-                orders, expires, metadata = result
-            except StructureAccessError as e:
-                print(f"[Structure] {hub_key} fetch failed: {e}")
-                return []
-            except StructureSnapshotError as e:
-                existing = self.order_cache._order_cache.get(structure_id, {})
-                stale_orders = existing.get("orders") or []
-                print(
-                    f"[Structure] {hub_key} snapshot rejected: {e}; "
-                    f"kept {len(stale_orders)} prior orders"
-                )
-                return stale_orders
-
-            self._apply_earliest_expires(expires)
-            self.order_cache.cache_orders_for_region(
-                structure_id, orders, expires, **metadata
-            )
-
-            # Browsing this complete snapshot also advances observed history.
-            try:
-                from history.structure_history import StructureHistoryDB
-                StructureHistoryDB.singleton().record_snapshot(
-                    structure_id, orders
-                )
-            except Exception as e:
-                print(f"[StructHist] hook skipped for {structure_id}: {e}")
-
-            return orders
+                previous = await asyncio.to_thread(
+                    _structure_snapshot, "structure_orders", structure_id,
+                    auth, "seller", fetch=False)
+                if private_context(auth) != context:
+                    previous = None
+            except (StructureAccessError, StructureSnapshotError, PrivateSnapshotError):
+                previous = None
+            stale = previous["payload"] if previous else []
+            print(f"[Structure] {hub_key} snapshot rejected: {exc}; kept {len(stale)} prior orders")
+            return stale
+        self._apply_earliest_expires(expires)
+        try:
+            from history.structure_history import StructureHistoryDB
+            StructureHistoryDB.singleton().record_snapshot(
+                structure_id, orders, now_utc=metadata["acquired_at"])
+        except Exception as exc:
+            print(f"[StructHist] hook skipped for {structure_id}: {exc}")
+        return orders
 
     async def get_market_orders(self, region_id: int, use_cache: bool = False,
                                  force_refresh: bool = False) -> list[dict]:
-        """Fetch all market orders for a region (handles pagination).
+        """Fetch a complete scanner-current book; flags cannot bypass ESI expiry.
 
-        Cache layering (when force_refresh is False):
-        - First: shared per-region cache (5 min freshness + ESI expires check)
-        - Then: legacy Jita-specific cache (if use_cache=True and Jita region)
-        - Otherwise: fetch from ESI
-
-        Concurrent calls for the same region are serialized via a per-region
-        lock so a second caller reads from the populated cache instead of
-        starting a duplicate fetch.
+        use_cache remains a compatibility argument. Deliberately older Jita
+        reference data is available only through get_jita_reference().
         """
-        if not force_refresh:
-            cached = self.order_cache.get_cached_orders(region_id)
-            if cached is not None:
-                cache_entry = self.order_cache._order_cache.get(region_id, {})
-                self._apply_earliest_expires(cache_entry.get('expires'))
-                return cached
-
-            if use_cache and region_id == JITA_REGION_ID and self.jita_orders_cache:
-                return self.jita_orders_cache
+        cached = self.order_cache.get_cached_orders(region_id)
+        if cached is not None:
+            entry = self.order_cache.get_snapshot_entry(region_id)
+            self._apply_earliest_expires(entry.get('expires'))
+            return cached
 
         async with self.order_cache.fetch_guard(region_id):
-            # Re-check after acquiring lock — another thread may have populated cache
-            if not force_refresh:
-                cached = self.order_cache.get_cached_orders(region_id)
-                if cached is not None:
-                    cache_entry = self.order_cache._order_cache.get(region_id, {})
-                    self._apply_earliest_expires(cache_entry.get('expires'))
-                    return cached
+            # Recheck even for forced callers after another worker completes.
+            cached = self.order_cache.get_cached_orders(region_id)
+            if cached is not None:
+                entry = self.order_cache.get_snapshot_entry(region_id)
+                self._apply_earliest_expires(entry.get('expires'))
+                return cached
 
             self._check_halted()
             for snapshot_attempt in range(2):
@@ -661,7 +625,7 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
             # Legacy Jita cache (preserve existing behavior)
             if region_id == JITA_REGION_ID:
                 self.jita_orders_cache = all_orders
-                self.jita_orders_timestamp = datetime.now(timezone.utc)
+                self.jita_orders_timestamp = metadata.get("acquired_at") or datetime.now(timezone.utc)
 
             return all_orders
 
@@ -688,198 +652,3 @@ class ESIClient(TypeNameMixin, ESIGetMixin):
     def is_valid_system(self, system_id: int) -> bool:
         """Check if system is within range and high-sec."""
         return system_id in self.valid_systems
-
-    async def get_market_history(self, region_id: int, type_id: int) -> list[dict]:
-        """Fetch market history for a specific item in a region."""
-        try:
-            return await self._get(f"/markets/{region_id}/history/", {"type_id": type_id})
-        except Exception:
-            return []
-
-    async def get_market_history_bulk(self, region_id: int, type_ids: list[int],
-                                       use_cache: bool = True) -> dict[int, list[dict]]:
-        """Fetch market history for multiple items.
-
-        Priority:
-        1. Market history database (SQLite) - instant indexed lookups
-        2. ESI supplement cache (for items missing from db)
-        3. In-memory ESI cache
-        4. ESI API calls for missing items
-        """
-        if self.market_history is not None:
-            result = self.market_history.get_history_bulk(region_id, type_ids, days=30)
-
-            missing_from_db = [tid for tid in type_ids if not result.get(tid)]
-            has_data = [tid for tid in type_ids if result.get(tid)]
-
-            if DEBUG_ESI:
-                print(f"[DIAG] Market history DB for region {region_id}:")
-                print(f"[DIAG]   Requested: {len(type_ids)} items")
-                print(f"[DIAG]   Have data: {len(has_data)} items")
-                print(f"[DIAG]   Missing (empty): {len(missing_from_db)} items")
-
-            if missing_from_db:
-                still_missing = []
-                supplement_hits = 0
-
-                for tid in missing_from_db:
-                    cached = self.supplement.get_if_fresh(region_id, tid)
-                    if cached is not None:
-                        result[tid] = cached
-                        supplement_hits += 1
-                    else:
-                        still_missing.append(tid)
-
-                if supplement_hits > 0 and DEBUG_ESI:
-                    print(f"[DIAG]   ESI supplement cache: {supplement_hits} items")
-
-                if still_missing:
-                    known_bad = [tid for tid in still_missing
-                                 if self.supplement.is_known_bad(region_id, tid)]
-                    to_fetch = [tid for tid in still_missing if tid not in known_bad]
-
-                    if known_bad and DEBUG_ESI:
-                        print(f"[DIAG]   Skipping {len(known_bad)} known-bad items (2+ errors)")
-                    for tid in known_bad:
-                        result[tid] = []
-
-                    if to_fetch:
-                        if DEBUG_ESI:
-                            print(f"[DIAG]   Still need ESI fetch: {len(to_fetch)} items")
-                            print(f"[DIAG]   Missing type_ids (first 20): {to_fetch[:20]}")
-
-                        esi_results, esi_errors = await self._fetch_history_from_esi(
-                            region_id, to_fetch, track_errors=True)
-
-                        esi_got_data = esi_empty = esi_error = 0
-                        for tid in to_fetch:
-                            if tid in esi_errors:
-                                esi_error += 1
-                                self.supplement.store(region_id, tid, [], is_error=True)
-                                result[tid] = []
-                            else:
-                                data = esi_results.get(tid, [])
-                                if data:
-                                    esi_got_data += 1
-                                    self.supplement.store(region_id, tid, data)
-                                else:
-                                    esi_empty += 1
-                                    self.supplement.store(region_id, tid, [])
-                                result[tid] = data
-
-                        if DEBUG_ESI:
-                            print(f"[DIAG]   ESI fallback: {esi_got_data} got data, "
-                                  f"{esi_empty} empty, {esi_error} errors")
-
-            final_with_data = sum(1 for tid in type_ids if result.get(tid))
-            final_empty = sum(1 for tid in type_ids if not result.get(tid))
-            if DEBUG_ESI:
-                print(f"[DIAG]   Final: {final_with_data} with data, {final_empty} empty")
-
-            if region_id not in self.history_cache:
-                self.history_cache[region_id] = {}
-            self.history_cache[region_id].update(result)
-
-            return result
-
-        # === FALLBACK: Original ESI-based approach ===
-        if region_id not in self.history_cache:
-            self.history_cache[region_id] = {}
-
-        region_cache = self.history_cache[region_id]
-        uncached = [tid for tid in type_ids if tid not in region_cache] if use_cache else list(type_ids)
-
-        if type_ids and DEBUG_ESI:
-            cached_count = len(type_ids) - len(uncached)
-            if uncached:
-                print(f"[DIAG] History cache: {cached_count}/{len(type_ids)} cached, "
-                      f"fetching {len(uncached)} from ESI")
-            else:
-                print(f"[DIAG] History cache: {cached_count}/{len(type_ids)} cached, no ESI calls needed")
-
-        if uncached:
-            esi_results, _ = await self._fetch_history_from_esi(region_id, uncached, track_errors=False)
-            region_cache.update(esi_results)
-
-        return {tid: region_cache.get(tid, []) for tid in type_ids}
-
-    async def _fetch_history_from_esi(self, region_id: int, type_ids: list[int],
-                                       track_errors: bool = False) -> tuple[dict[int, list[dict]], set[int]]:
-        """Fetch history for multiple items from ESI API."""
-        result = {}
-        errors = set()
-
-        success_count = error_count = empty_count = 0
-        errors_seen = {}
-
-        tasks = [self._get_market_history_raw(region_id, tid) for tid in type_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for tid, history in zip(type_ids, results):
-            if isinstance(history, Exception):
-                error_count += 1
-                err_type = type(history).__name__
-                errors_seen[err_type] = errors_seen.get(err_type, 0) + 1
-                if track_errors:
-                    errors.add(tid)
-                else:
-                    result[tid] = []
-            elif isinstance(history, list):
-                if history:
-                    success_count += 1
-                else:
-                    empty_count += 1
-                result[tid] = history
-            else:
-                error_count += 1
-                if track_errors:
-                    errors.add(tid)
-                else:
-                    result[tid] = []
-
-        if DEBUG_ESI:
-            print(f"[DIAG] ESI fetch for {len(type_ids)} items: "
-                  f"{success_count} success, {empty_count} empty, {error_count} errors")
-            if errors_seen:
-                print(f"[DIAG]   Error types: {errors_seen}")
-
-        return result, errors
-
-    async def _get_market_history_raw(self, region_id: int, type_id: int) -> list[dict]:
-        """Fetch market history with exceptions not caught (for diagnostics)."""
-        return await self._get(f"/markets/{region_id}/history/", {"type_id": type_id})
-
-    async def freshen_history_for_items(self, region_id: int,
-                                         type_ids: list[int]) -> None:
-        """Force-fetch ESI history for tracked items and merge into history_cache.
-
-        Unlike get_market_history_bulk (which short-circuits on SQLite hits
-        and never calls ESI for items everef has), this always calls ESI.
-        Used by the stock market holdings UI to close the 1-4 day recency
-        gap on user-tracked items: SQLite gives the long tail, ESI fills
-        the most recent few days that haven't been imported yet.
-
-        Merge rule: keep all existing dates (SQLite usually has more
-        history), add any ESI dates not already present, sort newest-first.
-        """
-        if not type_ids:
-            return
-        esi_results, _ = await self._fetch_history_from_esi(
-            region_id, list(type_ids), track_errors=False
-        )
-        if region_id not in self.history_cache:
-            self.history_cache[region_id] = {}
-        region_cache = self.history_cache[region_id]
-        for tid, fresh in esi_results.items():
-            if not fresh:
-                continue
-            existing = region_cache.get(tid, [])
-            if not existing:
-                region_cache[tid] = fresh
-                continue
-            existing_dates = {r.get("date") for r in existing}
-            merged = list(existing) + [
-                r for r in fresh if r.get("date") not in existing_dates
-            ]
-            merged.sort(key=lambda r: r.get("date") or "", reverse=True)
-            region_cache[tid] = merged

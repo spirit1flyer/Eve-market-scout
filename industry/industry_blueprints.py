@@ -134,6 +134,8 @@ class IndustryBlueprintsDB:
         }
         if "expires_at" not in columns:
             c.execute("ALTER TABLE pull_meta ADD COLUMN expires_at TEXT")
+        if "authorization_context" not in columns:
+            c.execute("ALTER TABLE pull_meta ADD COLUMN authorization_context TEXT")
         c.commit()
         logger.debug("[IndustryBP] schema ensured at %s", self.db_path)
 
@@ -142,7 +144,8 @@ class IndustryBlueprintsDB:
     # =========================================================================
 
     def replace_for_character(self, character_id: int, rows: list[dict],
-                              expires_at: Optional[datetime] = None) -> int:
+                              expires_at: Optional[datetime] = None, *, acquired_at=None,
+                              authorization_context=None, validate_context=None) -> Optional[int]:
         """Replace ALL owned blueprints for one character with `rows`.
 
         A blueprint pull is authoritative for that character: anything not in the
@@ -154,7 +157,9 @@ class IndustryBlueprintsDB:
         location_flag, quantity, material_efficiency, time_efficiency, runs).
         """
         character_id = int(character_id)
-        now = datetime.now(timezone.utc).isoformat()
+        from industry.industry_blueprint_cache import validate_blueprints
+        validate_blueprints("blueprints", rows)
+        now = (acquired_at or datetime.now(timezone.utc)).isoformat()
         expires_text = expires_at.isoformat() if expires_at else None
         prepared = []
         for r in rows or []:
@@ -183,6 +188,8 @@ class IndustryBlueprintsDB:
         try:
             c = self._conn()
             with c:
+                if validate_context:
+                    validate_context()
                 c.execute("DELETE FROM blueprints WHERE character_id = ?",
                           (character_id,))
                 if prepared:
@@ -196,21 +203,23 @@ class IndustryBlueprintsDB:
                     )
                 c.execute(
                     "INSERT INTO pull_meta "
-                    "(character_id, last_pulled, expires_at, count) "
-                    "VALUES (?, ?, ?, ?) "
+                    "(character_id, last_pulled, expires_at, count, authorization_context) "
+                    "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(character_id) DO UPDATE SET "
                     "  last_pulled = excluded.last_pulled, "
                     "  expires_at = excluded.expires_at, "
-                    "  count = excluded.count",
-                    (character_id, now, expires_text, len(prepared)),
+                    "  count = excluded.count, authorization_context = excluded.authorization_context",
+                    (character_id, now, expires_text, len(prepared), authorization_context),
                 )
+                if validate_context:
+                    validate_context()
             logger.debug("[IndustryBP] replaced %d blueprints for character %s",
                          len(prepared), character_id)
             return len(prepared)
         except Exception:
             logger.exception("[IndustryBP] replace_for_character failed for %s",
                              character_id)
-            return 0
+            return None
 
     def clear_character(self, character_id: int) -> None:
         """Drop a character's blueprints + pull record (on roster removal)."""
@@ -286,7 +295,7 @@ class IndustryBlueprintsDB:
         """Pull timing/count metadata for a character, or None if never pulled."""
         c = self._conn()
         row = c.execute(
-            "SELECT last_pulled, expires_at, count FROM pull_meta "
+            "SELECT last_pulled, expires_at, count, authorization_context FROM pull_meta "
             "WHERE character_id = ?",
             (int(character_id),),
         ).fetchone()
@@ -337,81 +346,77 @@ class BlueprintPuller:
     re-pulling after building/selling blueprints converges to the current set.
     """
 
-    def __init__(self, roster, db: Optional[IndustryBlueprintsDB] = None):
+    def __init__(self, roster, db: Optional[IndustryBlueprintsDB] = None, cache=None):
         self.roster = roster
         self.db = db or IndustryBlueprintsDB.singleton()
+        self.cache = cache
+
+    def get_cache_status(self, character_id):
+        from core.esi_character_cache import RosterAuth
+        from core.esi_private_cache import private_context
+        from industry.industry_blueprint_cache import get_blueprint_cache
+        try:
+            auth = RosterAuth(self.roster, int(character_id))
+            context = private_context(auth, "industry")
+            meta = self.db.get_pull_meta(character_id)
+            if not meta or meta.get("authorization_context") != context.partition:
+                return True, 0
+            store = self.cache if self.cache is not None else get_blueprint_cache()
+            snapshot = store.peek(context, "blueprints")
+            if snapshot is None or not snapshot["durable"]:
+                return True, 0
+            if (meta.get("last_pulled") != snapshot["acquired_at"].isoformat()
+                    or meta.get("count") != len(snapshot["payload"])):
+                return True, 0  # A retained raw snapshot still needs DB application.
+            store._check_context(auth, context)
+            eligible = max(snapshot["expires"], snapshot["acquired_at"] + timedelta(seconds=3600))
+            seconds = max(0, int((eligible - store.now()).total_seconds()))
+            return seconds == 0, seconds
+        except Exception:
+            return True, 0
 
     def pull(self, character_id: int) -> tuple[bool, str]:
-        """Fetch + store one character's blueprints. Returns (ok, message)."""
+        from core.esi_character_cache import RosterAuth
+        from core.esi_private_cache import private_context
+        from industry.industry_blueprint_cache import get_blueprint_cache, blueprint_apply_lock
         character_id = int(character_id)
-        can_fetch, next_in = self.db.get_cache_status(character_id)
-        if not can_fetch:
-            return True, f"cached blueprints valid for {_format_duration(next_in)}"
-
-        headers = self.roster.get_auth_headers(character_id)
-        if not headers:
-            msg = f"not authenticated for character {character_id}"
-            print(f"[IndustryBP] {msg}")
-            return False, msg
-
-        snapshot = self._fetch_all_pages(character_id, headers)
-        if snapshot is None:
-            return False, "ESI fetch failed (see log)"
-        rows, expires_at = snapshot
-
-        written = self.db.replace_for_character(
-            character_id, rows, expires_at=expires_at
-        )
-        msg = f"stored {written} blueprints"
-        print(f"[IndustryBP] character {character_id}: {msg}")
-        return True, msg
-
-    def _fetch_all_pages(self, character_id: int, headers: dict
-                         ) -> Optional[tuple[list[dict], datetime]]:
-        """Walk every X-Pages page; None on hard failure, [] is valid (no BPs)."""
-        all_rows: list[dict] = []
-        url = f"{BASE_URL}/characters/{character_id}/blueprints/"
+        auth = RosterAuth(self.roster, character_id)
+        store = self.cache if self.cache is not None else get_blueprint_cache()
         try:
-            first = esi_request(
-                "GET",
-                url, headers=headers,
-                params={"datasource": "tranquility", "page": 1},
-                timeout=30,
-            )
-            first.raise_for_status()
-            all_rows.extend(first.json() or [])
-            total_pages = int(first.headers.get("X-Pages", "1"))
-            first_validator = first.headers.get("Last-Modified")
-            expires_at = _response_expiry(first)
-            print(f"[IndustryBP] character {character_id}: X-Pages={total_pages}")
-        except (requests.RequestException, ValueError) as e:
-            print(f"[IndustryBP] character {character_id} page 1 error: {e}")
-            return None
-
-        for page in range(2, total_pages + 1):
-            time.sleep(PAGE_PAUSE_SECONDS)  # slow-pace safety
-            try:
-                resp = esi_request(
-                    "GET",
-                    url, headers=headers,
-                    params={"datasource": "tranquility", "page": page},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                validator = resp.headers.get("Last-Modified")
-                if validator != first_validator:
-                    print(
-                        "[ESI-Timing] resource=blueprints "
-                        "trigger=page_validation decision=REJECT "
-                        f"reason=representation_changed page={page}"
-                    )
-                    return None
-                all_rows.extend(resp.json() or [])
-            except (requests.RequestException, ValueError) as e:
-                print(f"[IndustryBP] character {character_id} page {page} "
-                      f"error: {e}")
-                return None
-        return all_rows, expires_at
+            with blueprint_apply_lock(self.db, character_id):
+                context = private_context(auth, "industry")
+                snapshot = store.get(auth, context, "blueprints", trigger="industry_blueprints",
+                                     min_age_seconds=BLUEPRINT_MIN_REFRESH_SECONDS)
+                def check_context():
+                    store._check_context(auth, context)
+                check_context()
+                meta = self.db.get_pull_meta(character_id)
+                acquired = snapshot["acquired_at"]
+                eligible = max(snapshot["expires"], acquired + timedelta(seconds=BLUEPRINT_MIN_REFRESH_SECONDS))
+                if (meta and meta.get("authorization_context") == context.partition
+                        and meta.get("last_pulled") == acquired.isoformat()
+                        and meta.get("count") == len(snapshot["payload"])):
+                    written = meta["count"]
+                else:
+                    written = self.db.replace_for_character(character_id, snapshot["payload"],
+                        expires_at=eligible, acquired_at=acquired,
+                        authorization_context=context.partition, validate_context=check_context)
+                if written is None:
+                    store._event(context, "blueprints", "SAVE_FAILED", "industry_blueprints",
+                                 snapshot, reason="database_previous_rows_retained")
+                    return False, "blueprint database write failed; previous data retained"
+                if not snapshot["durable"]:
+                    return False, "blueprints stored in database; raw snapshot save failed"
+                check_context()
+                store._event(context, "blueprints", "COMPLETE", "industry_blueprints",
+                             snapshot, reason="database_and_snapshot_durable", status="durable",
+                             eligible_at=eligible)
+                msg = f"stored {written} blueprints; next update in {_format_duration((eligible-store.now()).total_seconds())}"
+                print(f"[IndustryBP] character {character_id}: {msg}")
+                return True, msg
+        except Exception as exc:
+            print(f"[IndustryBP] pull failed; previous data retained: {type(exc).__name__}")
+            return False, "blueprint acquisition failed; previous data retained (see log)"
 
 
 def _response_expiry(response: requests.Response) -> datetime:
@@ -460,32 +465,14 @@ HANGAR_LOCATION_FLAGS = (
 )
 
 
-def fetch_structure_meta(structure_id: int, headers: dict) -> Optional[dict]:
-    """Resolve a player structure's {name, system_id} via the roster's auth.
-
-    `esi_structures.fetch_structure_info` takes the trading `ESIAuth`; the
-    Industry roster uses its own per-character headers (it holds the
-    `esi-universe.read_structures.v1` scope), so Phase 3.5 needs this small
-    header-based variant. Returns None on any auth/HTTP failure (the character
-    may have lost docking access to the structure).
-    """
-    if not headers:
-        return None
+def fetch_structure_meta(structure_id: int, auth, slot="industry", *, cache=None) -> Optional[dict]:
+    """Resolve through the same context-scoped metadata provider as discovery."""
+    from esi.esi_structures import fetch_structure_info, StructureAccessError, StructureSnapshotError
     try:
-        resp = esi_request(
-            "GET",
-            f"{BASE_URL}/universe/structures/{int(structure_id)}/",
-            headers=headers, timeout=30,
-        )
-        if resp.status_code != 200:
-            print(f"[IndustryBP] structure {structure_id} meta HTTP "
-                  f"{resp.status_code}")
-            return None
-        d = resp.json()
-        return {"name": d.get("name", f"Structure {structure_id}"),
-                "system_id": d.get("solar_system_id")}
-    except (requests.RequestException, ValueError) as e:
-        print(f"[IndustryBP] structure {structure_id} meta error: {e}")
+        info = fetch_structure_info(structure_id, auth, slot, cache=cache)
+        return {"name": info.name, "system_id": info.solar_system_id}
+    except (StructureAccessError, StructureSnapshotError) as exc:
+        print(f"[IndustryBP] structure meta failed: {type(exc).__name__}")
         return None
 
 

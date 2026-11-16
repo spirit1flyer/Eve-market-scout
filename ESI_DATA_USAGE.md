@@ -35,25 +35,45 @@ entered on the official EVE Online sign-in page.
 
 ## When data is acquired
 
-- Scanner regional orders follow ESI's server-provided cache expiry, normally
-  about five minutes.
-- Trade synchronization has a 20-minute scheduling floor, while each wallet
-  endpoint keeps its own ESI expiry clock.
-- Stock Market holdings history is refreshed at most once per hour per hub.
-- Character skills, standings, and owned blueprints are fetched only after a
-  corresponding user action.
-- Manual refresh actions reuse an unexpired ESI representation rather than
-  bypassing CCP's cache headers.
+- Scanner orders use complete shared snapshots until ESI's saved expiry,
+  normally about five minutes. Each selected hub is evaluated independently.
+- Jita used as another hub's price reference is preserved across restarts and
+  may be up to 24 hours old. Direct Jita scans and explicit refreshes use
+  scanner freshness.
+- Stock Market checks its selected hub on load/open and reuses orders acquired
+  less than one hour ago, including newer scanner acquisitions. The clock
+  measures acquisition age, not the time a tab was opened. Industry may reuse
+  older saved orders; no new scanner-frequency Industry schedule is imposed.
+- Trade synchronization retains its 20-minute scheduling floor. Wallet
+  resources keep their separate saved absolute ESI expiry clocks.
+- Holdings history checks tracked items on hub use, preferring reuse for one
+  hour and always respecting later ESI expiry. Recent ESI rows and their
+  original freshness metadata are saved separately from imported archives.
+  Failed fetches or saves do not claim durable successful completion.
+- Skills retain their one-hour preference. Saved reputation stays readable;
+  ordinary acquisition paths refresh it when seven days old, and explicit
+  reputation controls request an eligible update. Owned blueprint acquisition
+  follows the existing user-triggered workflow.
+- Shared providers reuse unexpired responses for covered public and
+  authorization-scoped private resources. Manual refresh requests an eligible
+  update; it does not override saved server expiry. An unexercised route is
+  not evidence of successful runtime coverage.
+- Trading and Industry share an SSO-specific Retry-After cooldown. Failed
+  grants receive a short retry delay without blocking unrelated valid grants;
+  server throttling covers both token and verify calls.
 
 Requests identify the application with a contactable User-Agent, send an
-explicit `X-Compatibility-Date`, honor `Expires`/cache headers, validate
-paginated `Last-Modified` values, and share one process-wide rate-limit gate.
+explicit `X-Compatibility-Date`, and use a process-wide ESI rate gate.
+Paginated snapshots are validated before acceptance. SSO has its own cooldown.
+Implementation and runtime verification status are recorded separately in
+`ESI_ACQUISITION_GOALS.md` and `ESI_DIAGNOSTICS.md` in the source distribution.
 
 ## Local storage
 
 Access and refresh tokens are stored only in the application's local data
 directory (`%APPDATA%\EVEMarketScout` on Windows). Character-derived caches,
-settings, and tracking data are stored there as well. The application does not
+settings, tracking data, recent public-history snapshots, and credential-free
+SSO cooldown deadlines are stored there as well. The application does not
 operate an external account service, telemetry service, or automatic crash
 uploader, and it does not send character data back to the project author.
 

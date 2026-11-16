@@ -211,12 +211,17 @@ class BrowseStructureOrdersDialog(BrowseOrdersFilterMixin, tk.Toplevel):
         self.status_var.set("Fetching orders…")
         for row in self.tree.get_children():
             self.tree.delete(row)
+        structure_id = self.structure_id
 
         def worker():
+            acquired_at = None
             try:
+                from core.esi_private_cache import private_context
+                context = private_context(self.auth, self.slot)
                 orders, _expires, _metadata = fetch_structure_orders(
-                    self.structure_id, self.auth, slot=self.slot
+                    structure_id, self.auth, slot=self.slot
                 )
+                acquired_at = _metadata["acquired_at"]
                 err = None
             except StructureAccessError as e:
                 orders, err = None, e
@@ -230,16 +235,28 @@ class BrowseStructureOrdersDialog(BrowseOrdersFilterMixin, tk.Toplevel):
                 try:
                     from history.structure_history import StructureHistoryDB
                     StructureHistoryDB.singleton().record_snapshot(
-                        self.structure_id, orders
+                        structure_id, orders, now_utc=acquired_at
                     )
                 except Exception as e:
                     print(f"[BrowseOrders] record_snapshot failed: {e}")
 
-            submit(lambda o=orders, e=err: self._on_result(o, e))
+            def deliver():
+                if self.structure_id != structure_id:
+                    return
+                if err is None:
+                    try:
+                        if private_context(self.auth, self.slot) != context:
+                            raise StructureAccessError(structure_id, 401, "authorization changed")
+                    except Exception:
+                        self._on_result(None, StructureAccessError(
+                            structure_id, 401, "authorization unavailable or changed"))
+                        return
+                self._on_result(orders, err, acquired_at)
+            submit(deliver)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_result(self, orders, err):
+    def _on_result(self, orders, err, acquired_at=None):
         if err is not None:
             self.status_var.set(f"Fetch failed: {err}")
             self.set_current_orders([])
@@ -266,6 +283,8 @@ class BrowseStructureOrdersDialog(BrowseOrdersFilterMixin, tk.Toplevel):
         self.status_var.set(
             f"{len(orders)} orders — {n_sell} sell, {n_buy} buy, "
             f"across {len(type_ids)} item types."
+            + (f" Acquired {max(0, int((datetime.now(timezone.utc) - acquired_at).total_seconds()))}s ago."
+               if acquired_at else "")
         )
 
         self._refresh_history_view()

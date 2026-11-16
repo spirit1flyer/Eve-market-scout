@@ -176,6 +176,9 @@ class MainControlsMixin:
 
         ttk.Button(row2, text="ESI Report", command=self._print_esi_report,
                    width=11).pack(side=tk.LEFT, padx=5)
+        from gui.gui_data_notice import show_data_notice
+        ttk.Button(row2, text="Data use / CCP",
+                   command=lambda: show_data_notice(self.root)).pack(side=tk.LEFT, padx=5)
         self.root.bind("<F12>", lambda _event: self._print_esi_report(), add="+")
         self.root.bind("<Control-F12>", lambda _event: self._check_private_cache(), add="+")
 

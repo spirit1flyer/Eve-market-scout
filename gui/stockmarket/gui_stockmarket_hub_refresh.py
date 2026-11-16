@@ -63,7 +63,7 @@ class HubPanelRefreshMixin:
         """
         import time as _pt
         _pt0 = _pt.perf_counter()
-        entry = order_cache._order_cache.get(self.order_cache_key, {})
+        entry = (order_cache.get_snapshot_entry(self.order_cache_key) or {})
         orders = entry.get("orders", [])
         if not orders:
             print(f"[PerfTimer] render_from_cache hub={getattr(self, 'hub_key', '?')} orders=0 total=0ms")
@@ -96,7 +96,7 @@ class HubPanelRefreshMixin:
     def update_refresh_labels(self, order_cache):
         """Update last_refreshed / next_refresh labels from the order cache."""
         now = datetime.now(timezone.utc)
-        entry = order_cache._order_cache.get(self.order_cache_key, {})
+        entry = (order_cache.get_snapshot_entry(self.order_cache_key) or {})
         ts = entry.get("timestamp")
         expires = entry.get("expires")
         self._last_refreshed_var.set(f"Updated: {_fmt_ago(ts, now)}")

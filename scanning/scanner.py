@@ -144,13 +144,8 @@ class MarketScanner:
         if is_jita:
             jita_orders = local_orders
         else:
-            use_jita_cache = not refresh_jita and self.client.has_jita_cache()
-            if use_jita_cache:
-                update(f"Using cached Jita data ({self.client.get_jita_cache_age()} old)...", 30)
-                jita_orders = self.client.jita_orders_cache
-            else:
-                update("Fetching Jita region orders...", 30)
-                jita_orders = await self.client.get_market_orders(JITA_REGION_ID, use_cache=False)
+            update("Loading Jita reference...", 30)
+            jita_orders = await self.client.get_jita_reference(refresh=refresh_jita)
             jita_orders = filter_expired_orders(
                 jita_orders, context=f"scanner:{self.hub_key}:jita-reference"
             )

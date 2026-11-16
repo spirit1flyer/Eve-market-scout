@@ -68,7 +68,7 @@ def _vprint(msg: str) -> None:
         print(f"[ContractDiag] {msg}")
 
 
-async def _raw_request(client, method: str, endpoint: str,
+async def _raw_request_network(client, method: str, endpoint: str,
                        params: Optional[dict] = None,
                        json_body=None,
                        extra_headers: Optional[dict] = None
@@ -152,6 +152,15 @@ async def _raw_request(client, method: str, endpoint: str,
 # Contract list (paginated, conditional via page-1 ETag)
 # =============================================================================
 
+async def _raw_request(client, method, endpoint, params=None, json_body=None, extra_headers=None):
+    if method != "GET" or not endpoint.startswith("/contracts/public/"):
+        return await _raw_request_network(client, method, endpoint, params, json_body, extra_headers)
+    from core.esi_request_cache import get_request_cache
+    store = getattr(client, "_contract_request_cache", None) or get_request_cache()
+    return await store.get_reply(endpoint, params,
+        lambda: _raw_request_network(client, method, endpoint, params, json_body, extra_headers),
+        request_etag=(extra_headers or {}).get("If-None-Match"))
+
 async def fetch_region_contract_list(client, region_id: int,
                                      etag: Optional[str] = None) -> dict:
     """Pull a region's public contract list, conditional on `etag`.
@@ -189,13 +198,16 @@ async def fetch_region_contract_list(client, region_id: int,
                 "contracts": None}
 
     contracts = list(body)
+    expiries = [expires] if expires else []
     try:
         total_pages = int(headers.get("X-Pages", 1))
     except (TypeError, ValueError):
-        total_pages = 1
+        total_pages = 0
     _print(f"region {region_id} list 200 — page 1/{total_pages}, "
            f"{len(contracts)} rows, etag={new_etag}")
 
+    if not 1 <= total_pages <= 9999 or (total_pages > 1 and not headers.get("Last-Modified")):
+        return {"status": 502, "expires": expires, "etag": new_etag, "contracts": None}
     if total_pages > 1:
         tasks = [
             _fetch_list_page(client, endpoint, p)
@@ -205,7 +217,8 @@ async def fetch_region_contract_list(client, region_id: int,
         first_validator = headers.get("Last-Modified")
         for page, page_status, page_headers, page_rows in results:
             if (page_status != 200 or not isinstance(page_rows, list)
-                    or page_headers.get("Last-Modified") != first_validator):
+                    or page_headers.get("Last-Modified") != first_validator
+                    or page_headers.get("X-Pages", "1") != str(total_pages)):
                 _print(
                     f"region {region_id} list rejected at page {page}: "
                     f"status={page_status} representation_changed="
@@ -217,10 +230,16 @@ async def fetch_region_contract_list(client, region_id: int,
                     "etag": new_etag,
                     "contracts": None,
                 }
+            page_expiry = _expires_from_headers(page_headers)
+            if page_expiry:
+                expiries.append(page_expiry)
             contracts.extend(page_rows)
 
     _print(f"region {region_id} list assembled — {len(contracts)} total rows "
            f"across {total_pages} pages")
+    from core.esi_public_cache import _utc
+    if expiries:
+        expires = max(_utc(value) for value in expiries).isoformat()
     return {"status": 200, "expires": expires, "etag": new_etag,
             "contracts": contracts}
 
@@ -264,7 +283,9 @@ async def fetch_contract_items(client, contract_id: int) -> dict:
     try:
         total_pages = int(headers.get("X-Pages", 1))
     except (TypeError, ValueError):
-        total_pages = 1
+        total_pages = 0
+    if not 1 <= total_pages <= 9999 or (total_pages > 1 and not headers.get("Last-Modified")):
+        return {"status": 502, "items": None, "gone": False}
     if total_pages > 1:
         tasks = [
             _fetch_items_page(client, endpoint, p)
@@ -273,7 +294,8 @@ async def fetch_contract_items(client, contract_id: int) -> dict:
         first_validator = headers.get("Last-Modified")
         for page, page_status, page_headers, page_items in await asyncio.gather(*tasks):
             if (page_status != 200 or not isinstance(page_items, list)
-                    or page_headers.get("Last-Modified") != first_validator):
+                    or page_headers.get("Last-Modified") != first_validator
+                    or page_headers.get("X-Pages", "1") != str(total_pages)):
                 _print(
                     f"contract {cid} items rejected at page {page}: "
                     f"status={page_status}"
@@ -378,26 +400,10 @@ async def resolve_names(client, ids) -> dict[int, str]:
     already filtered to ids missing from the cache. Item names come from the
     local SDE, NOT this endpoint.
     """
-    ids = list({int(x) for x in ids if x})
-    if not ids:
-        return {}
-
-    out: dict[int, str] = {}
-    for start in range(0, len(ids), _MAX_NAMES_PER_CALL):
-        batch = ids[start:start + _MAX_NAMES_PER_CALL]
-        status, _headers, body = await _raw_request(
-            client, "POST", "/universe/names/", json_body=batch
-        )
-        if status != 200 or not isinstance(body, list):
-            _print(f"name resolve failed for {len(batch)} ids status={status}")
-            continue
-        for entry in body:
-            try:
-                out[int(entry["id"])] = entry["name"]
-            except (KeyError, TypeError, ValueError):
-                continue
-    _print(f"resolved {len(out)}/{len(ids)} names")
-    return out
+    from core.esi_lookup_cache import get_lookup_cache
+    names = await asyncio.to_thread(get_lookup_cache().names, ids)
+    _print(f"resolved {len(names)} names through shared cache")
+    return names
 
 
 # =============================================================================
@@ -411,20 +417,9 @@ def _expires_from_headers(headers: dict) -> Optional[str]:
     (we don't keep the response object alive) and returns an ISO string for the
     freshness store (which persists absolute timestamps, not countdowns).
     """
-    import re
-    from datetime import datetime, timezone, timedelta
-
-    cache_control = headers.get("Cache-Control", "") or ""
-    m = re.search(r"max-age=(\d+)", cache_control)
-    if m:
-        secs = int(m.group(1))
-        return (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
-
-    expires_str = headers.get("Expires")
-    if not expires_str:
-        return None
+    from datetime import datetime, timezone
+    from core.esi_public_cache import _expires
     try:
-        dt = datetime.strptime(expires_str, "%a, %d %b %Y %H:%M:%S %Z")
-        return dt.replace(tzinfo=timezone.utc).isoformat()
+        return _expires(headers, datetime.now(timezone.utc)).isoformat()
     except ValueError:
         return None

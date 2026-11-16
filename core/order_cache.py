@@ -29,6 +29,10 @@ class OrderCacheStore:
         self._inflight_locks_meta = threading.Lock()
         self._load_all_disk_caches()
 
+    @staticmethod
+    def _diagnostic(*args, **kwargs):
+        decision_event(*args, **kwargs)
+
     def cache_orders_for_region(
         self,
         region_id: int,
@@ -39,6 +43,8 @@ class OrderCacheStore:
         last_modified: Optional[str] = None,
         complete: bool = True,
         source: str = "unknown",
+        acquired_at=None,
+        page_metadata=None,
     ):
         """Cache orders for a region, with empty-result guard.
 
@@ -46,7 +52,9 @@ class OrderCacheStore:
         against transient ESI hiccups wiping out good data. First-fetch empties
         are still stored so the cache shape stays consistent.
         """
-        if not orders:
+        if region_id >= 10**12:
+            raise ValueError("private structures require the authorization-scoped provider")
+        if not orders and not (complete and source == "esi_region_orders" and page_metadata):
             existing = self._order_cache.get(region_id)
             if existing and existing.get('orders'):
                 print(f"[API] Skipped empty cache write for region "
@@ -55,26 +63,47 @@ class OrderCacheStore:
 
         self._order_cache[region_id] = {
             'orders': orders,
-            'timestamp': datetime.now(timezone.utc),
+            'timestamp': acquired_at or datetime.now(timezone.utc),
             'expires': expires,
             'etag': etag,
             'last_modified': last_modified,
             'complete': complete,
             'source': source,
+            'page_metadata': page_metadata,
+            'durable': False,
         }
         print(f"[API] Cached {len(orders)} orders for region {region_id}")
         self._save_region_cache_to_disk(region_id)
 
+    def get_snapshot_entry(self, key_id):
+        """Resolve private views only in the currently authenticated context."""
+        if key_id < 10**12:
+            return self._order_cache.get(key_id)
+        from core.esi_route_cache import route_snapshot
+        from core.esi_private_cache import PrivateSnapshotError
+        from esi.esi_auth import ESIAuth
+        try:
+            snapshot = route_snapshot("structure_orders", key_id,
+                                      auth=ESIAuth.singleton(), fetch=False)
+        except PrivateSnapshotError:
+            return None
+        if snapshot is None:
+            return None
+        first = snapshot["page_metadata"][0]
+        return {"orders": snapshot["payload"], "timestamp": snapshot["acquired_at"],
+                "expires": snapshot["expires"], "complete": True,
+                "source": snapshot["source"], "etag": first.get("etag"),
+                "last_modified": first.get("last_modified")}
+
     def get_cached_orders(self, region_id: int, max_age_seconds: int = 300) -> Optional[list]:
         """Get cached orders if fresh enough.
 
-        Two independent freshness checks:
-        1. Timestamp age must be under max_age_seconds.
-        2. Stored ESI Expires must still be in the future — a cache hit on an
-           already-expired entry would poison the scanner's countdown timer.
+        A saved ESI expiry owns scanner freshness, even beyond a local age
+        preference. Only responses without expiry use max_age_seconds.
+        Complete snapshots are required for every consumer.
         """
         timing = self.get_cache_timing(region_id, max_age_seconds)
-        decision_event(
+        self._diagnostic(
             "structure_orders" if region_id >= 10**12 else "regional_orders",
             "REUSE" if timing['reusable'] else "MISS", "shared_cache",
             reason=timing['reason'], items=timing['order_count'],
@@ -84,8 +113,16 @@ class OrderCacheStore:
         if not timing['reusable']:
             return None
 
-        cached = self._order_cache[region_id]
-        age = timing['age_seconds']
+        cached = self.get_snapshot_entry(region_id)
+        if cached is None:
+            return None  # Authorization may have changed since the timing read.
+        now = datetime.now(timezone.utc)
+        age = max(0, (now - cached['timestamp']).total_seconds())
+        if (not cached.get('complete') or (age > max_age_seconds and cached.get('expires') is None)
+                or (cached.get('expires') is not None and cached['expires'] <= now)):
+            return None
+        if region_id < 10**12 and not cached.get('durable', True):
+            self._save_region_cache_to_disk(region_id)
         wait = format_refresh_wait(timing['expires_in_seconds'])
         print(f"[API] Using cached orders for region {region_id} "
               f"(age: {age:.0f}s; next scan eligible in: {wait})")
@@ -99,7 +136,7 @@ class OrderCacheStore:
         cache decision without inspecting or printing any individual order.
         The decision exactly mirrors :meth:`get_cached_orders`.
         """
-        cached = self._order_cache.get(region_id)
+        cached = self.get_snapshot_entry(region_id)
         if not cached:
             return {
                 'present': False,
@@ -124,7 +161,7 @@ class OrderCacheStore:
         if not complete:
             reusable = False
             reason = 'incomplete'
-        elif age > max_age_seconds:
+        elif age > max_age_seconds and expires_in is None:
             reusable = False
             reason = 'age_limit'
         elif expires_in is not None and expires_in <= 0:
@@ -157,29 +194,19 @@ class OrderCacheStore:
         (not for the scanner, whose countdown timer the Expires check
         protects). Returns (orders, age_seconds) or None.
         """
-        cached = self._order_cache.get(region_id)
+        cached = self.get_snapshot_entry(region_id)
         if not cached or not cached.get('complete', False):
             return None
         age = (datetime.now(timezone.utc) - cached['timestamp']).total_seconds()
-        if age > max_age_seconds:
+        if age < 0 or age >= max_age_seconds:
             return None
         return cached['orders'], age
 
     def _disk_cache_path(self, key_id: int) -> Optional[Path]:
-        """Resolve on-disk cache path for a region id or structure id.
-
-        Region ids (NPC hubs) hit the precomputed map. Structure ids miss it,
-        so we fall back to scanning `TRADE_HUBS` for a structure-typed entry
-        with a matching `station_id` — necessary because custom structures
-        are registered at runtime after this module's import-time map was
-        already snapshotted.
-        """
+        """Regional disk paths only; private structures use scoped snapshots."""
+        if key_id >= 10**12:
+            return None  # Legacy unscoped structure files are never restored.
         hub_key = _REGION_ID_TO_HUB_KEY.get(key_id)
-        if hub_key is None:
-            for k, cfg in TRADE_HUBS.items():
-                if cfg.get("type") == "structure" and cfg.get("station_id") == key_id:
-                    hub_key = k
-                    break
         if hub_key is None:
             return None
         try:
@@ -189,19 +216,9 @@ class OrderCacheStore:
             return None
 
     def _load_all_disk_caches(self):
-        """Load every hub's persisted order cache from disk at startup.
-
-        Covers NPC hub regions plus any custom structures already registered
-        in TRADE_HUBS (custom_stations._bootstrap runs before ESIClient init,
-        so structures persisted from a prior session are present here).
-        """
+        """Load regional snapshots; private data restores only after auth lookup."""
         for region_id in _REGION_ID_TO_HUB_KEY:
             self._load_region_disk_cache(region_id)
-        for cfg in TRADE_HUBS.values():
-            if cfg.get("type") == "structure":
-                sid = cfg.get("station_id")
-                if sid:
-                    self._load_region_disk_cache(sid)
 
     def _load_region_disk_cache(self, region_id: int):
         """Load one region's persisted cache from disk. Silent on missing file."""
@@ -211,6 +228,8 @@ class OrderCacheStore:
         try:
             with gzip.open(path, 'rt', encoding='utf-8') as f:
                 data = json.load(f)
+            if data.get('region_id') != region_id or not data.get('timestamp'):
+                raise ValueError("regional identity or original timestamp missing")
             orders = data.get('orders') or []
             ts_str = data.get('timestamp')
             exp_str = data.get('expires')
@@ -219,6 +238,27 @@ class OrderCacheStore:
                 else datetime.now(timezone.utc)
             )
             expires = datetime.fromisoformat(exp_str) if exp_str else None
+            from core.esi_route_cache import validate_route_payload
+            from core.esi_public_cache import _utc
+            validate_route_payload("type_orders", orders)
+            if timestamp.tzinfo is None or (expires is not None and expires.tzinfo is None):
+                raise ValueError("regional timestamps require timezone")
+            if timestamp > datetime.now(timezone.utc):
+                raise ValueError("future regional acquisition")
+            metadata = data.get('page_metadata')
+            if metadata is not None:
+                total = len(metadata)
+                if total < 1 or [row['page'] for row in metadata] != list(range(1, total + 1)):
+                    raise ValueError("regional pages incomplete")
+                if any(row['total_pages'] != total for row in metadata):
+                    raise ValueError("regional page counts inconsistent")
+                validators = {row.get('last_modified') for row in metadata}
+                if total > 1 and (len(validators) != 1 or not all(validators)):
+                    raise ValueError("regional validators missing/inconsistent")
+                if expires != max(_utc(row['expires']) for row in metadata):
+                    raise ValueError("regional expiry metadata inconsistent")
+                if timestamp != max(_utc(row['acquired_at']) for row in metadata):
+                    raise ValueError("regional acquisition metadata inconsistent")
             self._order_cache[region_id] = {
                 'orders': orders,
                 'timestamp': timestamp,
@@ -230,6 +270,8 @@ class OrderCacheStore:
                 # treating it as a reusable acquisition snapshot.
                 'complete': bool(data.get('complete', False)),
                 'source': data.get('source', 'legacy_disk'),
+                'page_metadata': data.get('page_metadata'),
+                'durable': True,
             }
             hub_key = _REGION_ID_TO_HUB_KEY.get(region_id, str(region_id))
             print(f"[API] Loaded {len(orders)} orders for {hub_key} from disk")
@@ -256,12 +298,20 @@ class OrderCacheStore:
                 'last_modified': entry.get('last_modified'),
                 'complete': bool(entry.get('complete', False)),
                 'source': entry.get('source'),
+                'page_metadata': entry.get('page_metadata'),
             }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with gzip.open(path, 'wt', encoding='utf-8') as f:
-                json.dump(payload, f)
+            self._write_snapshot(path, payload)
+            entry['durable'] = True
+            self._diagnostic('regional_orders', 'PERSIST', 'disk', reason='atomic_replace', items=len(payload['orders']))
         except Exception as e:
+            entry['durable'] = False
+            self._diagnostic('regional_orders', 'SAVE_FAILED', 'disk', reason='previous_disk_retained', status=type(e).__name__)
             print(f"[API] Failed to save disk cache for region {region_id}: {e}")
+
+    @staticmethod
+    def _write_snapshot(path, payload):
+        from core.esi_cache_io import write_gzip_atomic
+        write_gzip_atomic(path, payload)
 
     def clear_region_disk_cache(self, region_id: int):
         """Drop a region's cache from memory and delete its disk file."""

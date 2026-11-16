@@ -16,6 +16,7 @@ that returns a cached value or None.
 
 import json
 import os
+import asyncio
 from typing import Optional, TYPE_CHECKING
 
 from core.sound_manager import get_data_dir
@@ -94,15 +95,11 @@ class JumpCache:
         cached = self.lookup(origin, dest)
         if cached is not None:
             return cached
-        url = f"https://esi.evetech.net/latest/route/{origin}/{dest}/"
         try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                route = await resp.json()
-                if not isinstance(route, list) or not route:
-                    return None
-                jumps = max(0, len(route) - 1)
+            from core.esi_route_cache import route_snapshot
+            snapshot = await asyncio.to_thread(route_snapshot, "route", origin,
+                params={"destination": int(dest)}, trigger="jump_count")
+            jumps = len(snapshot["payload"]) - 1
         except Exception as e:
             print(f"[JumpCache] fetch error {origin}->{dest}: {e}")
             return None

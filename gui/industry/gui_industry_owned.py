@@ -313,10 +313,10 @@ class OwnedBlueprintsPanel:
             from industry.industry_blueprints import fetch_structure_meta
             from esi.esi_structures import resolve_region_for_system
             from core.custom_stations import add_custom_station
+            from core.esi_character_cache import RosterAuth
             added, failed = [], []
             for loc, cid in pending.items():
-                headers = self.roster.get_auth_headers(cid)
-                meta = fetch_structure_meta(loc, headers)
+                meta = fetch_structure_meta(loc, RosterAuth(self.roster, cid))
                 if not meta or not meta.get("system_id"):
                     failed.append(loc)
                     continue

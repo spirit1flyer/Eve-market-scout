@@ -18,7 +18,7 @@ import time
 from urllib.parse import urlsplit
 
 
-REVISION = "esi-evidence-1"
+REVISION = "esi-evidence-2-policy-batch"
 ROUTES = (
     "GET /markets/{id}/orders/", "GET /markets/structures/{id}/",
     "GET /markets/{id}/history/", "GET /markets/prices/",

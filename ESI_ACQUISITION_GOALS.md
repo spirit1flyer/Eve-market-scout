@@ -1,9 +1,95 @@
 # Agreed ESI acquisition and cache goals
 
-Recorded 2026-11-15 from the user's instructions; progress reviewed the same day.
+Recorded 2026-11-15; transcript and runtime progress rechecked 2026-11-16.
 This file owns the agreed behavior and remaining work order.
 [The compliance reassessment](ESI_COMPLIANCE_REVIEW.md) records baseline findings
 and implementation evidence. An implementation entry is not a runtime pass.
+
+## Current checkpoint — 2026-11-16
+
+- **Previous pushed baseline:** `b329c8c` on `main`, following `46c76f4`.
+  `APP_VERSION` remains **3.67 live**. The latest commit includes shared
+  skills/standings persistence, reputation retention/manual/seven-day policy,
+  and the expanded offline accounting/character/rep runner.
+- **Current position:** the shared-acquisition batch has cleared its expanded
+  test gate. The second batch (steps 2–4) is now implemented locally:
+  recent-history persistence, agreed consumer policies, and SSO/notices.
+  Syntax/diff checks pass; the expanded 52-check IDE run and live testing are
+  pending. The whole ESI phase remains open. A new general ESI compliance
+  audit waits until Caleb has tested this batch.
+- **Verified:** IDE run `11364-1794830978` passed **40/40** offline checks at
+  **06:11:55 Central on 2026-11-16**, including both corrected 404 regressions,
+  regional page/save recovery, blueprints, small routes, accounting, reputation
+  and private structures. Earlier real seller, Industry, wallet and structure
+  persistence/restart evidence remains valid. Synthetic and live evidence
+  remain distinct.
+- **Local implementation added:** authorization-scoped structure books/metadata,
+  shared Browse/scanner/discovery/Industry lookups, persisted per-type underbid
+  responses and public station/system/constellation metadata. Original page
+  expiry and acquisition times survive restart. Successful pages are staged;
+  partial/mixed books are rejected. Details are in ESI_DIAGNOSTICS.md.
+- **Pending live verification:** rep controls, structure metadata/discovery and
+  matching/different authorization cases remain open. A real private book
+  restored with original age/expiry after restart, but was already expired;
+  unexpired cross-restart reuse remains synthetic-verified only.
+- **Private-structure live evidence:** run `28296-1794823224` on 2026-11-16 acquired and
+  atomically saved 20 structure orders at 04:05:41 Central, reused that snapshot
+  twice, and acquired again only after expiry at 04:10:52. No early repeats
+  were observed. That run did not exercise restart, metadata or auth changes.
+  Tracking exposed a remaining routing gap: 17 public regional requests for
+  the selected private structure returned zero orders. The authorized local
+  correction now routes Tracking to the shared private book. The later run
+  restored the old book at 04:24:00, correctly refreshed it because it had
+  expired, then Tracking reused the new 20-order book at 04:24:18 and 04:24:21.
+  There was one structure-order request, no public underbid fallback, no
+  observed early repeats and no production HTTP/network errors in that run.
+- **Completed local batch:** regional page recovery/validation and atomic book
+  saves; authorization-scoped blueprints with serialized, failure-aware DB
+  application; shared contract pages, name/ID isolation, remaining universe
+  metadata, routes/jump counts and private structure search. Syntax/diff checks
+  passed, followed by the **40/40 runtime pass**. The missing public-404 expiry
+  import and filtered-page negative-cache interaction are fixed and verified.
+  Negative caching applies to public single-response metadata/routes; failed
+  order pages retain the last complete book and can recover using staged pages.
+  The failed-run history is retained in ESI_DIAGNOSTICS.md.
+- **Batch live evidence:** Amarr's 192-page books were accepted, atomically
+  saved and reused. Restart restored 191,659 orders; that book was expired
+  by the next scan, so it correctly acquired and reused a replacement.
+  All 57 blueprints persisted, then restored with original age/expiry and
+  reused twice after restart. Contracts reused its saved list after restart;
+  some item fetches failed and remain separate from successful list reuse.
+  Neither run reported early repeats. Details are in ESI_DIAGNOSTICS.md.
+- **Next work:** Caleb restarts from the IDE and runs Ctrl+F12 (expected
+  52/52), then tests history/restart, hub switching/Jita, Stock Market load,
+  reputation/auth cases and the Data use / CCP dialog. Read the saved log
+  before claiming runtime success. The 40-check result remains the prior
+  batch checkpoint, not a pass for the twelve newly added checks. Only after
+  this user testing should a fresh general ESI compliance audit begin.
+
+## Plain-language checkpoint record — 2026-11-16
+
+Checkpoint branch: `checkpoint/esi-compliance-2026-11-16`, based on `b329c8c`.
+This preserves the current work for recovery and review. It is not a tested
+release or a declaration that the application is ESI compliant.
+
+| Original problem | What the code now does | Evidence at this checkpoint |
+| --- | --- | --- |
+| Different screens could request the same data again before it was due. | Screens share saved responses and in-progress requests. The saved ESI expiry decides when another request is allowed. Private responses also require the matching character and authorization. | Earlier acquisition changes passed the 40-check IDE run. Some real routes and authorization cases still need testing. |
+| A failed page or save could lose useful progress or misrepresent completion. | Successful pages survive retry/restart. A complete book is accepted only after validation; failed replacements retain the previous disk data. Blueprints report database failures rather than successful empty results. | Page, save, blueprint, and smaller-route scenarios passed within the earlier 40 checks. |
+| Holdings could remember that history was refreshed without retaining the actual recent rows. | Recent history rows are saved separately from the archive, with their original acquisition/expiry. Fetch and save outcomes are reported per item. | New code is syntax-checked; the expanded IDE test run is pending. |
+| Scanner, Jita reference, and Stock Market had conflicting freshness rules. | Active scanner hubs follow ESI expiry. Jita reference has a 24-hour limit. Stock Market checks one hour since acquisition on hub load/open. | New age-boundary scenarios are prepared; the expanded IDE test run is pending. |
+| SSO retries and binary notices needed separate handling. | Trading and Industry share SSO retry cooldowns. The main window opens the data-use/CCP notice, and the build includes that notice. | New synthetic checks are prepared. Live dialog testing and any future packaged-build verification remain pending. |
+
+Some code moved into shared helper files to make these paths use the same
+rules. The larger file count does not represent that many separate features.
+The Trade Refresh scheduler, accounting rules, and broader Stock Market and
+Industry workflows were not intentionally redesigned by this checkpoint.
+
+**Next gate:** Caleb tests the IDE run, including Ctrl+F12 (expected 52/52).
+The prior 40/40 result does not verify the twelve new scenarios. Report any
+additional findings separately; do not silently add them to the implementation
+scope. After user testing, perform the requested general ESI compliance audit.
+APP_VERSION remains 3.67 live.
 
 ## Original conversation and continuation rule
 
@@ -13,6 +99,17 @@ plan**, including the user's corrections. The original local session records
 are `01a1df98-2eba-7073-9a7e-7a9c92e6d517` and
 `01a1e12b-b8c2-70a2-ad03-c9ec7b540f1a`, under the Codex sessions directory
 for `2026/11/15`.
+
+On 2026-11-16, re-read those source transcripts plus the reputation continuation
+`01a1e1b1-3ff2-7993-a3f2-1c63c39c1968` and the current batch thread
+`01a1e20a-814c-7550-8e83-dfead2439039`, rather than relying on a compacted
+handoff. In the original assessment, user messages at JSONL lines 558, 593
+and 705 establish Jita's 24-hour rule, Stock Market's one-hour rule and the
+ESI → Stock Market → Industry order. The implementation thread's line 525
+requires saved per-resource request timing, following the correction about
+ESI expiry. The current thread's lines 366–378 establish batching: regional
+orders/blueprints/small routes first, then history/policies/SSO/notices, with
+combined testing. No new implementation scope is inferred from this audit.
 
 When continuing after compaction, consult the original relevant messages
 before changing an agreed requirement or updating this plan. A compressed
@@ -52,18 +149,48 @@ Decisions preserved from those messages:
 | Diagnostics and readable REUSE waits | User-run logs show requests, acceptance, persistence, original ages, readable waits, heartbeats and automatic reports. | Exercise remaining routes; reports alone cannot clear unexercised paths or cross-restart repeats. |
 | Full public Industry prices and systems | Shared expiry-aware provider, locks and atomic persistence. Real acquisition, repeated reuse and restart restoration/reuse verified. | Retain regression coverage as other consumers are integrated. |
 | Wallet balance, transactions, journal, active orders and order history | All five real resources persisted/restored. Four unexpired resources reused after a real restart, with original ages/expiry; expired balance acquired independently. Eleven offline cache/accounting checks passed at 18:32:08 Central. | Live character changes and discovery sharing; accounting cases beyond the synthetic fixtures, including late purchases. Retain regression checks while extending the provider. |
-| Skills and standings, Trading and Industry | Seventeen checks passed at 19:00:02 Central. Real seller/Industry skills and standings acquired, saved, restored and reused across restart. | New seven-day/manual rep policy and two additional scenarios (nineteen total) await runtime verification. Matching-context sharing is synthetic-verified; buyer login fails with invalid_grant and needs reauthentication. |
-| Structure discovery's active character orders | Routed through the private provider. | Live matching-context reuse; structure metadata still needs shared protection. |
-| Remaining acquisition paths and consumer policies | Reviewed below; not finished. | Skills/standings, direct/manual paths, history overlay, order snapshot hardening, agreed consumer ages, SSO cooldown and notices. |
+| Skills and standings, Trading and Industry | Committed/pushed in b329c8c. Seventeen checks passed at 19:00:02 Central; real seller/Industry acquisition, save, restoration/reuse verified. | Live matching-context cross-consumer sharing remains unobserved; its synthetic scenario passed. Buyer login fails with invalid_grant and needs reauthentication. |
+| Reputation retention and manual/seven-day refresh | Committed/pushed in b329c8c. Seller/Industry retain last good rep beyond its update deadline and on failure. Its synthetic policy scenarios passed in the current 40/40 run. | Real manual rep-control behavior remains unobserved; fold it into final live checks. |
+| Private structures and discovery | Authorization-scoped books/metadata and discovery provider implemented; synthetic isolation/restart checks passed. Real books persist/reuse and Browse-to-Tracking sharing passed. | Live metadata/discovery sharing, authorization changes and unexpired private-book restart reuse remain unobserved. |
+| Regional books, blueprints and smaller routes | Implemented locally and passed 40/40. Both 404 regressions verified fixed. Real regional save/reuse, blueprint save/restart reuse and contract-list restart reuse observed. | Unexpired regional restart reuse and remaining live metadata/auth cases. Contract item errors remain distinct from list-cache success. |
+| History, consumer policies, SSO and notices | Implemented locally; syntax/diff checks passed. Twelve new isolated checks join the prior forty in the IDE runner. | Run 52 checks and user-test the live behavior. Remaining rep/auth/accounting cases stay open. General compliance re-audit follows user testing. |
 
 Latest wallet evidence: run `16552-1794789044` acquired eligible replacements
 around 18:32 Central and passed all eleven offline checks at 18:32:08. After
 restart, run `25944-1794789218` restored all five snapshots at 18:33:47 and
 reused transactions, journal, orders and order history at 18:34:40 without
 requests to those routes. Original ages/absolute expiry were preserved; balance
-alone was expired and fetched again. The public underbid fallback separately
-repeated eighteen requests before prior expiry in the earlier process. That
-known direct-path gap remains open. See [verification instructions](ESI_DIAGNOSTICS.md).
+alone was expired and fetched again. The public underbid fallback's earlier
+eighteen pre-expiry repeats were a historical direct-path gap. Shared per-type
+snapshots now address that path, with repeat/restart/page-recovery scenarios
+passing in the current suite. See [verification evidence](ESI_DIAGNOSTICS.md).
+
+## Immediate continuation
+
+1. **Done: batch 1 and its 40-check gate.** The user completed the combined
+   walkthrough; its evidence remains valid. No extra standalone rerun is due.
+2. **Next: batch 2, implemented together before the next test handoff.**
+   Persist the recent ESI history payload with acquisition/expiry and honest
+   per-item completion; enforce selected-scanner turnover, the 24-hour Jita
+   reference and one-hour Stock Market hub policy; finish shared SSO cooldowns
+   and accessible packaged notices. Details and boundaries are in steps 2–4.
+3. **Then: one combined verification and phase-1 closeout.** Extend Ctrl+F12
+   for history restore/partial failure, 23h/24h Jita and 59m/60m Stock Market
+   boundaries, independent hub switching and SSO cooldowns. Use the IDE/log
+   workflow and one consolidated live checklist, folding in the outstanding
+   rep, metadata/discovery, authorization and unexpired restart cases. Runtime
+   evidence determines which cases close; synthetic checks do not silently
+   clear unobserved live routes. Preserve the existing accounting regressions.
+
+Keep the agreed scope bounded. New findings stay separate unless they block
+the requested behavior. The Trade Refresh scheduler's 20-minute floor still
+requires separate discussion before changing it; do not add an hourly wallet
+delay or reopen deferred auth/versioning work. Broader Stock Market workflow
+review follows ESI closeout, and broader Industry review follows Stock Market.
+
+Buyer reauthentication and live character/discovery-sharing checks remain open
+verification items. Preserve the separation between an invalid buyer login,
+successful seller/Industry persistence, and unexercised authorization cases.
 
 ## Remaining phase-1 work, in order
 
@@ -77,17 +204,19 @@ sequence, not newly agreed product behavior or proof of runtime failures.
 Continue protecting that behavior as the provider is extended. Live character
 changes and discovery sharing remain unobserved; do not mark those complete.
 
-Run isolated accounting fixtures through the actual inventory sync with
-fetched, reused and restored wallet records. Require equal lots, cost basis,
-listings, partial fills, completed/cancelled orders, fees/taxes and realized
-P&L; repeated sync/restart must not double-count. Include delayed linking
-records and partial refresh failures. The existing inventory/P&L replay cases
-are useful foundations; the eight cache checks alone do not cover this.
+The passed inventory fixtures compare fetched, reused and restored wallet
+records through the actual sync: FIFO lots/basis, listings/partial fills,
+completed/cancelled orders, fees/taxes and realized P&L, including repeat sync,
+disk reload, delayed journal records and partial journal-refresh failures.
+Late-arriving purchases and other unrepresented linking cases remain separate
+coverage gaps. Preserve the existing accounting results while extending them;
+the original eight cache checks alone were not accounting verification.
 The wallet constructor's compatibility assertion for `ESIWallet(None)` passed
 in the 18:32 eleven-check run.
 
-The checkpoint through the prior review was committed and pushed as `46c76f4`
-on 2026-11-15, retaining `APP_VERSION` 3.67 live. Subsequent work adds three
+The initial ESI/cache checkpoint was committed and pushed as `46c76f4`.
+The subsequent shared-character/accounting/rep work was committed and pushed
+as `b329c8c` on 2026-11-15, retaining `APP_VERSION` 3.67 live. It adds three
 isolated in-app scenarios: complete order lifecycle across FIFO lots; delayed
 journal fee/tax backfill with independent expiry; and partial journal-refresh
 failure/recovery. Each compares fetched, reused and restored wallet data through
@@ -96,14 +225,15 @@ These three accounting scenarios passed in the user's 18:32 in-app run.
 Late-arriving purchase records and other delayed-linking cases remain outside
 these three scenarios; their pass is not exhaustive coverage.
 
-Then extend the established provider approach in small verified steps:
+Provider coverage already implemented (retain it while finishing the next batch):
 
 - **Skills and standings:** persist full raw responses and ESI expiry; share
   matching authorization contexts between trading and Industry. Keep derived
   calculations local and preserve the existing user-triggered acquisition.
   Original shared-provider chunk passed seventeen checks and normal live
   seller/Industry acquisition/restart/reuse. The newer reputation policy is
-  implemented locally and awaits nineteen-check/live verification.
+  committed/pushed in `b329c8c`; its isolated scenarios passed in the 29-check
+  run. Normal rep-control verification remains open.
   Skills retain their existing one-hour non-forced preference; rep uses the
   user-selected seven-day/manual policy. Explicit force may bypass a consumer
   preference only after server freshness permits it. Skills follow
@@ -111,30 +241,57 @@ Then extend the established provider approach in small verified steps:
   Cache-Control, Date and Age metadata remain saved. This is a route-specific
   interpretation of server caching, not a new wallet delay or scheduler change.
 - **Private structures:** isolate books and metadata by authorization context
-  before sharing Browse Orders, discovery and Industry lookups. The current
-  shared structure-book cache is keyed only by structure ID and can return
-  before checking authentication. Routing Browse into it alone is insufficient.
+  before sharing Browse Orders, discovery and Industry lookups. Implemented
+  locally in `core/esi_route_cache.py`; legacy unscoped files are ignored,
+  cache reads check current authorization, and no private book is written into
+  the public regional store. Real book persistence/reuse and Tracking sharing
+  passed; metadata and live authorization cases remain open.
 - **Other direct paths:** protect Tracking's per-type order fallback and the
   station/system metadata calls with reusable payloads, expiry and request
   deduplication. A later-page 404 must not accept accumulated partial orders.
+  These paths are implemented locally with exact query keys, page staging,
+  validation, atomic saves and original expiry. The structure Tracking fix
+  passed live; the expanded small-route scenarios passed in the 40-check run.
 - **Orders:** make regional/structure disk replacement atomic and report save
   failures. Retain successful pages across retry/restart, check all page counts,
   shapes and consistency metadata, and respect every page's expiry. Missing
   validators must not silently establish a complete consistent multi-page
   snapshot. Existing whole-snapshot retries can refetch successful page 1 too
   soon; preserve the working low-bandwidth retry behavior while closing this.
+  **Implemented locally in the combined batch:** successful regional pages
+  persist/reuse independently; every page's count/shape/validator/expiry is
+  checked before whole-book acceptance. Whole-book replacement is atomic,
+  failures retain disk data and retry saving without another acquisition.
 - **Blueprints:** deduplicate simultaneous pulls, review authorization scoping,
   validate all pages/rows before replacing the database, and distinguish a
-  database-write failure from a valid empty result. Currently a caught write
-  failure returns zero and the caller can still report successful storage.
+  database-write failure from a valid empty result. **Implemented locally:**
+  shared raw snapshots/pages use the roster's full auth context; per-DB/character
+  locks serialize application, complete row validation precedes replacement,
+  and failed transactions report failure and retain the previous rows. A valid
+  empty result still succeeds. DB/save retries reuse the accepted raw data;
+  context changes cannot inherit an earlier character-only cooldown.
 
 Finish the smaller route inventory too: contract cross-caller deduplication,
 name/ID failure isolation and negative caching, remaining universe metadata,
 and concurrent route/jump-count misses. These do not all require the same TTL;
 choose reuse appropriate to each resource. Do not declare every route covered
 because the public Industry and wallet families passed.
+**Implemented locally in this batch:** exact contract pages share requests,
+transactional persistence and cooldowns across callers/loops; mixed bad name/ID
+batches split without poisoning valid results, with persistent negatives;
+region/type/stargate data and route/jump-count misses use shared snapshots.
+Private structure-name search also uses exact auth/query keys. The combined
+40-check IDE run passed; unexercised live routes remain separately recorded.
 
 ### 2. Preserve recent history data and report durable completion honestly
+
+**Implemented locally, runtime pending:** the shared recent-history provider
+saves validated full per-region/type responses transactionally in a separate
+SQLite store. It restores original acquisition/expiry/headers, shares in-flight
+work across loops, and retries failed saves without another acquisition.
+History reads merge the recent overlay with archives; ESI wins on overlapping
+dates. Holdings freshening reports per-item accepted/durable/failed results.
+A saved hub timestamp alone no longer suppresses missing payload acquisition.
 
 Persist the recent ESI market-history overlay with acquisition/expiry metadata,
 separately from archive data. Restore it with the saved freshness state.
@@ -144,6 +301,13 @@ advance the successful-refresh clock. Preserve the previous good data on
 fetch, parse or write failure. Keep memory acceptance distinct from disk save.
 
 ### 3. Apply the agreed scanner, Jita and Stock Market policies
+
+**Implemented locally, runtime pending:** dedicated Jita-reference provider
+checks the strict 24-hour bound. Direct and cross-hub Jita targets cannot use
+the old unbounded legacy fallback. Stock Market load/open/manual paths use
+one hour from saved acquisition, including scanner updates. All regional
+callers recheck shared ESI freshness inside the acquisition lock, even when
+forced. No scheduler interval or Industry cadence was changed.
 
 Enforce the consumer table below through the shared snapshots: selected scanner
 resources follow ESI turnover; Jita reference has its own 24-hour bound; Stock
@@ -159,6 +323,15 @@ implementation. Do not introduce an extra hour after acquisition or force
 all wallet resources onto one clock.
 
 ### 4. Finish SSO cooldown and distribution notice work
+
+**Implemented locally, runtime pending:** Trading and Industry token/verify
+requests share a serialized SSO gate. Numeric/date Retry-After applies across
+endpoints and survives restart; failed grants have isolated retry delays.
+Saved cooldown data contains hashed request identities and deadlines, never
+credentials. A Data use / CCP dialog reads the disclosure from source or the
+PyInstaller bundle; the spec now includes it. Acquisition claims were revised
+to distinguish policy/implementation from remaining runtime coverage. No
+public executable was built in this batch.
 
 Share and honor SSO Retry-After/error cooldowns across token/verify callers.
 Make CCP's notice and the data-use disclosure accessible in the packaged app;
@@ -176,9 +349,13 @@ Compare original timestamps across runs; process-local repeat counters alone
 are insufficient. Keep implemented, statically checked and live-verified
 statuses separate. Only then proceed to the follow-on workflow phases below.
 
-Current verification gate: reputation retention and manual/seven-day refresh
-(nineteen-check runner and normal IDE behavior). Next implementation
-chunk after that: private-structure/direct-path work.
+The expanded forty-check runner passed on 2026-11-16 at 06:11:55 Central,
+including regional orders, blueprints, smaller routes and both corrected 404
+regressions. Remaining live cases include rep controls, metadata, authorization
+changes and unexpired regional/private-book cross-restart reuse. Steps 2–4
+are implemented locally; their twelve new checks bring the runner to 52.
+Step 5 and live verification remain pending before phase closeout.
+The Stock Market/Industry follow-on order remains unchanged.
 
 ## Consumer policies
 
@@ -294,6 +471,11 @@ Do not log credentials, tokens, authorization codes, or private payloads.
 7. Reconcile identical inventory scenarios using freshly fetched, reused and
    disk-restored linking records: require the same accounting results and no
    duplicate purchases, fills, fees or realized profit after repeated sync.
+8. Restore saved reputation for the matching seller/Industry context even
+   after its refresh deadline. Reuse before seven days on ordinary use; request
+   an eligible update at seven days or explicitly. A failed update retains the
+   previous rep and original acquisition time. Cached social modifiers remain
+   available for effective rep, and context changes do not expose old rep.
 
 ## Follow-on work order
 

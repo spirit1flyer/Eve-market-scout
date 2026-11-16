@@ -7,92 +7,12 @@ from typing import Optional, Callable, List, TYPE_CHECKING
 from esi.esi_wallet import ESIWallet
 from analytics.trade_tracker import TradeTracker
 from core.calculate import format_isk
-from core.config import TRADE_HUBS, get_esi_headers
-from core.esi_rate_limit import esi_request
+from core.config import TRADE_HUBS
 from core.tk_queue import submit
+from gui.tracking.gui_tracking_market import fetch_market_orders_sync, fetch_underbid_orders_sync
 
 if TYPE_CHECKING:
     from gui.tracking.gui_tracking import TrackingTabManager
-
-
-def fetch_market_orders_sync(region_id: int, type_ids: Optional[List[int]] = None,
-                             order_cache=None) -> List[dict]:
-    """Return orders for underbid checks from the shared regional snapshot.
-
-    On a cache miss, fetch only the listed types and reject mixed ESI pages.
-    """
-    if order_cache is not None:
-        peeked = order_cache.peek_cached_orders(region_id, max_age_seconds=300)
-        if peeked is not None:
-            orders, age = peeked
-            print(
-                "[TradeSync] stage=underbid_snapshot decision=REUSE "
-                f"source=shared_region_cache region={region_id} "
-                f"age={age:.0f}s orders={len(orders)}"
-            )
-            return orders
-
-    if not type_ids:
-        print(
-            "[TradeSync] stage=underbid_snapshot decision=SKIP "
-            f"region={region_id} reason=no_active_sell_types"
-        )
-        return []
-
-    all_orders = []
-    failed_types = 0
-    base_url = "https://esi.evetech.net/latest"
-    print(
-        "[ESI-Timing] resource=regional_orders trigger=underbid_fallback "
-        f"decision=FETCH reason=shared_cache_miss region={region_id} "
-        f"types={len(type_ids)}"
-    )
-
-    for type_id in type_ids:
-        try:
-            page = 1
-            type_orders = []
-            first_validator = None
-            while True:
-                response = esi_request(
-                    "GET",
-                    f"{base_url}/markets/{region_id}/orders/",
-                    headers=get_esi_headers(),
-                    params={"type_id": type_id, "order_type": "sell", "page": page},
-                    timeout=30
-                )
-                if response.status_code == 404:
-                    break  # Page vanished, stop
-                response.raise_for_status()
-                total_pages = int(response.headers.get("X-Pages", 1))
-                validator = response.headers.get("Last-Modified")
-                if page == 1:
-                    first_validator = validator
-                elif validator != first_validator:
-                    raise RuntimeError(
-                        f"representation changed on page {page}"
-                    )
-                type_orders.extend(response.json())
-                if page >= total_pages:
-                    break
-                page += 1
-            all_orders.extend(type_orders)
-        except Exception as e:
-            failed_types += 1
-            print(
-                "[ESI-Timing] resource=regional_orders "
-                "trigger=underbid_fallback decision=FAILED "
-                f"region={region_id} type_id={type_id} "
-                f"error_type={type(e).__name__}"
-            )
-
-    print(
-        "[ESI-Timing] resource=regional_orders trigger=underbid_fallback "
-        f"decision=COMPLETE status={'ok' if failed_types == 0 else 'partial_failure'} "
-        f"region={region_id} types={len(type_ids)} failed_types={failed_types} "
-        f"orders={len(all_orders)}"
-    )
-    return all_orders
 
 
 class ESISyncManager:
@@ -141,6 +61,8 @@ class ESISyncManager:
     def set_underbid_monitor(self, monitor, hub_key: str):
         """Set the underbid monitor instance and hub."""
         self.underbid_monitor = monitor
+        if hub_key != self.hub_key:
+            self.market_orders_cache = []
         self.hub_key = hub_key
     
     def set_stock_market_callback(self, callback: Callable[[List[dict], int], None]):
@@ -314,27 +236,37 @@ class ESISyncManager:
             # Fetch market orders so _on_esi_refresh can run the underbid check
             # against inventory listings (the underbid check itself moved out of
             # this thread when the UI swapped from TradeTracker to InventoryManager).
-            if self.hub_key:
-                hub_config = TRADE_HUBS.get(self.hub_key)
+            market_hub = self.hub_key
+            market_wallet = self.wallet
+            self.market_orders_cache = []
+            if market_hub:
+                hub_config = TRADE_HUBS.get(market_hub)
                 if hub_config:
-                    region_id = hub_config["region_id"]
                     listed_type_ids = sorted({
                         o.type_id for o in self.wallet.orders if not o.is_buy_order
                     }) if self.wallet else []
-                    order_cache = self.get_client().order_cache if self.get_client else None
+                    order_cache = (self.get_client().order_cache
+                                   if self.get_client and hub_config.get("type") != "structure" else None)
                     print(
                         "[TradeSync] stage=underbid_snapshot decision=LOAD "
-                        f"hub={self.hub_key} region={region_id} "
+                        f"hub={market_hub} region={hub_config['region_id']} "
                         f"active_sell_types={len(listed_type_ids)}"
                     )
-                    self.market_orders_cache = fetch_market_orders_sync(
-                        region_id, listed_type_ids, order_cache
-                    )
-                    print(
-                        "[TradeSync] stage=underbid_snapshot decision=READY "
-                        f"hub={self.hub_key} orders={len(self.market_orders_cache)}"
-                    )
-            
+                    try:
+                        orders = fetch_underbid_orders_sync(
+                            hub_config, listed_type_ids, order_cache, auth=market_wallet.auth
+                        )
+                    except Exception as exc:
+                        print("[TradeSync] stage=underbid_snapshot decision=FAILED "
+                              f"hub={market_hub} error_type={type(exc).__name__}")
+                    else:
+                        if self.hub_key == market_hub and self.wallet is market_wallet:
+                            self.market_orders_cache = orders
+                            print(
+                                "[TradeSync] stage=underbid_snapshot decision=READY "
+                                f"hub={market_hub} orders={len(orders)}"
+                            )
+
             def update():
                 import time as _pt
                 _pt0 = _pt.perf_counter()

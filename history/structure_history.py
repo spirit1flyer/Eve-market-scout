@@ -166,13 +166,15 @@ class StructureHistoryDB:
             return
 
         with conn:
-            conn.executemany(
+            inserted = conn.executemany(
                 "INSERT OR IGNORE INTO structure_snapshots "
                 "(structure_id, snapshot_at, order_id, type_id, is_buy, "
                 "price, volume_remain, issued, duration) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+            if inserted.rowcount == 0:
+                return  # Same acquired snapshot reused by another consumer.
 
             if prior_at is not None:
                 self._infer_and_apply(conn, structure_id, prior_at, snapshot_at)

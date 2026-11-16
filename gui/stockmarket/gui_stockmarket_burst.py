@@ -4,13 +4,26 @@ import asyncio
 import threading
 
 from core.tk_queue import submit
+from core.order_policy import STOCK_ORDER_SECONDS
 from core.config import TRADE_HUBS, get_hub_order_cache_key, is_stock_market_hub
 from analytics.stockmarket_filters import get_hub_burst_tracker
 
 
 class StockMarketBurstMixin:
 
-    _ACTIVE_REGION_MAX_AGE = 300  # 5 min = one scanner cycle
+    _ACTIVE_REGION_MAX_AGE = STOCK_ORDER_SECONDS
+
+    def _on_stock_tab_visible(self, event=None):
+        if event is None or event.widget is not self.frame.master:
+            return
+        if self.frame.master.select() != str(self.frame) or self._stock_market_off():
+            return
+        hub = self._get_current_hub_key()
+        panel = self.hub_panels.get(hub)
+        client = self.get_client() if self.get_client else None
+        if panel and client:
+            self._pull_active_region_if_stale(hub, panel, client)
+            self._freshen_holdings_for_hub(hub, panel, client)
 
     def _get_stale_hubs(self, client) -> list:
         """Return enabled hubs without a complete snapshot under 24 hours old."""
@@ -106,7 +119,7 @@ class StockMarketBurstMixin:
         threading.Thread(target=run_burst, daemon=True).start()
 
     def _pull_active_region_if_stale(self, hub_key, panel, client):
-        """Pull fresh orders for the active tab if cache is older than 5 min."""
+        """Pull fresh orders for the active tab when its saved acquisition is at least one hour old."""
         hub_cfg = TRADE_HUBS.get(hub_key, {})
         if not hub_cfg:
             return
@@ -117,9 +130,13 @@ class StockMarketBurstMixin:
         )
         if snapshot is not None:
             _orders, _age = snapshot
+            print("[ESI-Timing] resource=hub_orders trigger=stock_hub_load "
+                  f"hub={hub_key} decision=REUSE reason=under_one_hour age={_age:.0f}s")
             panel.render_from_cache(client.order_cache)
             return
 
+        # Keep the saved view readable while an eligible update is acquired.
+        panel.render_from_cache(client.order_cache)
         timing = client.order_cache.get_cache_timing(
             cache_key, max_age_seconds=self._ACTIVE_REGION_MAX_AGE
         )
@@ -139,7 +156,9 @@ class StockMarketBurstMixin:
                 async def pull():
                     client.reset_for_new_loop()
                     client.ensure_session()
-                    await client.get_orders_for_hub(hub_key)
+                    if client.order_cache.peek_cached_orders(
+                            cache_key, max_age_seconds=self._ACTIVE_REGION_MAX_AGE) is None:
+                        await client.get_orders_for_hub(hub_key)
                 loop.run_until_complete(pull())
             except Exception as e:
                 print(f"[StockMarket] Active tab pull failed for {hub_key}: {e}")

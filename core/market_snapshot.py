@@ -1,81 +1,66 @@
-"""Consistent multi-page regional market snapshot acquisition."""
+"""Complete regional books assembled from durable, expiry-aware pages."""
 
 import asyncio
-from datetime import datetime
-from typing import Optional
 
-from core.config import ESI_BASE_URL
+from core.esi_public_cache import _utc
+from core.esi_route_cache import validate_route_payload
+from core.market_pages import get_regional_pages
+from core.esi_cache_io import async_guard
 
 
 class ESIPaginationChangedError(RuntimeError):
-    """Raised when pages came from different ESI cached representations."""
+    """Pages cannot establish one complete ESI representation."""
 
 
-async def fetch_market_snapshot(
-    client, region_id: int
-) -> tuple[list[dict], Optional[datetime], int, dict]:
-    """Fetch one complete, internally consistent regional order snapshot."""
-    url = f"{ESI_BASE_URL}/markets/{region_id}/orders/"
-    endpoint = f"/markets/{region_id}/orders/"
-    await client._await_rate_limit_pause()
+async def regional_page(client, store, region, page):
+    async with async_guard(store._lock(("acquire", region, page))):
+        return await _regional_page_locked(client, store, region, page)
 
-    async with client.semaphore:
-        for attempt in range(2):
-            await client._await_rate_limit_pause()
-            async with client.session.get(url, params={"page": 1}) as response:
-                client._record_response_headers(response, endpoint)
-                if response.status == 429 and attempt == 0:
-                    retry_after = max(
-                        1, int(response.headers.get("Retry-After", "1") or "1")
-                    )
-                    print(
-                        f"[ESI-RL] HTTP 429 on {endpoint} - Retry-After "
-                        f"{retry_after}s, sleeping then retrying once"
-                    )
-                    await asyncio.sleep(retry_after)
-                    continue
-                if response.status == 429:
-                    print(
-                        f"[ESI-RL] HTTP 429 on {endpoint} AGAIN after "
-                        "retry - giving up, raising"
-                    )
-                response.raise_for_status()
-                total_pages = int(response.headers.get("X-Pages", 1))
-                expires = client._parse_expires_header(response)
-                page_one_validator = response.headers.get("Last-Modified")
-                etag = response.headers.get("ETag")
-                all_orders = list(await response.json())
-                break
 
-    if total_pages > 1:
-        page_results, validators, stale_pages = await client._fetch_pages_staged(
-            endpoint, list(range(2, total_pages + 1))
-        )
-        changed_pages = sorted(
-            page for page, validator in validators.items()
-            if validator != page_one_validator
-        )
-        if stale_pages or changed_pages:
-            details = []
-            if stale_pages:
-                details.append(f"404_pages={sorted(stale_pages)}")
-            if changed_pages:
-                details.append(f"validator_pages={changed_pages}")
-            raise ESIPaginationChangedError(" ".join(details))
+async def _regional_page_locked(client, store, region, page):
+    row = await asyncio.to_thread(store.peek_page, region, page)
+    if row is not None:
+        print(f"[RegionalPages] decision=REUSE region={region} page={page} expires={row['expires']}")
+        return row
+    payload, headers = await client._get_with_headers(f"/markets/{region}/orders/", {"page": page})
+    try:
+        return await asyncio.to_thread(store.accept_page, region, page, payload, headers)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ESIPaginationChangedError(f"invalid_page={page} error_type={type(exc).__name__}") from exc
 
-        if not page_one_validator:
-            print(
-                "[ESI-Timing] resource=regional_orders "
-                f"trigger=page_validation region={region_id} "
-                "decision=UNVALIDATED reason=no_last_modified "
-                f"pages={total_pages}"
-            )
-        for page in sorted(page_results):
-            all_orders.extend(page_results[page])
 
-    return all_orders, expires, total_pages, {
-        "etag": etag,
-        "last_modified": page_one_validator,
-        "complete": True,
-        "source": "esi_region_orders",
+async def fetch_market_snapshot(client, region_id):
+    store = getattr(client, "_regional_pages", None) or get_regional_pages()
+    first = await regional_page(client, store, region_id, 1)
+    total = int(first["headers"].get("x-pages", "1"))
+    rows = {1: first}
+    if total > 1:
+        results, _validators, stale = await client._fetch_pages_staged(
+            f"/markets/{region_id}/orders/", list(range(2, total + 1)),
+            page_loader=lambda page: regional_page(client, store, region_id, page))
+        if stale or set(results) != set(range(2, total + 1)):
+            raise ESIPaginationChangedError("missing_or_vanished_pages")
+        rows.update(results)
+    validator = first["headers"].get("last-modified")
+    if total > 1 and not validator:
+        raise ESIPaginationChangedError("missing_multi_page_validator")
+    orders = []
+    metadata = []
+    for page, row in sorted(rows.items()):
+        headers = row["headers"]
+        if (int(headers.get("x-pages", "1")) != total
+                or headers.get("last-modified") != validator):
+            raise ESIPaginationChangedError(f"representation_changed_page={page}")
+        orders.extend(row["payload"])
+        metadata.append({"page": page, "total_pages": total, "expires": row["expires"],
+                         "acquired_at": row["acquired_at"], "last_modified": validator,
+                         "etag": headers.get("etag")})
+    try:
+        validate_route_payload("type_orders", orders)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ESIPaginationChangedError("invalid_full_book") from exc
+    return orders, max(_utc(row["expires"]) for row in rows.values()), total, {
+        "etag": first["headers"].get("etag"), "last_modified": validator,
+        "complete": True, "source": "esi_region_orders", "page_metadata": metadata,
+        "acquired_at": max(_utc(row["acquired_at"]) for row in rows.values()),
     }

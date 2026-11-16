@@ -213,7 +213,8 @@ class CharactersPanel:
         """Pull this character's owned blueprints via ESI (worker thread)."""
         if not self.bp_puller or char.character_id in self._pulling:
             return
-        can_fetch, next_in = self.bp_db.get_cache_status(char.character_id)
+        can_fetch, next_in = (self.bp_puller.get_cache_status(char.character_id)
+                              if self.bp_puller else self.bp_db.get_cache_status(char.character_id))
         if not can_fetch:
             mins, secs = divmod(next_in, 60)
             print(

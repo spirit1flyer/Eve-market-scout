@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, TYPE_CHECKING
 
 from core.tk_queue import submit
+from core.order_policy import STOCK_ORDER_SECONDS
 from core.config import get_hub_config, get_hub_order_cache_key
 from gui.stockmarket.gui_stockmarket_dialogs import AddStockItemDialog
 from gui.stockmarket.gui_stockmarket_settings import (
@@ -40,7 +41,7 @@ class StockMarketActionsMixin:
     """
 
     _HOLDINGS_FRESHEN_MIN_INTERVAL = 60 * 60
-    _STOCK_ORDER_REUSE_SECONDS = 20 * 60
+    _STOCK_ORDER_REUSE_SECONDS = STOCK_ORDER_SECONDS
     
     # =========================================================================
     # Add Item
@@ -153,7 +154,7 @@ class StockMarketActionsMixin:
     # =========================================================================
     
     def _on_refresh_prices(self):
-        """Recalculate the current hub, acquiring regional orders at most every 20 minutes."""
+        """Recalculate the current hub, checking the shared one-hour order snapshot."""
         hub_key = self._get_current_hub_key()
         if not hub_key:
             self.set_status("No hub selected")
@@ -204,7 +205,7 @@ class StockMarketActionsMixin:
                     )
                     decision = 'CACHE' if cached is not None else 'FETCH'
                     reason = (
-                        'stock_20m_window'
+                        'stock_one_hour_window'
                         if cached is not None else timing['reason']
                     )
                     print(
@@ -217,7 +218,7 @@ class StockMarketActionsMixin:
                     )
                     # Every click reapplies the current snapshot so derived
                     # Stock Market values recalculate immediately.  This
-                    # consumer reacquires only when its 20-minute window is
+                    # consumer reacquires only when its one-hour window is
                     # due; other consumers may refresh the shared snapshot
                     # sooner and Stock Market will reuse their newer data.
                     if cached is not None:
@@ -250,26 +251,14 @@ class StockMarketActionsMixin:
         type_ids = [e.type_id for e in holdings_panel.holdings.get_all()]
         if not type_ids:
             return
-        now = datetime.now(timezone.utc)
-        last = self._holdings_freshen_ts.get(hub_key)
-        if last is not None:
-            age = (now - last).total_seconds()
-            if age < self._HOLDINGS_FRESHEN_MIN_INTERVAL:
-                next_in = self._HOLDINGS_FRESHEN_MIN_INTERVAL - age
-                print(
-                    "[ESI-Timing] resource=market_history "
-                    f"trigger=holdings_tab hub={hub_key} decision=SKIP "
-                    f"reason=hourly_interval age={age:.0f}s "
-                    f"next_in={next_in:.0f}s items={len(type_ids)}"
-                )
-                return
-        age_text = f"{(now - last).total_seconds():.0f}s" if last else "never"
-        print(
-            "[ESI-Timing] resource=market_history "
-            f"trigger=holdings_tab hub={hub_key} decision=FETCH "
-            f"reason=due age={age_text} items={len(type_ids)}"
-        )
-        self._holdings_freshen_ts[hub_key] = now
+        # A timestamp alone cannot prove the recent payload survived restart.
+        # The provider checks each saved item and its original clocks instead.
+        inflight = getattr(self, '_holdings_freshen_inflight', None)
+        if inflight is None:
+            self._holdings_freshen_inflight = inflight = set()
+        if hub_key in inflight:
+            return
+        inflight.add(hub_key)
         region_id = holdings_panel.region_id
 
         def run():
@@ -279,29 +268,31 @@ class StockMarketActionsMixin:
                 async def do_freshen():
                     client.reset_for_new_loop()
                     client.ensure_session()
-                    await client.freshen_history_for_items(region_id, type_ids)
-                loop.run_until_complete(do_freshen())
+                    return await client.freshen_history_for_items(region_id, type_ids)
+                result = loop.run_until_complete(do_freshen())
                 completed_at = datetime.now(timezone.utc)
                 print(
                     "[ESI-Timing] resource=market_history "
-                    f"trigger=holdings_tab hub={hub_key} decision=FETCHED "
-                    f"items={len(type_ids)}"
+                    f"trigger=holdings_tab hub={hub_key} "
+                    f"decision={'COMPLETE' if result['complete'] else 'PARTIAL'} "
+                    f"accepted={len(result['accepted'])} durable={len(result['durable'])} "
+                    f"failed={len(result['failed'])} fetched={len(result['fetched'])} "
+                    f"reused={len(result['reused'])}"
                 )
 
                 def record_success():
-                    self._holdings_freshen_ts[hub_key] = completed_at
-                    self.settings.holdings_last_freshened[hub_key] = (
-                        completed_at.isoformat()
-                    )
-                    save_settings(self.settings)
-                    holdings_panel._schedule_refresh()
+                    if result['complete']:
+                        self._holdings_freshen_ts[hub_key] = completed_at
+                        self.settings.holdings_last_freshened[hub_key] = completed_at.isoformat()
+                        save_settings(self.settings)
+                    if result['accepted']:
+                        holdings_panel._schedule_refresh()
 
                 submit(record_success)
             except Exception as e:
-                if self._holdings_freshen_ts.get(hub_key) == now:
-                    self._holdings_freshen_ts.pop(hub_key, None)
                 print(f"[StockMarket-{hub_key}] holdings ESI freshen failed: {e}")
             finally:
+                submit(lambda: inflight.discard(hub_key))
                 client.close_loop_state(loop)
                 loop.close()
 

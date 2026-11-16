@@ -65,13 +65,13 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
         # Hub panels
         self.hub_panels: Dict[str, StockMarketHubPanel] = {}
         self._active_hub_key: Optional[str] = None
-        # Last ESI-freshen timestamp per hub_key for holdings history.
-        # Debounce repeated tab switches within _HOLDINGS_FRESHEN_MIN_INTERVAL.
+        # History provider owns per-item reuse; these timestamps are display metadata.
         self._holdings_freshen_ts = self.settings.get_holdings_freshen_times()
         
         # Create main frame
         self.frame = ttk.Frame(notebook)
         notebook.add(self.frame, text="Stock Market")
+        notebook.bind("<<NotebookTabChanged>>", self._on_stock_tab_visible, add="+")
         
         # Cold-start orchestrator state (read by locked overlay each tick).
         # Initialised before _create_widgets so the overlay can read it.
@@ -264,7 +264,7 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
         _step_render_cache = 0.0
         if client:
             _ts = _pt.perf_counter()
-            panel.render_from_cache(client.order_cache)
+            self._pull_active_region_if_stale(hub_key, panel, client)
             _step_render_cache = _pt.perf_counter() - _ts
         _step_first_render = 0.0
         if not getattr(panel, "_has_rendered_once", False):
@@ -272,9 +272,7 @@ class StockMarketTab(StockMarketActionsMixin, StockMarketOverlayMixin, StockMark
             panel.refresh_display_async()
             _step_first_render = _pt.perf_counter() - _ts
             panel._has_rendered_once = True
-        # Close the 1-4 day SQLite lag on holdings by force-pulling ESI
-        # history for tracked items in this region. Refreshes the holdings
-        # panel once fresh data lands.
+        # Merge durable recent ESI rows with archive history for holdings.
         _ts = _pt.perf_counter()
         self._freshen_holdings_for_hub(hub_key, panel, client)
         _step_freshen_spawn = _pt.perf_counter() - _ts

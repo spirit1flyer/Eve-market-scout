@@ -107,21 +107,8 @@ class IndustryStandings:
     def resolve_names(self, ids) -> Dict[int, str]:
         """Resolve faction/corp/agent ids to names via public POST
         /universe/names/ (no auth). Cached; call from a worker thread."""
-        todo = list({int(i) for i in ids if i and int(i) not in self._names})
-        for start in range(0, len(todo), 1000):  # ESI caps at 1000 ids/call
-            chunk = todo[start:start + 1000]
-            if not chunk:
-                continue
-            try:
-                resp = esi_request("POST", f"{BASE_URL}/universe/names/",
-                                     json=chunk,
-                                     headers=get_esi_headers(),
-                                     timeout=30)
-                resp.raise_for_status()
-                for entry in resp.json():
-                    self._names[entry["id"]] = entry["name"]
-            except requests.RequestException as e:
-                print(f"[IndustryStandings] name resolve error: {e}")
+        from core.esi_lookup_cache import get_lookup_cache
+        self._names.update(get_lookup_cache().names(ids))
         return self._names
 
     def name_for(self, id_: int) -> Optional[str]:

@@ -80,27 +80,13 @@ class TypeNameMixin:
 
     async def _fetch_type_names_from_esi(self, type_ids: list[int], result: dict[int, str]):
         """Fetch type names from ESI in batches, updating result dict in place."""
-        BATCH_SIZE = 500
-
-        for i in range(0, len(type_ids), BATCH_SIZE):
-            batch = type_ids[i:i + BATCH_SIZE]
-            try:
-                await self._await_rate_limit_pause()
-                async with self.semaphore:
-                    url = f"{ESI_BASE_URL}/universe/names/"
-                    async with self.session.post(url, json=batch) as response:
-                        self._record_response_headers(
-                            response, "/universe/names/"
-                        )
-                        if response.status == 200:
-                            data = await response.json()
-                            for item in data:
-                                result[item["id"]] = item["name"]
-                                self.type_name_cache[item["id"]] = item["name"]
-                        else:
-                            await self._fetch_type_names_individual(batch, result)
-            except Exception:
-                await self._fetch_type_names_individual(batch, result)
+        from core.esi_lookup_cache import get_lookup_cache
+        names = await asyncio.to_thread(get_lookup_cache().names, type_ids)
+        result.update(names)
+        self.type_name_cache.update(names)
+        missing = [tid for tid in type_ids if tid not in names]
+        if missing:
+            await self._fetch_type_names_individual(missing, result)
 
     async def _fetch_type_names_individual(self, type_ids: list[int], result: dict[int, str]):
         """Fetch type names individually (fallback for batch failures)."""
@@ -118,19 +104,15 @@ class TypeNameMixin:
         results = []
 
         try:
-            await self._await_rate_limit_pause()
-            async with self.semaphore:
-                url = f"{ESI_BASE_URL}/universe/ids/"
-                async with self.session.post(url, json=[search_term]) as response:
-                    self._record_response_headers(response, "/universe/ids/")
-                    if response.status == 200:
-                        data = await response.json()
-                        for item in data.get("inventory_types", []):
-                            results.append({"type_id": item["id"], "name": item["name"]})
-                            self.type_name_cache[item["id"]] = item["name"]
-        except Exception as e:
+            from core.esi_lookup_cache import get_lookup_cache
+            resolved = await asyncio.to_thread(get_lookup_cache().ids, [search_term])
+            data = resolved.get(search_term.strip().casefold(), {})
+            for item in data.get("inventory_types", []):
+                results.append({"type_id": item["id"], "name": item["name"]})
+                self.type_name_cache[item["id"]] = item["name"]
+        except Exception as exc:
             if DEBUG_ESI:
-                print(f"[ESI] universe/ids error: {e}")
+                print(f"[ESI] universe/ids error: {exc}")
 
         search_lower = search_term.lower()
         for type_id, name in self.type_name_cache.items():

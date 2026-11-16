@@ -78,29 +78,31 @@ def _request_with_retry(
 
 
 def fetch_structure_info(
-    structure_id: int, auth: ESIAuth, slot: str = "seller"
+    structure_id: int, auth: ESIAuth, slot: str = "seller", *, cache=None
 ) -> StructureInfo:
     """Resolve structure metadata. Raises StructureAccessError on 403/404."""
-    headers = auth.get_auth_headers(slot)
-    if not headers:
-        raise StructureAccessError(structure_id, 401, "not authenticated")
+    data = _structure_snapshot("structure_info", structure_id, auth, slot, cache=cache)["payload"]
+    return StructureInfo(structure_id, data["name"], data["solar_system_id"],
+                         data["type_id"], data.get("owner_id"))
 
-    resp = _request_with_retry(
-        f"{BASE_URL}/universe/structures/{structure_id}/", headers=headers
-    )
 
-    if resp.status_code in (403, 404):
-        raise StructureAccessError(structure_id, resp.status_code, resp.text[:160])
-    resp.raise_for_status()
-
-    data = resp.json()
-    return StructureInfo(
-        structure_id=structure_id,
-        name=data.get("name", f"Structure {structure_id}"),
-        solar_system_id=data["solar_system_id"],
-        type_id=data["type_id"],
-        owner_id=data.get("owner_id"),
-    )
+def _structure_snapshot(resource, structure_id, auth, slot, *, cache=None, fetch=True):
+    from core.esi_route_cache import route_snapshot
+    from core.esi_private_cache import PrivateSnapshotError
+    try:
+        return route_snapshot(resource, structure_id, auth=auth, slot=slot,
+                              cache=cache, fetch=fetch, trigger="structure_lookup")
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if status in (401, 403, 404):
+            raise StructureAccessError(structure_id, status) from exc
+        raise StructureSnapshotError(f"HTTP {status}; previous snapshot retained") from exc
+    except PrivateSnapshotError as exc:
+        if str(exc) in ("not_authenticated", "authorization_changed", "character_context_mismatch"):
+            raise StructureAccessError(structure_id, 401, "authorization unavailable or changed") from exc
+        raise StructureSnapshotError(str(exc)) from exc
+    except (requests.RequestException, ValueError, KeyError, OSError) as exc:
+        raise StructureSnapshotError(type(exc).__name__) from exc
 
 
 _STRUCTURE_ID_FLOOR = 1_000_000_000_000
@@ -113,21 +115,11 @@ def is_structure_id(value: int) -> bool:
 
 def resolve_region_for_system(system_id: int) -> int:
     """Walk system → constellation → region via public ESI (no auth)."""
-    r1 = esi_request(
-        "GET",
-        f"{BASE_URL}/universe/systems/{system_id}/",
-        headers=get_esi_headers(), timeout=30
-    )
-    r1.raise_for_status()
-    const_id = r1.json()["constellation_id"]
-
-    r2 = esi_request(
-        "GET",
-        f"{BASE_URL}/universe/constellations/{const_id}/",
-        headers=get_esi_headers(), timeout=30
-    )
-    r2.raise_for_status()
-    return r2.json()["region_id"]
+    from core.esi_route_cache import route_snapshot
+    system = route_snapshot("system_info", system_id, trigger="structure_region")["payload"]
+    constellation = route_snapshot("constellation_info", system["constellation_id"],
+                                   trigger="structure_region")["payload"]
+    return constellation["region_id"]
 
 
 def discover_accessible_structures(
@@ -173,29 +165,27 @@ def search_structures_by_name(
     Returns an empty list when no matches; raises StructureAccessError on auth
     failure so the caller can prompt re-login.
     """
-    headers = auth.get_auth_headers(slot)
-    if not headers:
-        raise StructureAccessError(0, 401, "not authenticated")
-
+    from core.esi_route_cache import route_snapshot
+    from core.esi_private_cache import PrivateSnapshotError
     char = auth.get_character(slot)
     if not char or not char.character_id:
-        raise StructureAccessError(0, 401, "no character id for slot")
-
-    resp = _request_with_retry(
-        f"{BASE_URL}/characters/{char.character_id}/search/",
-        headers=headers,
-        params={"categories": "structure", "search": query, "strict": str(strict).lower()},
-    )
-    if resp.status_code in (401, 403):
-        raise StructureAccessError(0, resp.status_code, resp.text[:160])
-    resp.raise_for_status()
-
-    data = resp.json()
-    return list(data.get("structure", []))
+        raise StructureAccessError(0, 401, "not authenticated")
+    try:
+        snapshot = route_snapshot("structure_search", char.character_id,
+            auth=auth, slot=slot, params={"categories": "structure", "search": query,
+                                       "strict": str(strict).lower()}, trigger="structure_search")
+        return list(snapshot["payload"].get("structure", []))
+    except PrivateSnapshotError as exc:
+        raise StructureAccessError(0, 401, "authorization unavailable or changed") from exc
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if status in (401, 403):
+            raise StructureAccessError(0, status) from exc
+        raise
 
 
 def fetch_structure_orders(
-    structure_id: int, auth: ESIAuth, slot: str = "seller"
+    structure_id: int, auth: ESIAuth, slot: str = "seller", *, cache=None
 ) -> Tuple[list, Optional[datetime], dict]:
     """Fetch every page of a structure's market orders.
 
@@ -203,63 +193,10 @@ def fetch_structure_orders(
     /markets/{id}/orders/ shape so they slot straight into the existing
     scanner pipeline. Raises StructureAccessError on 403/404.
     """
-    headers = auth.get_auth_headers(slot)
-    if not headers:
-        raise StructureAccessError(structure_id, 401, "not authenticated")
-
-    url = f"{BASE_URL}/markets/structures/{structure_id}/"
-    for snapshot_attempt in range(2):
-        first = _request_with_retry(url, headers=headers, params={"page": 1})
-        if first.status_code in (403, 404):
-            raise StructureAccessError(
-                structure_id, first.status_code, first.text[:160]
-            )
-        first.raise_for_status()
-
-        orders: list = list(first.json())
-        expires = _parse_expires(first)
-        total_pages = int(first.headers.get("X-Pages", "1"))
-        first_validator = first.headers.get("Last-Modified")
-        etag = first.headers.get("ETag")
-        changed_page = None
-
-        for page in range(2, total_pages + 1):
-            resp = _request_with_retry(url, headers=headers, params={"page": page})
-            if resp.status_code in (403, 404):
-                raise StructureAccessError(
-                    structure_id, resp.status_code, resp.text[:160]
-                )
-            if resp.status_code >= 400:
-                raise StructureSnapshotError(
-                    f"structure {structure_id} page {page}/{total_pages}: "
-                    f"HTTP {resp.status_code}"
-                )
-            if resp.headers.get("Last-Modified") != first_validator:
-                changed_page = page
-                break
-            orders.extend(resp.json())
-
-        if changed_page is None:
-            validation = "validated" if first_validator else "unvalidated"
-            print(
-                "[ESI-Timing] resource=structure_orders "
-                f"trigger=page_validation decision=ACCEPT pages={total_pages} "
-                f"validation={validation}"
-            )
-            return orders, expires, {
-                "etag": etag,
-                "last_modified": first_validator,
-                "complete": True,
-                "source": "esi_structure_orders",
-            }
-
-        decision = "RETRY" if snapshot_attempt == 0 else "REJECT"
-        print(
-            "[ESI-Timing] resource=structure_orders "
-            f"trigger=page_validation decision={decision} "
-            f"reason=representation_changed page={changed_page}"
-        )
-
-    raise StructureSnapshotError(
-        f"structure {structure_id} changed during both snapshot attempts"
-    )
+    snapshot = _structure_snapshot("structure_orders", structure_id, auth, slot, cache=cache)
+    first = snapshot["page_metadata"][0]
+    return snapshot["payload"], snapshot["expires"], {
+        "etag": first.get("etag"), "last_modified": first.get("last_modified"),
+        "complete": True, "source": "esi_structure_orders",
+        "acquired_at": snapshot["acquired_at"], "durable": snapshot["durable"],
+    }

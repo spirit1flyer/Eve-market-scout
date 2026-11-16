@@ -11,6 +11,14 @@ The [execution plan and status](ESI_ACQUISITION_GOALS.md) were updated after
 checking the original assessment and implementation conversations, including
 the user's corrections. Use that plan for the current work order.
 
+Latest verification: **40/40** in IDE run `11364-1794830978` at 06:11:55
+Central on 2026-11-16. The regional/blueprint/small-route batch and both 404
+regressions cleared that gate. The combined history/consumer-policy/SSO-notice
+batch is now implemented locally and syntax-checked. Its expanded 52-check
+IDE run, user testing, and full phase-1 sign-off stay open. A new general
+compliance audit waits until after Caleb tests; this entry is implementation
+status, not a repeat audit or compliance finding.
+
 The conclusion, evidence and seven findings immediately below describe the
 **pre-implementation baseline**. In particular, public Industry response sharing
 and wallet persistence have since been implemented. The coverage table reflects
@@ -559,3 +567,154 @@ read solely to preserve effective rep modifiers. Raw rep continues to feed
 broker-fee calculations. Two new offline scenarios bring the runner to
 nineteen checks. Syntax/diff checks pass; this newer policy is not yet marked
 runtime-verified. No version bump, commit or push was performed.
+
+
+## Local continuation — private structures/direct paths (2026-11-15)
+
+Implemented locally after the user skipped the initial pending verification:
+
+- Structure books and metadata now share durable exact-resource snapshots only
+  within matching authorization contexts. Cache reads and asynchronous scanner
+  returns check auth; legacy unscoped structure files are not restored. Browse,
+  discovery and Industry roster metadata use the same provider.
+- Tracking's filtered sell-order fallback and station/system/constellation
+  metadata now have exact public keys, in-flight deduplication and persisted
+  payloads/original expiry. Filtered books never stand in for a regional dump.
+- Structure/filtered pagination uses staged successful pages across retry and
+  restart, requires consistent page counts/Last-Modified for multi-page books,
+  rejects later-page 404/invalid rows, and retains good snapshots on failure.
+  Disk replacement is atomic; failed saves are MEMORY_ONLY and retried on reuse.
+- Structure-history hooks preserve acquisition time; repeated observations are
+  idempotent, including daily inferred activity. This does not implement the
+  separate recent regional ESI market-history overlay from plan step 2.
+- Nine synthetic scenarios were added to the existing IDE Ctrl+F12 runner
+  (**28 total**, including the unverified rep additions). Syntax/diff checks
+  passed. No runtime result is claimed; real structure/context/restart and
+  filtered-order reuse still need the user's normal IDE-run evidence.
+
+The broader regional snapshot retry/disk-hardening work, blueprints, remaining
+small routes, consumer ages, history overlay, SSO and notices remain open.
+The cache-expiry and multi-page validation policy follows the existing
+[official ESI best-practices reference](https://developers.eveonline.com/docs/services/esi/best-practices/).
+
+### IDE evidence and structure underbid correction — 2026-11-16
+
+Run `28296-1794823224` verified real structure-book acquisition, atomic save,
+two same-process reuses with original age/expiry, and a new acquisition only
+after expiry. It did not exercise metadata, post-acquisition restart, or the
+28-check runner. Tracking still routed the selected private structure through
+17 public regional per-type requests, all empty, then correctly reused those
+empty public snapshots. That is cache reuse evidence, not correct routing.
+
+The user authorized the correction: Tracking now selects structure books
+through the private provider with the wallet's auth, before any regional lookup.
+Private failures clear the pending view and report FAILED without public
+fallback; changed hub/wallet results are discarded. NPC paths remain regional
+or per-type. The cohesive helpers now live in `gui_tracking_market.py`.
+One isolated routing regression scenario brings Ctrl+F12 to 29 checks. Syntax
+and diff checks passed; the fix and expanded suite still need IDE-run evidence.
+
+The next IDE run, `10604-1794824623`, supplied that evidence on 2026-11-16:
+all 29 isolated checks passed at 04:24:27 Central. The real structure snapshot
+restored with its original age/expiry, refreshed because it was already expired,
+and was reused by Tracking twice (20 orders, ages 15s/18s). The manual report
+counted one structure-order request, zero errors and zero early repeats; no
+public underbid fallback occurred. This clears the observed routing bug.
+Live metadata, rep controls, different authorization contexts and unexpired
+private-book cross-restart reuse remain open, separately from synthetic passes.
+
+## Combined acquisition batch — implemented locally, 2026-11-16
+
+The user authorized regional-order hardening, blueprints and the smaller route
+inventory together, with a combined IDE gate. Regional successful pages now
+persist/reuse independently of acceptance, retain original expiry/validators,
+and feed the existing staged timeout retry path. Every page/count and the full
+order list are validated; full disk replacement is atomic and save failures
+remain distinct from memory acceptance. Force cannot bypass server expiry.
+
+Blueprints now share full authorization-scoped snapshots and pages, preserve
+the existing one-hour preference/slow-page pace, serialize per-character DB
+application, and validate before replacement. Transaction failure returns a
+failure result, preserves old rows and permits persistence retry from accepted
+raw data; valid empty data still succeeds. Context is saved in DB metadata.
+
+Contract exact pages share cross-loop acquisition and transactional reply
+persistence; failures retain good data without advancing success time. Names/IDs
+share isolated positive/negative results across callers; failed batches isolate
+bad members. Universe regions/types/stargates, routes/jump-count misses and
+private structure-name search now share exact snapshots. Public negative entries
+are isolated from private authorization failures.
+
+Eleven new in-app scenarios bring Ctrl+F12 to **40**. Syntax/diff checks passed;
+no new runtime result is claimed. The prior 29 checks and real structure evidence
+remain the latest verified checkpoint. The combined live walkthrough is in
+ESI_DIAGNOSTICS.md. This does not close history overlay, consumer-age policies,
+SSO/notices, late-arriving purchase coverage or the remaining live auth cases.
+
+### Combined IDE results and missing-import fix — 2026-11-16
+
+Both completed runs (`23264-1794828329`, `6424-1794830000`) passed 39/40.
+The sole failing scenario was public metadata/route sharing: the 404 path
+called `_expires` without importing it. The import is now corrected locally.
+The regression requires the exact initial HTTP error and subsequent cached
+negative error, so unrelated exceptions cannot masquerade as expected rejection.
+Syntax/diff checks pass; a corrected 40/40 IDE result is still required.
+
+The completed live walkthrough supplies real regional 192-page acceptance,
+atomic save and same-process reuse; restoration of an expired regional book
+followed by eligible refresh; and 57 blueprints persisted then restored/reused
+twice after restart with original acquisition/expiry. Contract lists reused
+after restart, separately from item-fetch failures (including 400/403/404 and
+204 responses during the large crawl). Neither run observed early repeats.
+Detailed counts and timing are in ESI_DIAGNOSTICS.md. These observations remain
+valid; only Ctrl+F12 needs repeating for this import correction. Unexercised
+routes and authorization cases remain open.
+
+### Filtered-page recovery regression — 2026-11-16
+
+Run `2988-1794830742` passed `metadata_route_sharing` but ended 39/40 at
+06:06:38 Central. `underbid_route_cache` exposed a different interaction:
+the now-working negative writer saved a page-2 404 against the entire order
+query, blocking its recovery. Public negative caching is now restricted to
+single-response metadata/routes; paginated books retain staged-page retry
+behavior. The regression covers both memory and restart recovery, explicit
+HTTP status, retention of the prior complete book/time, missing-page-only
+requests and reuse after successful recovery. Syntax/diff checks pass; the
+corrected 40/40 IDE run remains pending. Existing live evidence is retained.
+
+### Combined batch pass and transcript audit — 2026-11-16
+
+The current-checkout run `11364-1794830978` passed all **40** synthetic checks
+at 06:11:55 Central, including filtered-page recovery and public-negative
+restart reuse. This supersedes the pending corrected-run status above; the
+completed live walkthrough evidence remains valid with its stated limits.
+
+Re-read the original assessment and implementation transcripts, the reputation
+decision, and the current batch discussion directly. The execution plan now
+records batch 1 as cleared for continuation and batches remaining steps 2–4:
+history payload persistence and honest completion; separate scanner/Jita/Stock
+Market consumer policies; SSO cooldowns and accessible distribution notices.
+The next handoff consolidates tests and remaining relevant live checks.
+Trade Refresh scheduling still needs separate agreement before alteration;
+no extra hourly wallet delay, developer-account recheck, or deferred auth/
+versioning redesign is introduced. ESI closeout still precedes the Stock
+Market workflow review, which precedes Industry. Documentation only this turn.
+
+
+### Second batch implementation handoff — 2026-11-16
+
+Recent ESI history now persists separately from archive data with validated
+payloads, original clocks/headers, shared acquisition, transactional replacement,
+save retry, and per-item honest completion. Jita reference reuse has a strict
+24-hour boundary; active Jita scans cannot use the unbounded legacy fallback.
+Stock Market hub load/open/manual paths check one hour from actual acquisition.
+Forced regional callers recheck unexpired data after waiting for a fetch lock.
+SSO token/verify callers share durable Retry-After/error cooldowns, and the
+source/binary disclosure is accessible from the main control bar and included
+by the PyInstaller spec.
+
+These are local source changes with static verification, not new live evidence.
+Twelve synthetic scenarios were added to the prior forty-check in-app runner.
+See ESI_DIAGNOSTICS.md for the 52-check IDE/user handoff and remaining live
+cases. No packaged executable was built, scheduler interval changed, or general
+ESI compliance audit repeated. That audit follows the user's testing.

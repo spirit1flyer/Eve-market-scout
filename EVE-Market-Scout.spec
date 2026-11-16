@@ -28,9 +28,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        # No bundled data files: the alert sound (alert.wav), SDE databases, and
-        # market_history.db all live in %APPDATA%/EVEMarketScout/ and are
-        # supplied/downloaded at runtime. The repo .jpg files are docs art only.
+        ('ESI_DATA_USAGE.md', '.'),
+        # User databases, caches, and sound remain in the local data directory.
     ],
     hiddenimports=[
         # aiohttp and its dependencies

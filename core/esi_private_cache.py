@@ -100,6 +100,19 @@ class PrivateWalletCache:
     resource_paths = RESOURCE_PATHS
     fallback_seconds = FALLBACK_SECONDS
     single_value_resources = ("balance",)
+    paginated_resources = ("journal", "orders", "order_history")
+
+    def _request_url(self, context, resource, query):
+        return f"{BASE_URL}/characters/{context.character_id}/{self.resource_paths[resource]}"
+
+    def _request_query(self, params):
+        return {"datasource": "tranquility", **(params or {})}
+
+    def _wire_query(self, query):
+        return dict(query)
+
+    def _validate_request_payload(self, resource, payload, params):
+        self._validate_payload(resource, payload)
 
     @staticmethod
     def _validate_payload(resource, payload):
@@ -165,7 +178,7 @@ class PrivateWalletCache:
                 raise PrivateSnapshotError("unproven_snapshot")
             if self._identity(context, resource, saved.get("params")) != key:
                 raise PrivateSnapshotError("mismatched_request")
-            self._validate_payload(resource, saved["payload"])
+            self._validate_request_payload(resource, saved["payload"], saved.get("params"))
             json.dumps(saved["payload"], allow_nan=False)
             acquired = _utc(saved["acquired_at"])
             expires = _utc(saved["expires"])
@@ -269,6 +282,7 @@ class PrivateWalletCache:
         pages = self._stage(context, resource, key)
         previous = pages.get(str(page))
         if previous and self.now() < _utc(previous["expires"]):
+            self._validate_request_payload(resource, previous["payload"], query)
             self._event(context, resource, "PAGE_REUSE", "retry",
                         reason="esi_unexpired", pages=1,
                         next_in=f"{(_utc(previous['expires']) - self.now()).total_seconds():.0f}s")
@@ -276,15 +290,15 @@ class PrivateWalletCache:
         for attempt in range(2 if retry_server_errors else 1):
             self._check_context(auth, context)
             response = self.request("GET",
-                f"{BASE_URL}/characters/{context.character_id}/{self.resource_paths[resource]}",
-                headers=headers, params=dict(query), timeout=30)
+                self._request_url(context, resource, query),
+                headers=headers, params=self._wire_query(query), timeout=30)
             if getattr(response, "status_code", 200) < 500 or attempt == 1:
                 break
             # Retain structure discovery's existing one retry on 5xx.
         response.raise_for_status()
         self._check_context(auth, context)
         payload = response.json()
-        self._validate_payload(resource, payload)
+        self._validate_request_payload(resource, payload, query)
         json.dumps(payload, allow_nan=False)
         received = self.now()
         metadata = {name.lower(): value for name, value in response.headers.items()
@@ -318,11 +332,11 @@ class PrivateWalletCache:
         if not headers:
             raise PrivateSnapshotError("not_authenticated")
         self._check_context(auth, context)
-        paginated = resource in ("journal", "orders", "order_history")
+        paginated = resource in self.paginated_resources
         start = (params or {}).get("page", 1)
         if type(start) is not int or not 1 <= start <= 9999:
             raise PrivateSnapshotError("invalid_start_page")
-        query = {"datasource": "tranquility", **(params or {})}
+        query = self._request_query(params)
         payload = []
         metadata = []
         first_validator = None
@@ -364,7 +378,7 @@ class PrivateWalletCache:
             if not paginated or page >= total:
                 break
         self._check_context(auth, context)
-        self._validate_payload(resource, payload)
+        self._validate_request_payload(resource, payload, params)
         json.dumps(payload, allow_nan=False)
         return {"payload": payload, "page_metadata": metadata,
                 "acquired_at": self.now(),

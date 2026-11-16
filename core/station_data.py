@@ -50,24 +50,8 @@ async def _batch_names(client, ids: list[int]) -> dict[int, str]:
 
     Works for any category (regions, solar_systems, stations, …).
     """
-    result: dict[int, str] = {}
-    if not ids:
-        return result
-    BATCH = 500
-    for i in range(0, len(ids), BATCH):
-        batch = ids[i:i + BATCH]
-        try:
-            await client._await_rate_limit_pause()
-            async with client.semaphore:
-                url = f"{ESI_BASE_URL}/universe/names/"
-                async with client.session.post(url, json=batch) as resp:
-                    client._record_response_headers(resp, "/universe/names/")
-                    if resp.status == 200:
-                        for item in await resp.json():
-                            result[item["id"]] = item["name"]
-        except Exception as e:
-            print(f"[StationData] batch names error: {e}")
-    return result
+    from core.esi_lookup_cache import get_lookup_cache
+    return await asyncio.to_thread(get_lookup_cache().names, ids)
 
 
 # ---------------------------------------------------------------------------

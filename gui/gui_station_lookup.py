@@ -19,6 +19,7 @@ sessions because station ownership effectively never changes.
 
 import json
 import os
+import asyncio
 from typing import Optional, TYPE_CHECKING
 
 from core.sound_manager import get_data_dir
@@ -136,12 +137,11 @@ class StationLookup:
         """ESI /universe/stations/{id}/ -> info dict. Derives faction_id from
         race_id since /corporations/{id}/ no longer returns it for NPC corps.
         """
-        url = f"https://esi.evetech.net/latest/universe/stations/{station_id}/"
         try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                sta = await resp.json()
+            from core.esi_route_cache import route_snapshot
+            snapshot = await asyncio.to_thread(route_snapshot, "station_info", station_id,
+                                               trigger="station_lookup")
+            sta = snapshot["payload"]
         except Exception as e:
             print(f"[StationLookup] station fetch error {station_id}: {e}")
             return None
