@@ -17,7 +17,7 @@ from core.esi_get import ESIGetMixin
 from core.esi_lookup_cache import LookupCache
 from core.esi_private_cache import PrivateSnapshotError
 from core.esi_request_cache import PublicRequestCache
-from core.esi_route_cache import RouteSnapshotCache, route_snapshot
+from core.esi_route_cache import RouteSnapshotCache, route_snapshot, validate_route_payload
 from core.market_pages import RegionalPageStore
 from core.market_snapshot import fetch_market_snapshot
 from core.order_cache import OrderCacheStore
@@ -54,6 +54,7 @@ class _RegionalClient:
         self.clock, self.calls = clock, calls if calls is not None else []
         self.fail = None
         self.invalid = None
+        self.zero_duration = False
         self.halted = False
 
     def _check_halted(self):
@@ -78,7 +79,39 @@ class _RegionalClient:
         if self.invalid == "count" and page == 2:
             headers["X-Pages"] = "4"
         payload = [_order(1 if self.invalid == "duplicate" else page)]
+        if self.zero_duration and page == 2:
+            payload[0]["duration"] = 0
         return payload, headers
+
+
+def regional_zero_duration(directory):
+    clock = _Clock()
+    client = _RegionalClient(directory, clock)
+    client.zero_duration = True
+    orders, expiry, count, metadata = asyncio.run(fetch_market_snapshot(client, 10000043))
+    _require(len(orders) == 3 and count == 3 and metadata["complete"] is True,
+             "zero-duration row rejected or truncated the regional snapshot")
+    _require(orders[1]["duration"] == 0 and [row["order_id"] for row in orders] == [1, 2, 3],
+             "zero-duration row was modified or other orders were lost")
+    restarted = _RegionalClient(directory, clock)
+    restored = asyncio.run(fetch_market_snapshot(restarted, 10000043))
+    _require(restored == (orders, expiry, count, metadata) and not restarted.calls,
+             "restart lost zero-duration data/metadata or refetched accepted pages")
+
+
+def order_duration_validation(_directory):
+    for resource in ("type_orders", "structure_orders"):
+        zero, normal = {**_order(), "duration": 0}, _order(2)
+        validate_route_payload(resource, [zero, normal])
+        _require(zero["duration"] == 0 and normal["duration"] == 90,
+                 "order validation modified the original durations")
+        for value in (-1, True, "0", 0.0, None):
+            _rejected(lambda: validate_route_payload(resource, [{**zero, "duration": value}]))
+        for field in ("order_id", "type_id", "location_id", "volume_total"):
+            _rejected(lambda: validate_route_payload(resource, [{**zero, field: 0}]))
+        for changes in ({"price": float("nan")}, {"volume_remain": 3}, {"is_buy_order": 1}):
+            _rejected(lambda: validate_route_payload(resource, [{**zero, **changes}]))
+        _rejected(lambda: validate_route_payload(resource, [zero, zero]))
 
 
 def regional_page_resume(directory):

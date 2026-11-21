@@ -1,8 +1,9 @@
-"""Runtime evidence for ESI activity; never fetches data or changes scheduling.
+"""Runtime evidence for ESI activity; never fetches EVE data or changes scheduling.
 
 HTTP responses are evidence of transport activity, not proof that a caller
 parsed, validated, or saved a snapshot. Existing ESI-Timing events supply those
 separate decisions. Reports explicitly leave unvisited routes unverified.
+Transport failures also schedule a separate background internet access check.
 """
 
 from collections import Counter
@@ -141,6 +142,9 @@ def end_request(token, status=None, headers=None, error=None):
         row["last"] = now
         if announce:
             row["last_print"] = now
+    if error is not None:
+        from core.connectivity import note_connection_failure
+        note_connection_failure(error)
     if announce:
         expiry_text = (f"{max(0, expires - time.time()):.0f}s"
                        if expires is not None else "unknown")

@@ -160,6 +160,7 @@ class MainScanMixin:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         error_msg = None
+        connectivity_message = None
         scan_result = None
         refresh_seconds = 0
 
@@ -222,9 +223,11 @@ class MainScanMixin:
             
             scan_result, refresh_seconds = result
         except Exception as e:
-            error_msg = str(e)
+            error_msg = str(e) or type(e).__name__
             import traceback
             traceback.print_exc()
+            from core.connectivity import connection_failure_message
+            connectivity_message = connection_failure_message(e)
         finally:
             loop.close()
             set_scan_active(False)
@@ -237,7 +240,8 @@ class MainScanMixin:
 
         # Schedule UI updates on main thread
         if error_msg:
-            submit(lambda msg=error_msg: self._show_error(msg))
+            submit(lambda msg=error_msg, connection=connectivity_message:
+                   self._show_error(msg, connection, is_auto))
         else:
             submit(lambda r=refresh_seconds: self._set_refresh_timing(r))
             submit(lambda sr=scan_result, a=is_auto: self._display_deals(sr, a))
@@ -466,10 +470,13 @@ class MainScanMixin:
             f"demand={_step_demand*1000:.0f}ms"
         )
 
-    def _show_error(self, message: str):
-        """Show error dialog."""
-        self.status_label.configure(text="Error occurred")
-        messagebox.showerror("Scan Error", f"Failed to scan market:\n{message}")
+    def _show_error(self, message: str, connectivity_message=None, is_auto=False):
+        """Keep automatic connection failures from waiting on a modal dialog."""
+        self.status_label.configure(text=connectivity_message or "Error occurred")
+        if connectivity_message and is_auto:
+            return  # _scan_complete can schedule the next normal auto-refresh.
+        detail = f"{connectivity_message}\n\n" if connectivity_message else ""
+        messagebox.showerror("Scan Error", f"{detail}Failed to scan market:\n{message}")
 
     def _play_alert(self):
         """Play custom alert sound in a cross-platform way."""

@@ -4,6 +4,63 @@ This instrumentation identifies the running checkout and records evidence of
 actual activity. It does not implement the remaining fixes from the compliance
 audit and does not label an untested route compliant.
 
+## Zero-duration order acceptance — 2026-11-21
+
+Version 3.70 accepts integer `duration=0` in regional, type-filtered and structure
+order books. ESI has returned these rows in successful market responses; the
+previous positive-only duration check rejected their entire regional download.
+The original row and the complete book now survive validation, persistence and
+restart reuse. Negative/noninteger durations, invalid identities, invalid prices,
+bad volumes, duplicate orders and inconsistent pagination remain rejected.
+
+The new `regional_zero_duration` and `order_duration_validation` synthetic checks
+passed, including page restoration without reacquisition and the existing strict
+numeric checks. The existing pagination validation/resume scenarios also passed.
+All 62 release-runner scenarios passed on 2026-11-21 in an isolated copy of the
+staged source, with no network access and synthetic data only. Development
+checkouts may register additional scenarios. Actual ESI acceptance after an IDE
+restart remains pending.
+
+## Internet access diagnosis — 2026-11-21
+
+Implemented locally; syntax checks and all four injected offline scenarios
+passed on 2026-11-21. IDE/live verification is pending. An ESI or SSO connection
+failure now starts a separate anonymous HTTPS check against Microsoft and, if
+needed, Cloudflare. An HTTP response establishes that an independent site was
+reachable; it does not establish why the original EVE request failed. Failed
+probes report unconfirmed internet access, with a separate result when both DNS
+lookups fail. HTTP errors such as 400/404/429/503, invalid market data and cancelled
+requests do not start a check.
+
+The checker uses a single daemon worker, shares concurrent callers, and reuses
+its result for 30 seconds. Probes send no EVE credentials, disable implicit
+`.netrc` authentication, do not follow redirects or read bodies, and retain TLS
+verification. Socket connect/read timeouts are two seconds each. DNS may outlast
+those timeouts; scans wait at most six seconds for a diagnosis, then report that
+the check is pending. No network work runs on the Tk thread. There are no idle,
+startup or ESI Report probes, and probes are excluded from ESI traffic counts.
+
+Look for `[Connectivity] probe=...` and `result=INTERNET_AVAILABLE`,
+`DNS_UNAVAILABLE`, `INTERNET_UNCONFIRMED` or `CHECK_FAILED` in `eve_scout.log`.
+Manual scan errors include the diagnosis. Automatic connection failures show it
+in the status bar without a modal error dialog, allowing the normal retry timer
+to proceed. Empty-message exceptions (including some timeouts) now retain their
+exception class as the scan error instead of appearing successful. Existing
+data/cache policy and the repeated-timeout hard halt are unchanged.
+
+Verification after the next normal IDE restart:
+
+1. Press **Ctrl+F12**. Require PASS for `connectivity_outcomes`,
+   `connectivity_filtering`, `connectivity_singleflight` and
+   `connectivity_auto_status`, plus the two order-duration checks above. Require
+   the overall runner to pass. These checks use synthetic, offline transports
+   and do not invoke the production checker.
+2. During an actual connectivity interruption, an attempted scan should log a
+   `[Connectivity]` result and display its diagnosis. An automatic failure must
+   not wait for an error dialog to be dismissed. Once connectivity returns, a
+   normal eligible scan should succeed. Real outage/recovery and independent
+   site access remain live-unverified.
+
 Latest checkpoint: run `7296-1794837922` passed **52/52** at **08:31:08
 Central, 2026-11-16**, revision `esi-evidence-2-policy-batch`, code
 `df45afeff0d3`. Real restart `21248-1794840356` restored 27 recent-history

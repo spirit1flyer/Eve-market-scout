@@ -35,6 +35,11 @@ def _positive(value):
         raise ValueError("positive integer required")
 
 
+def _nonnegative(value):
+    if type(value) is not int or value < 0:
+        raise ValueError("nonnegative integer required")
+
+
 def validate_route_payload(resource, payload):
     if resource == "structure_search":
         if not isinstance(payload, dict) or not isinstance(payload.get("structure", []), list):
@@ -56,8 +61,11 @@ def validate_route_payload(resource, payload):
             if not isinstance(row, dict):
                 raise ValueError("order object required")
             for field in ("order_id", "type_id", "location_id", "volume_total", "duration"):
+                # ESI can publish zero-duration orders. Preserve the complete
+                # book and original row instead of rejecting a whole region.
+                validator = _nonnegative if field == "duration" else _positive
                 try:
-                    _positive(row[field])
+                    validator(row[field])
                 except ValueError as exc:
                     details = (
                         f"resource={resource} row={row_index} field={field} "
@@ -66,7 +74,8 @@ def validate_route_payload(resource, payload):
                         f"type_id={row.get('type_id')!r} "
                         f"location_id={row.get('location_id')!r}"
                     )
-                    print(f"[OrderValidation] reason=positive_integer_required {details}")
+                    reason = "nonnegative_integer_required" if field == "duration" else "positive_integer_required"
+                    print(f"[OrderValidation] reason={reason} {details}")
                     raise ValueError(f"{exc}; {details}") from exc
             if type(row["volume_remain"]) is not int or not 0 <= row["volume_remain"] <= row["volume_total"]:
                 raise ValueError("invalid remaining volume")

@@ -306,6 +306,10 @@ def _authorization_race(directory):
 
 def run_checks():
     """Return pass/fail; each check prints a concise, payload-free result."""
+    from tools.connectivity_checks import (
+        connectivity_outcomes, connectivity_filtering,
+        connectivity_singleflight, connectivity_auto_status,
+    )
     from tools.wallet_accounting_checks import (
         inventory_cache_lifecycle, inventory_delayed_journal, inventory_partial_refresh,
     )
@@ -320,6 +324,7 @@ def run_checks():
         underbid_route_cache, underbid_structure_routing, public_metadata_cache, structure_observation_reuse,
     )
     from tools.acquisition_batch_checks import (
+        regional_zero_duration, order_duration_validation,
         regional_page_resume, regional_page_validation, regional_atomic_persistence,
         blueprint_roundtrip, blueprint_database_failure, blueprint_context_concurrency,
         lookup_isolation_restart, lookup_concurrent, contract_singleflight,
@@ -357,7 +362,10 @@ def run_checks():
               sso_shared_cooldown_restart, sso_failed_grant_isolation,
               sso_date_and_concurrent_throttle, distribution_notice,
               contract_queued_cooldown, contract_cancelled_cooldown,
-              underbid_regional_expiry_reuse, underbid_regional_fallback)
+              underbid_regional_expiry_reuse, underbid_regional_fallback,
+              connectivity_outcomes, connectivity_filtering,
+              connectivity_singleflight, connectivity_auto_status,
+              regional_zero_duration, order_duration_validation)
     passed = 0
     for check in checks:
         try:
