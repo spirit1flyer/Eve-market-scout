@@ -269,7 +269,7 @@ def distribution_notice(directory):
     from gui.gui_data_notice import notice_path
     import ast
     text = notice_path().read_text(encoding='utf-8')
-    _require('CCP hf.' in text and 'Local storage' in text and 'Removing access' in text,
+    _require('Fenris Creations' in text and 'Local storage' in text and 'Removing access' in text,
              'notice missing required disclosure sections')
     # The source check can inspect the build declaration; a frozen app has
     # already proven packaging by reading the notice from its bundle above.

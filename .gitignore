@@ -103,3 +103,13 @@ _review_2026-05-23/survey_G_misc_gui.md
 _review_2026-05-23/SYNTHESIS.md
 supply.jpg
 REVIEW_findings_2026-07-02.md
+
+# Local-only architecture/review analysis folders (never committed)
+_arch_map_2026-11-26/
+_review_2026-05-23/
+
+# Local-only ESI engineering docs — internal working notes, not for the public
+# repo. ESI_DATA_USAGE.md is the only ESI doc that ships (the in-app notice).
+ESI_AUDIT_2026-11-25.md
+PLAN_ESI_FIXES.md
+ESI_GOALS.md

@@ -1,8 +1,12 @@
 # PLAN: History Reconciler — consolidate market-history import pipelines
 
-Status: **READY TO IMPLEMENT — design agreed with Caleb 2026-07-24.**
-Supersedes the parked 2026-07-23 draft. All open decisions from that draft are resolved
-below except the two listed under "Still open (small)".
+Status: **SHIPPED — live-validated in v3.4/v3.5; the 2026-08-01 startup-hang fix was
+live-validated and committed 2026-08-13 (b8b2942).** Kept as the design record for
+`history/history_reconciler.py`: the ledger, phases A–E, the scanner-priority rule and
+defects D1/D3/D6/D7 are documented nowhere else. Deferred follow-ups are tracked in
+memory (`project_history_reconciler_in_flight`), not here.
+
+Design agreed with Caleb 2026-07-24; supersedes the parked 2026-07-23 draft.
 
 ## Decisions locked 2026-07-24
 

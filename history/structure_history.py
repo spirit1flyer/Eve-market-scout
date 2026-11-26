@@ -5,11 +5,11 @@ order book on every structure scan and infer daily activity from snapshot
 deltas so structure hubs can eventually feed the same safety checks NPC
 hubs feed (velocity gates, ceiling caps, market-crashing flags).
 
-Phase 1 scope: storage + collection only. No consumer reads `structure_daily`
-yet — that arrives in later phases. The derived rollup is still built
-incrementally on every snapshot so it's queryable when consumers wire in.
-
-See `PLAN_structure_history.md` for the full design and phasing.
+Phases 1, 2 and 4 shipped 2026-05-17: storage, collection, the readers
+(`get_history`/`get_history_bulk`) and the Browse Orders views. The derived
+rollup mirrors `MarketHistoryDB.get_history`'s shape so every existing scanner
+safety check consumes it unchanged via `history/history_source.py`. Retention
+is 2 years.
 """
 
 import logging

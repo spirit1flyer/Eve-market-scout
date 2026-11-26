@@ -1,4 +1,4 @@
-"""Accessible source/binary data-use disclosure and CCP notice."""
+"""Accessible source/binary data-use disclosure and Fenris Creations notice."""
 
 from pathlib import Path
 import sys
@@ -16,7 +16,7 @@ def notice_path():
 
 def show_data_notice(parent):
     window = tk.Toplevel(parent)
-    window.title('Data use and CCP notice')
+    window.title('Data use and Fenris Creations notice')
     window.transient(parent)
     frame = ttk.Frame(window, padding=12)
     frame.pack(fill=tk.BOTH, expand=True)

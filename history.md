@@ -13,3 +13,5 @@ life save on my efforts. My timeline for this was roughly since Jan 17 2026 with
 different files, the core scanning app with several features, player stations (which is poorly utilized at the moment),
 A stock market (which is a work in progress), a industry module (work in progress), a contract search/watchlist, NPC watchlist
 (for items sold to NPC for profit), a customizable watchlist that can expand with separate tabs for refined lists, a (TBA...)
+
+While I'm basically using this on my own and don't really think anyone else is using or really following it, you are perfectly welcome to give me feedback, offer assistance or use it/fork it yourself. 

@@ -1,8 +1,8 @@
 # ESI data usage and authorization
 
 EVE Market Scout is an independent, open-source desktop application. It uses
-CCP's EVE Swagger Interface (ESI) and EVE Online SSO. It is not affiliated with
-or endorsed by CCP Games.
+the EVE Swagger Interface (ESI) and EVE Online SSO. It is not affiliated with
+or endorsed by Fenris Creations (formerly CCP Games).
 
 The application is provided for use at your own risk. ESI data can be delayed,
 incomplete, unavailable, or inaccurate, and calculations may contain errors.
@@ -89,7 +89,8 @@ attach them to bug reports.
 You can remove a trading or Industry character from the application and revoke
 the application's authorization from EVE Online account management. Deleting
 the corresponding local authorization file removes the locally stored tokens;
-revoking access through EVE Online invalidates the grant at CCP.
+revoking access through EVE Online invalidates the grant at Fenris Creations.
 
-© 2014 CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related
-logos and images are trademarks or registered trademarks of CCP hf.
+EVE Online® and Fenris Creations™ and all related logos and other elements are
+trademarks of Fenris Creations (formerly CCP hf., rebranded 2026-05-06).
+© 2026 Fenris Creations. All rights reserved.

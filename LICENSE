@@ -1,0 +1,52 @@
+MIT License
+
+Copyright (c) 2026 spirit1flyer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+ADDITIONAL NOTICES
+
+Use at your own risk. This Software reads delayed and potentially incomplete
+public market data and performs estimates on top of it. Its output is not
+financial, trading, or in-game advice of any kind. Verify any decision in EVE
+Online before acting on it. Any in-game or real-world loss arising from use of
+this Software is the sole responsibility of the user.
+
+EVE Online trademark acknowledgment:
+
+EVE Online(R) and Fenris Creations(TM) and all related logos and other elements
+are trademarks of Fenris Creations (formerly CCP hf., rebranded 2026-05-06).
+(C) 2026 Fenris Creations. All rights reserved. All other trademarks are the
+property of their respective owners.
+
+All artwork, screenshots, characters, vehicles, storylines, world facts or other
+recognizable features of the intellectual property relating to these trademarks
+are likewise the intellectual property of Fenris Creations.
+
+This Software is an independent, third-party application. Fenris Creations does
+not endorse it and is not in any way affiliated with it. Fenris Creations is in
+no way responsible for the content or functioning of this Software, nor can it
+be liable for any damage arising from the use of this Software.
+
+The MIT License above applies to this Software's own source code. It does not
+grant any rights in Fenris Creations' intellectual property, nor in data
+retrieved from the EVE Swagger Interface, which remains subject to Fenris
+Creations' own terms.
