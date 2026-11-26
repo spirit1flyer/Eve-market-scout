@@ -31,6 +31,7 @@ from core.esi_public_cache import next_refresh_seconds
 from gui.gui_async import run_coro_blocking
 
 from industry.industry_engine import Recipe, SellInfo, FacilityParams, SellFees
+from industry.industry_blueprint_pricing import BpcPricing  # Owned-panel compatibility
 
 CACHE_FILE = str(get_data_dir() / "industry_market_cache.json")
 SETTINGS_FILE = str(get_data_dir() / "industry_settings.json")
@@ -96,102 +97,6 @@ class JobCostConstants:
                 json.dump(data, f, indent=2)
         except (json.JSONDecodeError, IOError) as e:
             print(f"[IndustryDiag] settings save error: {e}")
-
-
-# ---------------------------------------------------------------------------
-# BPC pricing (Phase 3.4): amortized blueprint-copy cost per run
-# ---------------------------------------------------------------------------
-
-class BpcPricing:
-    """Resolves a blueprint's amortized cost per run for the engine.
-
-    Priority (mirrors the Boosters tab's BPC logic, but committed/public):
-      1. user **write-in** (a price + run count, persisted) — authoritative;
-      2. cheapest cached **contract offer** (`contracts_db.find_bpc_offers`
-         across the supplied hub regions) — price ÷ runs, cheapest per-run wins;
-      3. **unset** — per-run 0, flagged so the GUI can mark the margin overstated.
-
-    A BPO amortizes to ~0 over its unlimited runs, so callers simply don't ask
-    for one (per-run 0). Write-ins persist to industry_settings.json key
-    `bpc_prices` ({blueprint_type_id: {price, runs}}).
-    """
-
-    def __init__(self):
-        self.writeins: Dict[int, dict] = {}
-        self._load()
-
-    def _load(self):
-        if not os.path.exists(SETTINGS_FILE):
-            return
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            raw = data.get("bpc_prices", {})
-            self.writeins = {int(k): v for k, v in raw.items()}
-        except (json.JSONDecodeError, IOError, ValueError, TypeError) as e:
-            print(f"[IndustryDiag] bpc_prices load error: {e}")
-
-    def save(self):
-        try:
-            data = {}
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, "r") as f:
-                    data = json.load(f)
-            data["bpc_prices"] = {str(k): v for k, v in self.writeins.items()}
-            with open(SETTINGS_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"[IndustryDiag] bpc_prices save error: {e}")
-
-    def get_writein(self, blueprint_type_id: int) -> Optional[dict]:
-        return self.writeins.get(int(blueprint_type_id))
-
-    def set_writein(self, blueprint_type_id: int, price: float, runs: int):
-        """Set/update a write-in BPC price+runs; price<=0 clears it."""
-        bid = int(blueprint_type_id)
-        if price and price > 0:
-            self.writeins[bid] = {"price": float(price),
-                                  "runs": max(1, int(runs or 1))}
-        else:
-            self.writeins.pop(bid, None)
-        self.save()
-
-    def resolve(self, blueprint_type_id: int, regions,
-                contracts_db=None) -> dict:
-        """Return {per_run, source, price, runs, offer_count} for a blueprint.
-
-        source ∈ {"write-in", "contract", "unset"}. `regions` is an iterable of
-        region_ids to scan for contract offers (e.g. the buy + sell hub regions).
-        """
-        bid = int(blueprint_type_id)
-        wi = self.writeins.get(bid)
-        if wi and wi.get("price", 0) > 0:
-            runs = max(1, int(wi.get("runs", 1)))
-            return {"per_run": wi["price"] / runs, "source": "write-in",
-                    "price": float(wi["price"]), "runs": runs, "offer_count": 0}
-
-        if contracts_db is not None:
-            best = None
-            count = 0
-            for region in set(regions or []):
-                try:
-                    offers = contracts_db.find_bpc_offers(bid, region)
-                except Exception as e:
-                    print(f"[IndustryDiag] find_bpc_offers failed: {e}")
-                    offers = []
-                count += len(offers)
-                for o in offers:
-                    runs = max(1, int(o.get("runs") or 1))
-                    per = o["price"] / runs
-                    if best is None or per < best["per_run"]:
-                        best = {"per_run": per, "source": "contract",
-                                "price": float(o["price"]), "runs": runs}
-            if best:
-                best["offer_count"] = count
-                return best
-
-        return {"per_run": 0.0, "source": "unset", "price": 0.0,
-                "runs": 0, "offer_count": 0}
 
 
 # ---------------------------------------------------------------------------

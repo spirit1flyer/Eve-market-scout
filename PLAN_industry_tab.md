@@ -1,5 +1,183 @@
 # Industry Tab — Master Project Plan (Rev 7)
 
+Blueprint pricing status 2026-11-16: **Implemented locally after Caleb's explicit
+implementation instruction; IDE runtime verification pending.**
+
+- Persistent manual overrides win over automatic offers and survive restarts.
+  Existing industry_settings.json bpc_prices entries import once transactionally
+  into the new SQLite overrides table. Clearing an imported override cannot
+  resurrect it on restart; legacy JSON and unrelated settings are preserved.
+- Industry loads saved Jita candidates immediately for its calculation pass.
+  On the first run only, it can seed a partial snapshot from already-cached
+  Jita contracts, without representing that seed as a successful daily pull.
+- For BPC-only products, compare each eligible copy's price/run plus material
+  and installation cost/run at that copy's ME, using the existing calculator.
+  Only copies with known positive runs covering the requested batch qualify.
+  Cache calculations by ME within a selection. The winning ME and TE feed the
+  displayed build/material/time estimate. When comparison data is incomplete,
+  choose the cheapest known ISK/run; unknown ME uses the visible build assumption.
+  Never invent one run for a copy whose runs are unknown.
+- Main-browser BPC charges enter batch totals and per-unit profit. Missing or
+  insufficient copy estimates have unpriced margins instead of apparent free
+  blueprint profit. BPO purchase estimates stay separate from manufacturing
+  charges; homogeneous original stacks use price divided by quantity.
+- Owned copies retain their actual owned ME/TE; when possible, price against
+  offers with matching research. Persistent overrides remain shared by blueprint
+  type as before. Owned workers use one pricing snapshot per pass and discard
+  stale results when a newer price refresh supersedes them.
+- Jita IV-4 only (station 60003760, The Forge 10000002): the existing Contracts
+  scheduler checks the durable 24-hour price-feed clock at its normal cycles
+  (initial delay 180 seconds, then hourly). Due jobs use the same ContractsEngine,
+  shared list/immutable-items caches, pacing, cooldowns and transport locks. They
+  fetch missing Jita contents without a separate network implementation. Each
+  daily-feed sync pass uses the same 1,500-item background limit as the existing
+  scheduler, defined once in contracts_engine. A capped pass with pending work
+  logs deferred, preserves saved prices and the daily-success timestamp, and
+  resumes from the Contracts cache on the next eligible hourly cycle (also after
+  restart). Ordinary Contracts hourly work retains its existing policy. The
+  scheduler runs while
+  the app is open; an overdue refresh runs on its next cycle after startup.
+- Complete daily snapshots require a valid list result and zero actual pending
+  station items, not merely a zero attempted-work counter. Failures keep the last
+  saved prices and retry no sooner than an hour. Contract-list save/prune failures
+  now return failure before freshness can advance. An Industry job failure cannot
+  prevent the ordinary Contracts scheduler tasks from continuing.
+- Save clean included blueprint offers from item-exchange contracts only. Exclude
+  mixed bundles, requested-item trades, auctions, user-excluded contracts, expired
+  offers, invalid prices/quantities and unrelated types. Persist contract ID,
+  blueprint type, original/copy, price, quantity, ME/TE/runs, location/region,
+  expiry, observation time and original source-check time. Historical observations
+  survive live-contract pruning; they describe asking prices, not completed sales.
+- Store: %APPDATA%/EVEMarketScout/industry_blueprint_prices.db. Retention defaults
+  to 30 days; UI choices 7 / 30 / 90 / 365 days or Forever. Minimum is seven days;
+  the last saved snapshot and all overrides survive history pruning. Trend UI is
+  deferred; raw dated offers are retained for it.
+- Selected-product details show quote source/date, comparison, research/run data
+  and Save/Clear override controls. Filter settings include feed age and retention.
+  Store notifications marshal through tk_queue to recompute browser and Owned
+  views; refreshes arriving during a compute queue one follow-up pricing pass.
+
+Validation: syntax/import and static callback checks passed. Eight isolated
+pricing scenarios are registered in the existing Ctrl+F12 suite (66 total,
+including two product-family filter checks):
+override restart/migration, material-aware choice, fallback/capacity/originals,
+history/retention, clean Jita scope, daily restart/failure/retry and capped
+multi-pass backlog continuation, transactional
+snapshot failure, and contract-list persistence failure. All clocks, stores,
+locks, requesters and settings are fixture-local; no live data/global transport
+patching. These runtime scenarios have NOT been run in the IDE yet. The pure
+industry_engine formulas are unchanged. No application was launched or controlled.
+
+Next verification: restart main.py from this checkout and press Ctrl+F12; expect
+all eight blueprint_* named PASS lines, industry_capital_families and
+industry_structure_families PASS, and passed=66 total=66 network=none
+data=synthetic. In Industry > Build browser, Show a BPC-only product with saved
+quotes; reconcile selected ME, blueprint/run allocation, batch totals and time.
+Save an override, restart and verify persistence; clear it and verify automatic
+quotes return. Check BPO upfront reference, insufficient copy runs and retention
+choices. The existing scheduler's first cycle is delayed three minutes: watch
+[BlueprintPrices] daily Jita refresh / snapshot / saved or failure logs; failures
+must preserve the prior snapshot/source time. No successful production daily pull
+or post-change restart has yet been observed. APP_VERSION remains 3.69 live;
+no commit or push is included.
+
+Filter coverage correction 2026-11-16: **Sub-cap only now covers capital
+ships/components/rigs, XL turrets/launchers/ammo, superweapons (including
+phenomena generators and Reapers), clone vat/recloner modules, burst projectors,
+carrier fighters and capital-only modules inside shared market branches.**
+Classification lives in industry_classification.py and uses exact SDE market
+ancestors, dedicated item groups and narrow mixed-branch module rules. Do not
+exclude all Extra Large or Siege Modules: XL shield boosters, Bastion,
+medium/large industrial cores and covert jump portals remain available. Titan
+and Rorqual jump portals are capital; the covert variant is subcapital.
+
+**Hide Upwell / sov includes hulls, equipment/modules, rigs, structure ammo
+and fighters, sovereignty structures/upgrades (1272) and orbital infrastructure
+(1410), including skyhooks.** Hide POS uses Starbase Structures (1285), whose
+descendants include towers, weapon batteries, maintenance/hardening arrays,
+silos, assembly arrays, laboratories and other POS modules. Cargo Containers
+(379, under Deployable Structures 404) are excluded from neither family;
+ordinary ship equipment such as Nanofiber Internal Structures stays outside
+these exclusions. Classification changes only; settings still apply on Show.
+Two additional offline checks exercise manager metadata wiring for these
+families and ordinary neighboring products; registered for Ctrl+F12, runtime
+pending. Syntax/import checks and read-only local SDE inspection cover the
+change; live verification remains pending after IDE restart. Restart, keep
+Sub-cap only / Hide Upwell / sov / Hide POS checked and click Show: screenshot
+capital weapons, phenomena/recloner modules and sovereignty products should
+disappear; containers and ordinary subcapital modules should remain eligible.
+No version bump or commit.
+
+Status 2026-11-16: **Corrected Industry layout implemented locally; IDE visual
+verification pending.** Caleb rejected the initial toolbar/cascading-dropdown
+layout and clarified the intended interaction. This design supersedes that
+first implementation:
+
+- Left: two distinct stacked panels, Class browser above Matching products.
+  Each retains its header and compact selection/count summary when collapsed.
+  Browse items expands the top panel's technology dropdown and classic EVE
+  market-group tree; Results expands the lower panel's product list. Expanding
+  either panel shrinks the other's body, keeping both summaries visible.
+- Top right: global filter settings, search and calculation settings, in their
+  own scrollable area. Bottom right: the selected individual build, with its
+  own scrolling. The column divider and right-side horizontal divider resize.
+- Choose broad presets (Owned only / Profitable only / technology, etc.) or
+  drill down through market branches. These changes remain pending until Show.
+  Show applies a plain snapshot, shrinks the whole Class browser panel and
+  expands Matching products beneath it, keeping the class selection visible.
+  Clicking a product opens its build on the bottom right. Reopen Browse items
+  to change classes; the previous selections remain highlighted. Recalculation
+  and sorting use the last shown selection while pending choices are edited.
+- The class tree uses native extended selection: Ctrl-click adds/removes
+  classes and Shift-click selects a range. Results are the union of selected
+  classes and their descendants, with no duplicate product rows for overlapping
+  parent/child selections. Adding a class replaces Everything; choosing
+  Everything replaces class selections. Deselecting every class yields no
+  results, rather than silently reverting to Everything.
+- Global browser exclusions still combine across categories: Sub-cap only
+  (excludes capitals), missing input costs, Upwell, POS, ignored items, blueprint
+  source (All / BPO only / BPC-only), min profit and unpriced-output visibility.
+  Owned only and Profitable only are independent flags; search intersects all
+  active filters. Nothing bypasses global filters during direct search.
+- Category membership uses actual root-first SDE market-group IDs, including
+  every descendant of a selected parent. Only branches containing manufacturable
+  products appear. Technology dropdown: Everything / T1 + Faction / T1 /
+  Faction / T2 / T3. Initial selection remains T1 + Faction; invention/T2/T3
+  costing limitations remain displayed. The tree contains classes/groups only,
+  never individual products; those appear in Matching products or via search.
+  The local SDE confirms Light Missiles contains Standard, Advanced High
+  Precision, Advanced High Damage and Faction subgroups, so selecting the
+  Light Missiles parent includes those variants under the chosen tech filter.
+- Initial exclusions: Sub-cap only, missing input costs, ignored items. Other
+  flags start off; blueprint source starts All; unpriced outputs stay hidden.
+  Missing inputs follow the existing diagnostic semantics. No ranked results
+  appear until the first Show; it is valid to press Show without drilling down.
+- Owned only uses cached blueprints across the roster and responds to blueprint
+  pulls/removals. It does not apply owned ME/TE or BPC prices to this ranking.
+  Dedicated Owned BPO/BPC and Characters panels retain their existing behavior.
+
+`gui_industry_filters.py` owns the tree, pending/applied choices and filtering;
+`gui_industry_browser.py` owns the two-column layout, settings and result actions.
+The UI-only stage preserved pricing and acquisition. The subsequent pricing
+integration described above intentionally changes calculation orchestration;
+current static analysis resolves all 68 internal callback targets. Pure engine
+formulas and the fee assumptions are unchanged.
+Whitespace, privacy and file-size checks pass. No app was launched or controlled. No version
+bump, commit or push is included; APP_VERSION remains 3.69 live.
+
+Live check: restart main.py from the IDE, open Industry > Build browser, open
+Browse items, Ctrl-click separate classes and Shift-click a range, choose tech
+and global presets, then Show. Confirm Class browser keeps its compact summary
+above the expanded Matching products panel. Verify the combined class results,
+overlapping parent/child selections without duplicates and Everything handling.
+Collapse/reopen Results, then reopen Browse items and confirm all class
+selections survive. Select a result for the bottom-right build. Check that
+pending edits apply only after Show, zero selected classes, global-only Show,
+sorting, research/history actions and pane resizing.
+`[IndustryDiag] browser_show` reports the applied path/tech/count plus
+`selector_open=False results_open=True`; filter diagnostics report class
+summaries/group IDs, exclusions and search scope.
+
 Status 2026-11-16: **GUI split into three modules before the filtering redesign.**
 `gui_industry.py` retains the manager, data-refresh/calculation coordination,
 metadata and SDE-update lifecycle. `gui_industry_browser.py` contains the existing

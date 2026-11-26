@@ -310,6 +310,14 @@ def run_checks():
         connectivity_outcomes, connectivity_filtering,
         connectivity_singleflight, connectivity_auto_status,
     )
+    from tools.industry_filter_checks import (
+        industry_capital_families, industry_structure_families,
+    )
+    from tools.industry_pricing_checks import (
+        blueprint_override_restart, blueprint_material_aware, blueprint_fallback_capacity,
+        blueprint_history_retention, blueprint_contract_scope, blueprint_daily_restart,
+        blueprint_snapshot_save_failure, blueprint_contract_list_failure,
+    )
     from tools.wallet_accounting_checks import (
         inventory_cache_lifecycle, inventory_delayed_journal, inventory_partial_refresh,
     )
@@ -363,6 +371,10 @@ def run_checks():
               sso_date_and_concurrent_throttle, distribution_notice,
               contract_queued_cooldown, contract_cancelled_cooldown,
               underbid_regional_expiry_reuse, underbid_regional_fallback,
+              blueprint_override_restart, blueprint_material_aware, blueprint_fallback_capacity,
+              blueprint_history_retention, blueprint_contract_scope, blueprint_daily_restart,
+              blueprint_snapshot_save_failure, blueprint_contract_list_failure,
+              industry_capital_families, industry_structure_families,
               connectivity_outcomes, connectivity_filtering,
               connectivity_singleflight, connectivity_auto_status,
               regional_zero_duration, order_duration_validation)

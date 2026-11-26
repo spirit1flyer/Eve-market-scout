@@ -40,6 +40,11 @@ from contracts import contracts_esi
 from contracts.contracts_db import ContractsDB, scope_key_for_region
 
 
+# Shared cap for each background sync pass, including Industry's daily feed.
+# Explicit, user-confirmed foreground crawls may still use an uncapped sync.
+BACKGROUND_ITEMS_PER_CYCLE = 1500
+
+
 def _print(msg: str) -> None:
     print(f"[ContractDiag] {msg}")
 
@@ -81,7 +86,8 @@ class ContractsEngine:
 
     def __init__(self, get_client: Callable,
                  db: Optional[ContractsDB] = None,
-                 exclude_ids_provider: Optional[Callable[[], set]] = None):
+                 exclude_ids_provider: Optional[Callable[[], set]] = None,
+                 fetch_region_list: Optional[Callable] = None):
         """
         get_client: callable returning the shared ESIClient.
         exclude_ids_provider: callable returning a set of excluded contract_ids
@@ -90,6 +96,7 @@ class ContractsEngine:
         self.get_client = get_client
         self.db = db or ContractsDB.singleton()
         self.exclude_ids_provider = exclude_ids_provider
+        self._fetch_region_list = fetch_region_list or contracts_esi.fetch_region_contract_list
 
     def _excludes(self) -> set:
         if self.exclude_ids_provider is None:
@@ -152,7 +159,7 @@ class ContractsEngine:
         etag = rec.get("etag") if rec else None
 
         if not fresh or force:
-            result = await contracts_esi.fetch_region_contract_list(
+            result = await self._fetch_region_list(
                 client, region_id, etag=etag
             )
             summary["list_status"] = result["status"]
@@ -167,9 +174,15 @@ class ContractsEngine:
                 new_ids = fresh_ids - cached_ids
                 gone_ids = cached_ids - fresh_ids
 
-                self.db.upsert_list_rows(region_id, contracts)
+                saved = self.db.upsert_list_rows(region_id, contracts)
+                if saved != len(contracts):
+                    summary.update(ok=False, reason="list_save_failed")
+                    return summary
                 if gone_ids:
                     self.db.prune_contracts(gone_ids)
+                if self.db.get_contract_ids_for_region(region_id) != fresh_ids:
+                    summary.update(ok=False, reason="list_snapshot_incomplete")
+                    return summary
                 self.db.set_scope_freshness(
                     scope_key, region_id, result["expires"], result["etag"], 200
                 )

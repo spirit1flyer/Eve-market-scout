@@ -1,6 +1,7 @@
 """Industry tab manager, data acquisition coordination and calculation context.
 
-The browser/layout/filtering lives in gui_industry_browser; selected-item
+The browser/layout lives in gui_industry_browser, selectors in
+gui_industry_filters; selected-item
 breakdowns, build time and dialogs live in gui_industry_details. Calculation
 rules remain in industry_engine and data comes from industry_market_data.
 Shared display helpers remain importable here for the Owned BPO/BPC panel.
@@ -26,9 +27,11 @@ from industry.industry_skills import IndustrySkills
 from industry.industry_standings import IndustryStandings
 from industry.industry_blueprints import IndustryBlueprintsDB, BlueprintPuller
 from industry.industry_ignore import IgnoreList
-from gui.industry.gui_industry_browser import (
-    IndustryBrowserMixin, CATEGORIES, DEFAULT_TECH, TECH_ORDER, tech_label,
-)
+from industry.industry_classification import classify_product
+from contracts.contracts_lists import ExcludeList
+from gui.industry.gui_industry_browser import IndustryBrowserMixin
+from gui.industry.gui_industry_filters import DEFAULT_TECH
+from gui.industry.gui_industry_pricing import IndustryPricingMixin
 # Preserve the helper imports used by the existing Owned BPO/BPC panel.
 from gui.industry.gui_industry_details import (
     IndustryDetailsMixin, CLR_GOOD, CLR_OK, CLR_BAD, CLR_MUTED, CLR_OVERRIDE,
@@ -51,22 +54,7 @@ def _is_dummy_recipe(recipe: Optional[dict]) -> bool:
     return (len(mats) == 1 and mats[0][1] == 1 and mats[0][0] in MINERALS)
 
 
-# Market-group ancestry substrings that mark big-investment classes the user
-# usually wants hidden. Capital catches capital ships + capital components/rigs/
-# modules (incl. "anticapital"). Upwell hulls are matched by their four
-# unambiguous hull group names — NOT the bare word "structure", which also
-# appears in module groups like "Nanofiber Internal Structures".
-CAPITAL_MATCHERS = ("capital",)
-# Upwell structures (Citadels/Engineering Complexes/Refineries/FLEX) vs the
-# older POS gear (Control Towers/arrays/silos under "Starbase Structures").
-# Kept separate so each can be hidden independently — NOT the bare word
-# "structure", which also tags module groups like "Nanofiber Internal Structures".
-UPWELL_MATCHERS = ("citadels", "engineering complexes", "refineries",
-                   "flex structures")
-POS_MATCHERS = ("starbase structures",)
-
-
-class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
+class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin, IndustryPricingMixin):
     """Coordinate the Industry page and its existing calculation lifecycle."""
 
     def __init__(self, notebook: ttk.Notebook,
@@ -90,7 +78,7 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         # Phase 3: owned BPO/BPC store + ESI puller + BPC pricing (3.4).
         self.bp_db = IndustryBlueprintsDB.singleton()
         self.bp_puller = BlueprintPuller(self.roster, self.bp_db)
-        self.bpc_pricing = BpcPricing()
+        self.bpc_pricing = BpcPricing(excluded_ids_provider=ExcludeList.singleton().ids)
         try:
             from contracts.contracts_db import ContractsDB
             self.contracts_db = ContractsDB.singleton()
@@ -101,11 +89,13 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         self.ignore = IgnoreList.singleton()     # shared with Owned panel
         self.results: Dict[int, dict] = {}       # tid -> calc result
         self.name_map: Dict[int, str] = {}       # tid -> name
-        self.category_map: Dict[int, str] = {}   # tid -> category label
+        self.market_paths = {}                  # product -> root-first market IDs
+        self.market_group_names = {}            # market ID -> display name
+        self.blueprint_map = {}                 # product -> blueprint type ID
         self.meta_map: Dict[int, Optional[int]] = {}  # tid -> meta_group_id
         self.bpo_map: Dict[int, bool] = {}       # tid -> has buyable BPO (else BPC-only)
         self.capital_map: Dict[int, bool] = {}   # tid -> is capital-class (excl. by sub-cap filter)
-        self.upwell_map: Dict[int, bool] = {}    # tid -> is Upwell structure hull (excl. by Hide Upwell)
+        self.upwell_map: Dict[int, bool] = {}    # tid -> Upwell/sov/orbital infrastructure
         self.pos_map: Dict[int, bool] = {}       # tid -> is POS/starbase gear (excl. by Hide POS)
         self.tech_selected = set(DEFAULT_TECH)   # active tech-level buckets
         self.display_order: List[int] = []       # filtered+sorted tids
@@ -119,16 +109,17 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         self._last_refresh = 0.0
         self._chain_rows: Dict[str, int] = {}    # tree iid -> type_id
         self._iid_seq = 0
-        self._active_category = "All"
         self._compute_run_seq = 0
         self._last_filter_diag = None
         self._filter_diag_after = None
         self._last_detail_diag = None
         self._pending_sde_recompute = False
+        self._pending_pricing_recompute = False
         self.sort_col = "profit"
         self.sort_reverse = True
 
         self._build_tab()
+        self.bpc_pricing.store.subscribe(lambda: submit(self._on_blueprint_prices_changed))
         if self.sde.is_available():
             self.frame.after(800, lambda: self._compute(refetch=True))
         else:
@@ -162,6 +153,7 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         sell = self._hub_cfg(self.sell_var)
         return {
             "me": _f(self.me_var, 10.0),
+            "te": _f(self.te_var, 20.0),
             "batch": max(1, int(_f(self.batch_var, 1.0))),
             "buy_station": buy["station_id"],
             "buy_region": buy["region_id"],
@@ -272,10 +264,13 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
                 fac = self._facility_from(p)
                 provider = self._provider_from(p)
                 calc = IndustryCalculator(provider, buildable=lambda t: False)
+                self.bpc_pricing.bootstrap(self.contracts_db, set(self.blueprint_map.values()) - {None})
+                price_view = self.bpc_pricing.view()
                 results = {}
                 for tid in products:
-                    res = calc.calc_full(tid, fac, fees,
-                                         me=p["me"], batch=p["batch"])
+                    res = self.bpc_pricing.cost_build(
+                        calc, fac, fees, tid, self.blueprint_map.get(tid),
+                        self.bpo_map.get(tid, True), p, price_view)
                     if res:
                         results[tid] = res
             except Exception as e:
@@ -300,7 +295,7 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         threading.Thread(target=_work, daemon=True, name="IndustryCompute").start()
 
     def _build_metadata(self, products: List[int]):
-        """Resolve names + categories once (bulk)."""
+        """Resolve names, exact market paths and blueprint metadata once."""
         infos = self.names.get_type_info_bulk(products)
         names = self.names.get_type_names_bulk(products)
         # Classify buyable-BPO vs BPC-only: an item has a buyable BPO iff its
@@ -309,7 +304,7 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         bp_of = {tid: self.sde.get_blueprint_for_item(tid) for tid in products}
         bp_infos = self.names.get_type_info_bulk([b for b in bp_of.values() if b])
         self.name_map = names
-        cat = {}
+        paths = {}
         meta = {}
         has_bpo = {}
         is_cap = {}
@@ -318,40 +313,23 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
         for tid in products:
             info = infos.get(tid)
             mg_id = info.market_group_id if info else None
-            ancestry = self._ancestry_names(mg_id)
-            cat[tid] = self._category_of(ancestry)
+            paths[tid] = tuple(self.names.get_market_group_ancestry(mg_id))
             meta[tid] = info.meta_group_id if info else None
             bpinfo = bp_infos.get(bp_of.get(tid))
             has_bpo[tid] = bool(bpinfo and bpinfo.market_group_id is not None)
-            is_cap[tid] = any(m in ancestry for m in CAPITAL_MATCHERS)
-            is_upwell[tid] = any(m in ancestry for m in UPWELL_MATCHERS)
-            is_pos[tid] = any(m in ancestry for m in POS_MATCHERS)
-        self.category_map = cat
+            is_cap[tid], is_upwell[tid], is_pos[tid] = classify_product(
+                paths[tid], names.get(tid, ""), info.group_id if info else None)
+        self.market_paths = paths
+        self.market_group_names = {
+            gid: self.names.get_market_group_name(gid) or str(gid)
+            for gid in {gid for path in paths.values() for gid in path}
+        }
+        self.blueprint_map = bp_of
         self.meta_map = meta
         self.bpo_map = has_bpo
         self.capital_map = is_cap
         self.upwell_map = is_upwell
         self.pos_map = is_pos
-
-    def _ancestry_names(self, mg_id: Optional[int]) -> str:
-        """Lowercased ' | '-joined market-group ancestry name string (leaf
-        included), used for category + capital/structure classification."""
-        if mg_id is None:
-            return ""
-        try:
-            ancestry = self.names.get_market_group_ancestry(mg_id)
-        except Exception:
-            return ""
-        return " | ".join(
-            (self.names.get_market_group_name(m) or "").lower() for m in ancestry)
-
-    def _category_of(self, ancestry: str) -> str:
-        if not ancestry:
-            return "Other"
-        for label, matchers in CATEGORIES:
-            if matchers and any(m in ancestry for m in matchers):
-                return label
-        return "Other"
 
     def _compute_done(self, results, err, note, refetch):
         self._computing = False
@@ -376,9 +354,13 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
             self.progress_label.configure(
                 text=note or f"{len(results)} items computed")
         self._update_tech_note()
+        self._refresh_categories()
         self._rebuild_list()
         if self.selected in self.results:
             self._show_detail(self.selected)
+        if self._pending_pricing_recompute:
+            self._pending_pricing_recompute = False
+            self.frame.after_idle(self._on_blueprint_prices_changed)
 
     def _on_update_sde(self):
         """Rebuild type/meta and Industry recipe SDEs, then recompute."""
@@ -407,7 +389,9 @@ class IndustryTabManager(IndustryBrowserMixin, IndustryDetailsMixin):
     def _invalidate_sde_metadata(self):
         """Force names/classification to rebuild against the current SDE."""
         self.name_map = {}
-        self.category_map = {}
+        self.market_paths = {}
+        self.market_group_names = {}
+        self.blueprint_map = {}
         self.meta_map = {}
         self.bpo_map = {}
         self.capital_map = {}

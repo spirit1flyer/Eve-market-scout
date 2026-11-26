@@ -95,6 +95,7 @@ class IndustryDetailsMixin:
                   foreground=CLR_MUTED).pack(side=tk.LEFT)
 
         self._build_built_by(tid)
+        self._build_blueprint_pricing(tid, r)
         self._build_margins(r)
         self._build_chain(r, tid)
         self._build_totals(r)
@@ -126,8 +127,11 @@ class IndustryDetailsMixin:
             ttk.Label(row, text=label, width=22).pack(side=tk.LEFT)
             ttk.Label(row, text=f"net {isk(net)}", width=16,
                       foreground=CLR_MUTED).pack(side=tk.LEFT)
+            quote = r.get("_blueprint") or {}
+            unavailable = ("blueprint estimate incomplete" if quote.get("is_copy")
+                           and not quote.get("sufficient") else "no history")
             ptxt = (f"{profit:+,.0f} ({margin:+.1f}%)"
-                    if profit is not None else "no history")
+                    if profit is not None else unavailable)
             ttk.Label(row, text=ptxt, font=("Segoe UI", 9, "bold"),
                       foreground=margin_color(margin)).pack(side=tk.RIGHT)
         ttk.Label(frame,
@@ -247,6 +251,8 @@ class IndustryDetailsMixin:
         self._kv(frame, "Materials:", f"{isk(r['material_cost'])} ISK")
         self._kv(frame, f"Job install cost (EIV {isk(r['eiv'])}):",
                  f"{isk(r['job_cost'])} ISK")
+        if r.get("blueprint_cost"):
+            self._kv(frame, "Blueprint copy cost:", f"{isk(r['blueprint_cost'])} ISK")
         self._kv(frame, f"Total build ({r['units']} units):",
                  f"{isk(r['total_build'])} ISK", bold=True)
         self._kv(frame, "Build cost / unit:", f"{isk(r['unit_cost'])} ISK", bold=True)
@@ -303,7 +309,9 @@ class IndustryDetailsMixin:
                       foreground=CLR_MUTED).pack(anchor="w", padx=8)
             return
 
-        te = self._te_value()
+        quote = r.get("_blueprint") or {}
+        te = (quote["te"] if quote.get("is_copy") and quote.get("te") is not None
+              else self._te_value())
         params, char_id, state = self._build_time_params(tid, te)
         t = manufacturing_time(float(base), r["batch"], params)
         per_run = t["per_run_seconds"]

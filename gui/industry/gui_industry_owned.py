@@ -245,8 +245,9 @@ class OwnedBlueprintsPanel:
 
         def work():
             results = {}
+            pricing_view = self.bpc_pricing.view() if self.bpc_pricing else None
             for r in snapshot:
-                bpc = self._resolve_bpc(r, regions)
+                bpc = self._resolve_bpc(r, regions, pricing_view)
                 try:
                     res = calc.calc_full(
                         r["product_tid"], fac, fees, me=r["me"], batch=1,
@@ -266,7 +267,7 @@ class OwnedBlueprintsPanel:
                 f"zero_input_products={summary['zero_input_products']} "
                 f"zero_input_rows={summary['zero_input_rows']}"
             )
-            submit(lambda: self._costs_done(results))
+            submit(lambda: self._costs_done(results, run_id))
 
         threading.Thread(target=work, daemon=True, name="OwnedBPCompute").start()
 
@@ -346,7 +347,7 @@ class OwnedBlueprintsPanel:
             self.on_hubs_changed()
         self._update_struct_button()
 
-    def _resolve_bpc(self, row: dict, regions) -> dict:
+    def _resolve_bpc(self, row: dict, regions, view=None) -> dict:
         """Amortized blueprint cost for one owned blueprint.
 
         A BPO amortizes to ~0 (one-time buy, unlimited runs). A BPC resolves via
@@ -357,10 +358,14 @@ class OwnedBlueprintsPanel:
             return {"per_run": 0.0, "source": "bpo", "price": 0.0,
                     "runs": row.get("runs", 0), "offer_count": 0}
         bpc = self.bpc_pricing.resolve(row["bp_type_id"], regions,
-                                       self.contracts_db)
+                                       self.contracts_db, view=view,
+                                       comparable_me=row["me"], comparable_te=row["te"])
         return bpc
 
-    def _costs_done(self, results: dict):
+    def _costs_done(self, results: dict, run_id=None):
+        if run_id is not None and run_id != self._compute_run_seq:
+            _print(f"cost_done discarded_stale_run={run_id}")
+            return
         self.results = results
         self._fill_tree()
         if self.selected is not None:
@@ -595,7 +600,11 @@ class OwnedBlueprintsPanel:
             runs = int((runs_str or "1").strip())
         except ValueError:
             runs = 1
-        self.bpc_pricing.set_writein(bp_type_id, price, runs)
+        try:
+            self.bpc_pricing.set_writein(bp_type_id, price, runs)
+        except Exception as exc:
+            self.set_status(f"Industry: invalid BPC override: {exc}")
+            return
         self.set_status("Industry: saved BPC price" if price > 0
                         else "Industry: cleared BPC price")
         self.refresh()  # recompute with the new blueprint cost

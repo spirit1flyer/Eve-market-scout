@@ -2,6 +2,9 @@
 
 The design has NO separate watchlist poller — the hourly contract pull IS the
 engine. Each cycle:
+  0. When due, save Industry's daily Jita IV-4 blueprint-price snapshot through
+     the same engine. Previously saved contents are reused; failures do not
+     prevent the ordinary hourly contract tasks below.
   1. Refresh every cached trade-hub scope (station-scoped at the hub's main
      station) regardless of what the user has selected, so a hub watched from
      another screen stays live. The freshness gate + ETag make a no-change
@@ -24,6 +27,7 @@ from typing import Callable, Optional
 
 from core.config import get_enabled_hubs, get_hub_config
 from contracts.contracts_lists import ContractWatchlist
+from contracts.contracts_engine import BACKGROUND_ITEMS_PER_CYCLE as ITEMS_PER_CYCLE
 
 
 # Hourly cadence; first run delayed so startup isn't ESI-heavy. ESI caches the
@@ -31,11 +35,11 @@ from contracts.contracts_lists import ContractWatchlist
 PULL_INTERVAL_SECONDS = 3600
 FIRST_RUN_DELAY_SECONDS = 180
 
-# Max item fetches per region per cycle. A busy station (Jita IV-4 ~30k) must
+# Max item fetches per background sync pass. A busy station (Jita IV-4 ~30k) must
 # NOT be crawled in one blocking shot from the background — that's what froze
 # the UI. With a watchlist present we drain the backlog gradually over cycles;
 # the search tab does the fast full crawl on explicit, warned user action.
-ITEMS_PER_CYCLE = 1500
+# ITEMS_PER_CYCLE is shared with the Industry feed via contracts_engine.
 
 
 def _print(msg: str) -> None:
@@ -138,6 +142,13 @@ class ContractsScheduler:
 
     async def _cycle_async(self) -> None:
         _print("hourly cycle begin")
+        # Industry's daily Jita feed shares this worker and ContractsEngine.
+        # A failed/partial pass keeps the previous durable price snapshot.
+        from industry.industry_contract_refresh import refresh_blueprint_contracts
+        try:
+            await refresh_blueprint_contracts(self.engine)
+        except Exception as exc:
+            _print(f"blueprint price job failed; continuing ordinary contracts: {exc}")
         # 1+2. Trade-hub scopes + watchlist match per region.
         #
         # Item fetching is the expensive part (one call per contract; Jita is

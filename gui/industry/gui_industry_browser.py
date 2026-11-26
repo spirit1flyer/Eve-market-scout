@@ -1,51 +1,24 @@
 """Industry page layout, product browser, filters and list interactions.
 
 IndustryBrowserMixin uses the shared manager state; it owns no separate cache
-or calculation lifecycle. This keeps the existing callbacks and filter behavior.
+or calculation lifecycle. Product selectors live in gui_industry_filters.
 """
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Optional
 
 from core.config import get_enabled_hubs
 from gui.gui_window_utils import make_scrollable
 from gui.industry.gui_industry_characters import CharactersPanel
-from industry.industry_diagnostics import format_counts
-from industry.industry_ignore import is_auto_hidden
+from gui.industry.gui_industry_filters import (
+    IndustryFiltersMixin,
+)
 from gui.industry.gui_industry_details import (
     CLR_GOOD, CLR_OK, CLR_BAD, CLR_MUTED, isk_m, show_ignore_manager, _print,
 )
 
-# Category chips -> substrings matched against an item's market-group ancestry.
-CATEGORIES = [
-    ("All", None),
-    ("Ships", ("ships",)),
-    ("Modules", ("ship equipment",)),
-    ("Ammo", ("ammunition & charges",)),
-    ("Components", ("components",)),
-]
 
-
-# Tech-level filter buckets. meta_group_id → bucket (catch-all to T1 so nothing
-# vanishes for unlisted/storyline/special-edition metas). 2=Tech II, 14=Tech III,
-# 4=Faction; everything else (1, None, 3, 5, 6, 17, 19, …) is T1. Needs the
-# SDE meta_group_id column (re-download); without it everything reads as T1.
-TECH_ORDER = ["T1", "Faction", "T2", "T3"]
-DEFAULT_TECH = {"T1", "Faction"}  # T2/T3 cost modeling not built yet
-
-
-def tech_label(meta_group_id: Optional[int]) -> str:
-    if meta_group_id == 2:
-        return "T2"
-    if meta_group_id == 14:
-        return "T3"
-    if meta_group_id == 4:
-        return "Faction"
-    return "T1"
-
-
-class IndustryBrowserMixin:
+class IndustryBrowserMixin(IndustryFiltersMixin):
     """Layout, filtering and list callbacks for IndustryTabManager."""
 
     # ===================================================================== build
@@ -54,209 +27,84 @@ class IndustryBrowserMixin:
         outer = ttk.Frame(self.notebook)
         self.notebook.add(outer, text="Industry")
         self.frame = outer
-
-        # Industry-level sub-notebook: Top Profit T1 (here) + Characters
-        # (Phase 2). Phases 5-7 add T2/T3/Extra; Phase 3 adds Owned BPO/BPC.
         self.sub_nb = ttk.Notebook(outer)
         self.sub_nb.pack(fill=tk.BOTH, expand=True)
-        t1 = ttk.Frame(self.sub_nb)
-        self.sub_nb.add(t1, text="Top Profit — T1")
+        browser = ttk.Frame(self.sub_nb)
+        self.sub_nb.add(browser, text="Build browser")
 
-        hub_names = [name for _key, name in get_enabled_hubs()]
-        self._hub_key_by_name = {name: key for key, name in get_enabled_hubs()}
-
-        # ---- top bar: refresh + hub/facility/input selectors ----
-        top = ttk.Frame(t1, padding=(8, 6))
+        # Maintenance/status stays outside the two working columns.
+        top = ttk.Frame(browser, padding=(8, 4))
         top.pack(fill=tk.X)
-
         self.refresh_btn = ttk.Button(top, text="Refresh from caches",
                                       command=lambda: self._compute(refetch=True))
         self.refresh_btn.pack(side=tk.LEFT)
-        self.sde_btn = ttk.Button(top, text="Update SDE",
-                                  command=self._on_update_sde)
-        self.sde_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.sde_btn = ttk.Button(top, text="Update SDE", command=self._on_update_sde)
+        self.sde_btn.pack(side=tk.LEFT, padx=4)
         self.progress_label = ttk.Label(top, text="", foreground=CLR_MUTED)
-        self.progress_label.pack(side=tk.LEFT, padx=10)
+        self.progress_label.pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(top, text="Buy at:").pack(side=tk.LEFT, padx=(12, 2))
-        self.buy_var = tk.StringVar(value="Jita")
-        self.buy_combo = self._combo(top, self.buy_var, hub_names,
-                                     self._on_input_change)
+        columns = ttk.Panedwindow(browser, orient=tk.HORIZONTAL)
+        columns.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        left = ttk.Frame(columns)
+        right = ttk.Panedwindow(columns, orient=tk.VERTICAL)
+        columns.add(left, weight=1)
+        columns.add(right, weight=1)
 
-        ttk.Label(top, text="Sell at:").pack(side=tk.LEFT, padx=(12, 2))
-        self.sell_var = tk.StringVar(value="Jita")
-        self.sell_combo = self._combo(top, self.sell_var, hub_names,
-                                      self._on_input_change)
-
-        ttk.Label(top, text="Input:").pack(side=tk.LEFT, padx=(12, 2))
-        self.input_var = tk.StringVar(value="Patient (buy orders)")
-        self._combo(top, self.input_var,
-                    ["Patient (buy orders)", "Impatient (sell orders)"],
-                    self._on_input_change, width=20)
-
-        self.status_label = ttk.Label(
-            top, text=f"Data: {self.market.get_last_update()}",
-            foreground=CLR_MUTED)
-        self.status_label.pack(side=tk.RIGHT)
-
-        # ---- facility row (SCI source + write-in structure bonuses) ----
-        fac = ttk.LabelFrame(t1, text="Facility", padding=(8, 4))
-        fac.pack(fill=tk.X, padx=8)
-        ttk.Label(fac, text="System (cost index):").pack(side=tk.LEFT)
-        self.facility_var = tk.StringVar(value="Jita")
-        self.facility_combo = self._combo(fac, self.facility_var, hub_names,
-                                          self._on_input_change)
-        self.fac_tax_var = self._mini_field(fac, "Facility tax %:",
-                                            f"{self.constants.facility_tax_pct}")
-        self.cost_bonus_var = self._mini_field(fac, "Cost bonus %:", "0")
-        self.mat_bonus_var = self._mini_field(fac, "Material bonus %:", "0")
-        # Structure/rig TIME reduction — feeds Phase 4 build + research time only
-        # (never cost). Default 0 (generic NPC station, no time bonus).
-        self.time_bonus_var = self._mini_field(fac, "Time bonus %:", "0")
-        self.scc_var = self._mini_field(fac, "SCC %:",
-                                        f"{self.constants.scc_surcharge_pct}")
-        ttk.Label(fac, text="(SCC/tax are CCP-tuned — verify in-game)",
-                  foreground=CLR_MUTED).pack(side=tk.LEFT, padx=8)
-
-        # ---- filter row: chips + search + min profit + ME/batch ----
-        filt = ttk.Frame(t1, padding=(8, 4))
-        filt.pack(fill=tk.X)
-        self._chip_buttons = {}
-        for label, _match in CATEGORIES:
-            b = ttk.Button(filt, text=label, width=11,
-                           command=lambda l=label: self._on_chip(l))
-            b.pack(side=tk.LEFT, padx=1)
-            self._chip_buttons[label] = b
-        self._highlight_chip("All")
-
-        ttk.Label(filt, text="Search:").pack(side=tk.LEFT, padx=(12, 2))
-        self.search_var = tk.StringVar()
-        se = ttk.Entry(filt, textvariable=self.search_var, width=16)
-        se.pack(side=tk.LEFT)
-        se.bind("<KeyRelease>", lambda e: self._rebuild_list())
-
-        ttk.Label(filt, text="Min profit:").pack(side=tk.LEFT, padx=(12, 2))
-        # Blank = no lower bound (negatives shown for contrast). Type a number
-        # to floor the list; the "Positive only" sub-tab is the >0 view.
-        self.min_profit_var = tk.StringVar(value="")
-        mp = ttk.Entry(filt, textvariable=self.min_profit_var, width=12)
-        mp.pack(side=tk.LEFT)
-        mp.bind("<KeyRelease>", lambda e: self._rebuild_list())
-
-        self.show_unpriced_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Show unpriced", variable=self.show_unpriced_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(12, 0))
-
-        # Capitals are hidden by default — hugely expensive and need months of
-        # BPO ME research to be worth building. Upwell + POS structures are
-        # reasonable builds, so they stay visible unless the user opts out.
-        self.subcap_only_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filt, text="Sub-cap only", variable=self.subcap_only_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(12, 0))
-        self.hide_upwell_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Hide Upwell", variable=self.hide_upwell_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(8, 0))
-        self.hide_pos_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filt, text="Hide POS", variable=self.hide_pos_var,
-                        command=self._rebuild_list).pack(side=tk.LEFT, padx=(8, 0))
-        self.ignored_btn = ttk.Button(filt, text="Ignored…",
-                                      command=self._manage_ignored)
-        self.ignored_btn.pack(side=tk.LEFT, padx=(12, 0))
-        self._update_ignored_btn()
-
-        ttk.Label(filt, text="ME:").pack(side=tk.LEFT, padx=(12, 2))
-        self.me_var = tk.StringVar(value="10")
-        me = ttk.Entry(filt, textvariable=self.me_var, width=4)
-        me.pack(side=tk.LEFT)
-        me.bind("<Return>", lambda e: self._compute(refetch=False))
-
-        # TE only affects build TIME (Phase 4), not cost, so it doesn't trigger a
-        # recompute — the detail panel reads it live. Default 20 (researched BPO).
-        ttk.Label(filt, text="TE:").pack(side=tk.LEFT, padx=(8, 2))
-        self.te_var = tk.StringVar(value="20")
-        te = ttk.Entry(filt, textvariable=self.te_var, width=4)
-        te.pack(side=tk.LEFT)
-        te.bind("<Return>", lambda e: self._refresh_detail_if_selected())
-
-        ttk.Label(filt, text="Batch:").pack(side=tk.LEFT, padx=(8, 2))
-        self.batch_var = tk.StringVar(value="1")
-        ba = ttk.Entry(filt, textvariable=self.batch_var, width=5)
-        ba.pack(side=tk.LEFT)
-        ba.bind("<Return>", lambda e: self._compute(refetch=False))
-        ttk.Button(filt, text="Apply ME/Batch",
-                   command=lambda: self._compute(refetch=False)).pack(
-                       side=tk.LEFT, padx=(4, 0))
-
-        # ---- tech-level chips (multi-select; grey out where a category has none) ----
-        tech_row = ttk.Frame(t1, padding=(8, 0))
-        tech_row.pack(fill=tk.X)
-        ttk.Label(tech_row, text="Tech:").pack(side=tk.LEFT)
-        self.tech_buttons = {}
-        for label in TECH_ORDER:
-            b = ttk.Button(tech_row, text=label, width=9,
-                           command=lambda l=label: self._on_tech_chip(l))
-            b.pack(side=tk.LEFT, padx=1)
-            self.tech_buttons[label] = b
-        self._refresh_tech_chip_styles()
-
-        # Blueprint-source filter: buyable BPO vs BPC-only (no BPO — drops/
-        # invented; build cost ignores blueprint cost until Stage C pricing).
-        ttk.Label(tech_row, text="Blueprint:").pack(side=tk.LEFT, padx=(12, 2))
-        self.bp_filter_var = tk.StringVar(value="All")
-        self._combo(tech_row, self.bp_filter_var,
-                    ["All", "BPO only", "BPC-only"],
-                    self._rebuild_list, width=10)
-
-        # Persistent note, re-evaluated after an SDE update (no restart needed).
-        self.tech_note_label = ttk.Label(tech_row, foreground=CLR_MUTED)
-        self.tech_note_label.pack(side=tk.LEFT, padx=8)
-        self._update_tech_note()
-
-        # ---- main split: list | detail ----
-        main = ttk.Frame(t1, padding=8)
-        main.pack(fill=tk.BOTH, expand=True)
-
-        left = ttk.Frame(main)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        # Both left panels retain their headers/summaries when collapsed.
+        left.columnconfigure(0, weight=1)
+        self.left_panels = left
+        self._build_item_browser(left)
+        self.results_panel = ttk.LabelFrame(left, text="Matching products", padding=6)
+        self.results_panel.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self._results_open = False
+        self.results_toggle_btn = ttk.Button(
+            self.results_panel, text="Results ▸", command=self._toggle_results_panel)
+        self.results_toggle_btn.pack(anchor="w")
+        self.result_count_label = ttk.Label(
+            self.results_panel, text="Choose items, then press Show", foreground=CLR_MUTED)
+        self.result_count_label.pack(anchor="w", pady=(4, 4))
+        self.results_body = ttk.Frame(self.results_panel)
         self._headings = {"#0": "Item", "cost": "Build cost", "profit": "Profit",
                           "margin": "Margin%", "vol": "Vol/day"}
-        # Shared right-click menu (acts on self.selected, tree-agnostic).
         self._list_menu = tk.Menu(self.frame, tearoff=0)
-        self._list_menu.add_command(label="View price history",
-                                    command=self._show_list_history)
-        self._list_menu.add_command(label="Copy name",
-                                    command=self._copy_selected_name)
+        self._list_menu.add_command(label="View price history", command=self._show_list_history)
+        self._list_menu.add_command(label="Copy name", command=self._copy_selected_name)
         self._list_menu.add_separator()
-        self._list_menu.add_command(label="Ignore this item",
-                                    command=self._ignore_selected)
-        # Two list views sharing the detail panel: full ranked list (incl.
-        # negatives) and a profit>0 view. Both render from the same results.
-        self.list_nb = ttk.Notebook(left)
-        self.list_nb.pack(fill=tk.BOTH, expand=True)
-        self.tree = self._make_list_tree(self.list_nb, "All")
-        self.tree_pos = self._make_list_tree(self.list_nb, "Positive only")
-        self._trees = (self.tree, self.tree_pos)
+        self._list_menu.add_command(label="Ignore this item", command=self._ignore_selected)
+        self.tree = self._make_list_tree(self.results_body)
+        self._trees = (self.tree,)
         self._update_headings()
 
-        right = ttk.Frame(main)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.legend_label = ttk.Label(right, foreground=CLR_MUTED)
-        self.legend_label.pack(anchor="w")
+        # Filters occupy the upper right; selected build occupies the lower right.
+        # Each scrolls independently and the horizontal divider is adjustable.
+        settings_host = ttk.Frame(right)
+        build_host = ttk.Frame(right)
+        right.add(settings_host, weight=1)
+        right.add(build_host, weight=2)
+        settings = make_scrollable(settings_host)
+        self._build_filters(settings)
+        self._build_calculation_settings(settings)
+        self.status_label = ttk.Label(
+            settings, text=f"Data: {self.market.get_last_update()}", foreground=CLR_MUTED)
+        self.status_label.pack(anchor="w", padx=8, pady=4)
+        settings.bind("<Configure>", lambda event: self.tech_note_label.configure(
+            wraplength=max(180, event.width - 24)), add="+")
+
+        ttk.Label(build_host, text="Individual build", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(4, 0))
+        self.legend_label = ttk.Label(build_host, foreground=CLR_MUTED, wraplength=420)
+        self.legend_label.pack(fill=tk.X, padx=8, pady=(2, 4))
         self._update_legend()
-
-        # Scrollable detail panel via the shared make_scrollable helper (same
-        # model as every dialog: recursive wheel binding incl. Linux Button-4/5,
-        # smart latching for inner scroll-own widgets). The hand-rolled canvas
-        # this replaced bound only <MouseWheel>, so it did nothing on Linux.
-        scroll_host = ttk.Frame(right)
-        scroll_host.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        build_host.bind("<Configure>", lambda event: self.legend_label.configure(
+            wraplength=max(180, event.width - 24)))
+        scroll_host = ttk.Frame(build_host)
+        scroll_host.pack(fill=tk.BOTH, expand=True)
         self.detail = make_scrollable(scroll_host)
-        self._detail_canvas = self.detail.master  # the Canvas it created
-        ttk.Label(self.detail, text="Select an item to view its build breakdown",
-                  foreground=CLR_MUTED).pack(expand=True)
+        self._detail_canvas = self.detail.master
+        ttk.Label(self.detail, text="Select a result to view its build breakdown",
+                  foreground=CLR_MUTED).pack(anchor="w", padx=8, pady=8)
 
-        # ---- Owned BPO/BPC sub-tab (Phase 3) ----
-        # Keep this lazy: Owned imports shared helpers from gui_industry.
+        # Dedicated blueprint and character tools retain their existing paths.
         from gui.industry.gui_industry_owned import OwnedBlueprintsPanel
         owned_frame = ttk.Frame(self.sub_nb)
         self.sub_nb.add(owned_frame, text="Owned BPO/BPC")
@@ -267,8 +115,6 @@ class IndustryBrowserMixin:
             on_hubs_changed=self._refresh_hub_selectors,
             on_ignore_changed=self._apply_ignore_change,
             build_time_for=self.build_time_for, on_research=self.open_research)
-
-        # ---- Characters sub-tab (Phase 2) ----
         chars_frame = ttk.Frame(self.sub_nb)
         self.sub_nb.add(chars_frame, text="Characters")
         self.characters_panel = CharactersPanel(
@@ -277,10 +123,87 @@ class IndustryBrowserMixin:
             bp_puller=self.bp_puller, bp_db=self.bp_db,
             on_blueprints_pulled=self._on_blueprints_pulled)
 
+    def _build_calculation_settings(self, parent):
+        hubs = get_enabled_hubs()
+        hub_names = [name for _key, name in hubs]
+        self._hub_key_by_name = {name: key for key, name in hubs}
+        markets = ttk.LabelFrame(parent, text="Markets", padding=(8, 4))
+        markets.pack(fill=tk.X, padx=8, pady=4)
+        self.buy_var = tk.StringVar(value="Jita")
+        self.sell_var = tk.StringVar(value="Jita")
+        for column, label, var, attr in (
+                (0, "Buy materials at:", self.buy_var, "buy_combo"),
+                (2, "Sell products at:", self.sell_var, "sell_combo")):
+            ttk.Label(markets, text=label).grid(row=0, column=column, sticky="w")
+            combo = ttk.Combobox(markets, textvariable=var, values=hub_names,
+                                 state="readonly", width=14)
+            combo.grid(row=0, column=column + 1, sticky="ew", padx=(4, 8))
+            combo.bind("<<ComboboxSelected>>", lambda event: self._on_input_change())
+            setattr(self, attr, combo)
+            markets.columnconfigure(column + 1, weight=1)
+        ttk.Label(markets, text="Input:").grid(row=1, column=0, sticky="w", pady=4)
+        self.input_var = tk.StringVar(value="Patient (buy orders)")
+        combo = ttk.Combobox(markets, textvariable=self.input_var, state="readonly",
+                             values=["Patient (buy orders)", "Impatient (sell orders)"], width=22)
+        combo.grid(row=1, column=1, columnspan=3, sticky="w", padx=4)
+        combo.bind("<<ComboboxSelected>>", lambda event: self._on_input_change())
+
+        build = ttk.LabelFrame(parent, text="Build assumptions", padding=(8, 4))
+        build.pack(fill=tk.X, padx=8, pady=4)
+        facility = ttk.Frame(build)
+        facility.pack(fill=tk.X)
+        ttk.Label(facility, text="Facility system:").pack(side=tk.LEFT)
+        self.facility_var = tk.StringVar(value="Jita")
+        self.facility_combo = self._combo(facility, self.facility_var, hub_names,
+                                          self._on_input_change, width=16)
+        basic = ttk.Frame(build)
+        basic.pack(fill=tk.X, pady=4)
+        for attr, label, default, callback in (
+                ("me_var", "ME:", "10", lambda: self._compute(refetch=False)),
+                ("te_var", "TE:", "20", self._refresh_detail_if_selected),
+                ("batch_var", "Batch:", "1", lambda: self._compute(refetch=False))):
+            ttk.Label(basic, text=label).pack(side=tk.LEFT, padx=(0, 2))
+            var = tk.StringVar(value=default)
+            setattr(self, attr, var)
+            entry = ttk.Entry(basic, textvariable=var, width=5)
+            entry.pack(side=tk.LEFT, padx=(0, 8))
+            entry.bind("<Return>", lambda event, cb=callback: cb())
+        ttk.Button(basic, text="Apply ME/Batch",
+                   command=lambda: self._compute(refetch=False)).pack(side=tk.LEFT)
+        self.facility_settings_btn = ttk.Button(
+            build, text="Facility settings ▸", command=self._toggle_facility_settings)
+        self.facility_settings_btn.pack(anchor="w")
+        self.facility_settings = ttk.Frame(build)
+        taxes = ttk.Frame(self.facility_settings)
+        taxes.pack(fill=tk.X)
+        self.fac_tax_var = self._mini_field(taxes, "Facility tax %:",
+                                            f"{self.constants.facility_tax_pct}")
+        self.scc_var = self._mini_field(taxes, "SCC %:",
+                                        f"{self.constants.scc_surcharge_pct}")
+        ttk.Label(self.facility_settings, text="SCC/tax are CCP-tuned — verify in-game.",
+                  foreground=CLR_MUTED).pack(anchor="w", padx=10)
+        bonuses = ttk.Frame(self.facility_settings)
+        bonuses.pack(fill=tk.X)
+        self.cost_bonus_var = self._mini_field(bonuses, "Cost bonus %:", "0")
+        self.mat_bonus_var = self._mini_field(bonuses, "Material bonus %:", "0")
+        time_row = ttk.Frame(self.facility_settings)
+        time_row.pack(fill=tk.X)
+        self.time_bonus_var = self._mini_field(time_row, "Time bonus %:", "0")
+        self._build_blueprint_contract_controls(parent)
+
     def _on_blueprints_pulled(self):
         """Refresh the Owned panel after a Characters-tab blueprint pull."""
         if getattr(self, "owned_panel", None):
             self.owned_panel.refresh()
+        self._rebuild_list()
+
+    def _toggle_facility_settings(self):
+        if self.facility_settings.winfo_manager():
+            self.facility_settings.pack_forget()
+            self.facility_settings_btn.configure(text="Facility settings ▸")
+        else:
+            self.facility_settings.pack(fill=tk.X, pady=(4, 0))
+            self.facility_settings_btn.configure(text="Facility settings ▾")
 
     def _refresh_hub_selectors(self):
         """Repopulate the buy/sell/facility hub comboboxes after a structure is
@@ -310,11 +233,10 @@ class IndustryBrowserMixin:
         e.bind("<Return>", lambda ev: self._compute(refetch=False))
         return var
 
-    def _make_list_tree(self, notebook, title):
-        """One ranked-list Treeview as a sub-tab. All trees share sort state,
-        the detail panel, and the right-click menu (keyed off self.selected)."""
-        frame = ttk.Frame(notebook)
-        notebook.add(frame, text=title)
+    def _make_list_tree(self, parent):
+        """Ranked products; profitable-only is a composable global filter."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.BOTH, expand=True)
         cols = ("cost", "profit", "margin", "vol")
         tree = ttk.Treeview(frame, columns=cols, height=24)
         tree.heading("#0", text="Item", command=lambda: self._on_sort("name"))
@@ -336,27 +258,6 @@ class IndustryBrowserMixin:
         return tree
 
     # ===================================================================== list
-
-    def _on_chip(self, label):
-        self._active_category = label
-        self._highlight_chip(label)
-        self._rebuild_list()
-
-    def _highlight_chip(self, label):
-        for l, b in self._chip_buttons.items():
-            b.state(["pressed"] if l == label else ["!pressed"])
-
-    def _on_tech_chip(self, label):
-        if label in self.tech_selected:
-            self.tech_selected.discard(label)
-        else:
-            self.tech_selected.add(label)
-        self._refresh_tech_chip_styles()
-        self._rebuild_list()
-
-    def _refresh_tech_chip_styles(self):
-        for label, b in self.tech_buttons.items():
-            b.state(["pressed"] if label in self.tech_selected else ["!pressed"])
 
     def _update_tech_note(self):
         if not getattr(self, "tech_note_label", None):
@@ -412,103 +313,6 @@ class IndustryBrowserMixin:
         if col == "vol":
             return r["volume"]
         return 0
-
-    def _rebuild_list(self):
-        search = self.search_var.get().strip().lower()
-        mp_raw = self.min_profit_var.get().strip().replace(",", "")
-        try:
-            min_profit = float(mp_raw) if mp_raw else None  # blank = no floor
-        except ValueError:
-            min_profit = None
-        show_unpriced = self.show_unpriced_var.get()
-        subcap_only = self.subcap_only_var.get()
-        hide_upwell = self.hide_upwell_var.get()
-        hide_pos = self.hide_pos_var.get()
-        cat = self._active_category
-        bp_mode = self.bp_filter_var.get()
-        excluded = {
-            "category": 0, "hidden": 0, "search_miss": 0, "tech": 0,
-            "capital": 0, "upwell": 0, "pos": 0, "blueprint": 0,
-            "unpriced": 0, "min_profit": 0,
-        }
-
-        # Items passing the category filter (independent of tech) drive both the
-        # tech-chip greying and the row set. A tech chip greys out when the
-        # active category contains no item of that tech level.
-        cat_items = [tid for tid in self.results
-                     if search or cat == "All" or self.category_map.get(tid) == cat]
-        excluded["category"] = len(self.results) - len(cat_items)
-        avail_tech = {tech_label(self.meta_map.get(tid)) for tid in cat_items}
-        for label, b in self.tech_buttons.items():
-            b.state(["!disabled"] if label in avail_tech else ["disabled"])
-
-        rows = []
-        for tid in cat_items:
-            r = self.results[tid]
-            name = self.name_map.get(tid, str(tid))
-            hidden = is_auto_hidden(name) or self.ignore.contains(tid)
-            # Search is a direct item lookup and bypasses every visibility
-            # filter, including auto-hidden/user-ignored status.
-            if search:
-                if search in name.lower():
-                    rows.append(tid)
-                    excluded["hidden"] += int(hidden)
-                else:
-                    excluded["search_miss"] += 1
-                continue
-            if hidden:
-                excluded["hidden"] += 1
-                continue
-            if tech_label(self.meta_map.get(tid)) not in self.tech_selected:
-                excluded["tech"] += 1
-                continue
-            if subcap_only and self.capital_map.get(tid):
-                excluded["capital"] += 1
-                continue
-            if hide_upwell and self.upwell_map.get(tid):
-                excluded["upwell"] += 1
-                continue
-            if hide_pos and self.pos_map.get(tid):
-                excluded["pos"] += 1
-                continue
-            has_bpo = self.bpo_map.get(tid, True)
-            if bp_mode == "BPO only" and not has_bpo:
-                excluded["blueprint"] += 1
-                continue
-            if bp_mode == "BPC-only" and has_bpo:
-                excluded["blueprint"] += 1
-                continue
-            priced = r["patient_profit"] is not None
-            if not priced and not show_unpriced:
-                excluded["unpriced"] += 1
-                continue
-            if priced and min_profit is not None and r["patient_profit"] < min_profit:
-                excluded["min_profit"] += 1
-                continue
-            rows.append(tid)
-
-        rows.sort(key=lambda t: self._sort_value(t, self.sort_col),
-                  reverse=self.sort_reverse)
-        self.display_order = rows
-        # "Positive only" sub-tab: same base filter, profit strictly > 0.
-        pos_rows = (list(rows) if search else
-                    [t for t in rows
-                     if self.results[t]["patient_profit"] is not None
-                     and self.results[t]["patient_profit"] > 0])
-        self._fill_tree(self.tree, rows)
-        self._fill_tree(self.tree_pos, pos_rows)
-        if search:
-            diag = (f"search text={search!r} total={len(self.results)} "
-                    f"matches={len(rows)} filters_bypassed=True "
-                    f"hidden_matches={excluded['hidden']}")
-        else:
-            diag = (
-                f"filter total={len(self.results)} visible={len(rows)} "
-                f"positive={len(pos_rows)} category={cat!r} "
-                f"tech={','.join(sorted(self.tech_selected)) or 'none'} "
-                f"blueprint={bp_mode!r} excluded={format_counts(excluded)}"
-            )
-        self._queue_filter_diag(diag, delayed=bool(search))
 
     def _queue_filter_diag(self, diag: str, delayed: bool = False):
         """Deduplicate filter logs and debounce search typing only."""
